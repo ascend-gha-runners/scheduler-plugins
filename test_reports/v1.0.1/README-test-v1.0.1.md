@@ -1,19 +1,31 @@
-# 测试调度器
-[测试 github action](https://github.com/cllouud/vllm-ascend/actions/runs/15579516815/job/43871254090)
+# 测试场景
+`runner scheduler`版本为[v1.0.1](https://github.com/ascend-gha-runners/scheduler-plugins/releases/tag/v1.0.1)，将其打包成镜像并部署到K8S集群。
 
-选取0卡，1卡，2卡，4卡job，各3个，共12个job。不限制并发数。
 
-运行结果：
-![alt text](assets/README-测试报告/image.png)
-调度器依次调度12个pod。
-前7个pod均调度到192节点。此时192节点已分配7卡。
-对于两个4卡pod，先后将其分配到有足够资源的104，105节点。
-对于两个2卡pod，先后将其分配到有足够资源的104，206节点。
-对于最后2卡pod，没有节点有足够资源，pod处于pending状态。
+本地测试 [github action](https://github.com/cllouud/vllm-ascend/actions/runs/15608341152)
+同时触发0卡，1卡，2卡，4卡job，各3个，共12个job。
+不限制并发数。
+12个job均由`runner scheduler v1.0.1`调度。
 
+# 测试结果
+1. 如果某节点存在空闲资源，那么调度器可以将`runner pod`分配到空闲节点。
+不会出现多个`runner pod`堵在同一个节点的情况。
 解决了`部分 node 的NPU资源没有被充分使用`的问题。
 
-# 测试label正确
+2. 所有`runner pod`的标签都配置正确。
+
+3. 所有`node`的标签都配置正确。
+
+# 测试过程
+## runner scheduler 调度
+分析`runner scheduler`日志，调度器依次调度12个pod。
+![alt text](assets/README-test-v1.0.1/image-1.png)
+第四个pod`57jg8`需要4卡，105节点不满足需求，因此过滤105节点。
+第六个pod`l8gv7`需要2卡，192节点不满足需求，因此过滤192节点。
+第八个pod`rj8mx`需要4卡，105,192节点不满足需求，因此过滤105,192节点。
+第十二个pod`ccxmlg`需要1卡，206,105,192节点不满足需求，因此过滤206,105,192节点。
+
+## ascend-ci.com/required-npu-count label
 运行如下脚本，验证autoscalingrunnerset资源的`ascend-ci.com/required-npu-count`标签值正确。
 ```bash
 #!/bin/bash
@@ -35,7 +47,7 @@ kubectl get autoscalingrunnerset --all-namespaces --no-headers \
       fi
     done
 ```
-运行结果
+运行结果，所有`autoscalingrunnerset`资源的的标签正确
 ```
 OK: Name: linux-arm64-npu-1 Namespace: ascend NPUCOUNT: 1
 OK: Name: linux-arm64-npu-2 Namespace: ascend NPUCOUNT: 2
@@ -61,4 +73,19 @@ OK: Name: linux-arm64-npu-1 Namespace: vllm-project NPUCOUNT: 1
 OK: Name: linux-arm64-npu-2 Namespace: vllm-project NPUCOUNT: 2
 OK: Name: linux-arm64-npu-4 Namespace: vllm-project NPUCOUNT: 4
 OK: Name: linux-arm64-npu-8 Namespace: vllm-project NPUCOUNT: 8
+
+```
+
+## ascend-ci.com/npu-resource-domain=huawei.com ascend-ci.com/npu-resource-model=ascend-1980 label
+command:
+```bash
+kubectl get nodes -l ascend-ci.com/npu-resource-domain=huawei.com -l ascend-ci.com/npu-resource-model=ascend-1980
+```
+result:4个节点都添加`label`。
+```log
+NAME           STATUS   ROLES    AGE    VERSION
+172.22.0.104   Ready    <none>   145d   v1.28.13-r4-28.0.39.4-arm64
+172.22.0.105   Ready    <none>   145d   v1.28.13-r4-28.0.39.4-arm64
+172.22.0.192   Ready    <none>   78d    v1.28.13-r4-28.0.39.4-arm64
+172.22.0.206   Ready    <none>   9d     v1.28.13-r4-28.0.39.4-arm64
 ```
