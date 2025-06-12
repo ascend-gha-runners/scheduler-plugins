@@ -17,10 +17,10 @@ spec:
         spec:
             serviceAccountName: runner-pod-npu-scheduler
             imagePullSecrets:
-              - name: your-secret
+              - name: huawei-swr-image-pull-secret-model-gy
             containers:
                 - name: scheduler
-                  image: your-image:your-tag
+                  image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/scheduler-plugins:4aea04ec881bf416a1345f3c669440c1fd5e88a3
                   imagePullPolicy: Always
                   command:
                       - /bin/kube-scheduler
