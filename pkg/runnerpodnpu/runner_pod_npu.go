@@ -46,7 +46,7 @@ func (pl *runnerScheduler) Filter(ctx context.Context, state *framework.CycleSta
 		return framework.NewStatus(framework.Unschedulable, err.Error())
 	}
 
-	allocatableNpuCount, err := getAllocatableNpuCountFromNode(nodeInfo)
+	allocatableNpuCount, err := getAllocatableNpuCountFromNode(pod, nodeInfo)
 	if err != nil {
 		return framework.NewStatus(framework.Unschedulable, err.Error())
 	}
@@ -81,9 +81,9 @@ func (pl *runnerScheduler) PreScore(ctx context.Context, state *framework.CycleS
 	return framework.NewStatus(framework.Success, "Pod: "+pod.Name)
 }
 
-func getAllocatableNpuCountFromNode(nodeInfo *framework.NodeInfo) (int64, error) {
-	domainLabel, domainLabelExists := nodeInfo.Node().Labels[npuResourceDomainLabel]
-	modelLabel, modelLabelExists := nodeInfo.Node().Labels[npuResourceModelLabel]
+func getAllocatableNpuCountFromNode(pod *v1.Pod, nodeInfo *framework.NodeInfo) (int64, error) {
+	domainLabel, domainLabelExists := pod.Labels[npuResourceDomainLabel]
+	modelLabel, modelLabelExists := pod.Labels[npuResourceModelLabel]
 	if !modelLabelExists || !domainLabelExists {
 		return 0, fmt.Errorf("fail to parse npu resource label. nodeName: %v, label: %v = %v, %v = %v", nodeInfo.Node().Name, npuResourceDomainLabel, domainLabel, npuResourceModelLabel, modelLabel)
 	}
