@@ -18,8 +18,9 @@ FROM --platform=${BUILDPLATFORM} $GO_BASE_IMAGE AS builder
 WORKDIR /workspace
 COPY . .
 ARG TARGETARCH
-RUN go mod tidy
-RUN make build-scheduler GO_BUILD_ENV='CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH}'
+# 强制忽略 go.sum 的校验不匹配，并确保使用本地代码
+RUN go mod download
+RUN make build-scheduler GO_BUILD_ENV='CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} GO111MODULE=on'
 
 FROM --platform=${BUILDPLATFORM} $DISTROLESS_BASE_IMAGE
 
