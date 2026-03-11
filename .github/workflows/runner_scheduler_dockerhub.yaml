@@ -26,4 +26,5 @@ jobs:
           push: true
           build-args: |
             ARCH=arm64v8
+            GO_BUILD_ENV=GOPROXY=https://goproxy.cn,direct
           tags: ${{ secrets.SWR_IMAGE }}:${{ github.sha }}
