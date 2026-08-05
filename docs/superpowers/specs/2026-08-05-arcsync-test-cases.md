@@ -2,7 +2,7 @@
 
 > **集群配置**：本地集群 8 张 NPU 卡，远端虚拟节点 20 张 NPU 卡
 > 
-> 资源类型：`huawei.com/ascend-310`
+> 资源类型：`huawei.com/ascend-1980`
 
 ## 一、基础功能验证
 
@@ -61,7 +61,7 @@
 - **前置条件**：
   - namespace1 有 NamespaceOffloading
   - namespace1 annotation `scheduling.volcano.sh/queue-name: q1`
-  - Queue q1 `spec.capability[huawei.com/ascend-310] = 4`
+  - Queue q1 `spec.capability[huawei.com/ascend-1980] = 4`
   - 本地节点总卡数 8，已占用 2 → 物理剩余 6，但 Queue 限额 4 → 本地剩余 = 4-2 = 2
   - 虚拟节点剩余 15
 - **Pod 配置**：runner pod `required-npu-count=1`，namespace1
@@ -164,7 +164,7 @@
 
 ### TC-15: FIFO 不跨 namespace 阻塞
 - **前置条件**：
-  - namespace1 和 namespace2 用相同 NPU 类型（`huawei.com/ascend-310`）
+  - namespace1 和 namespace2 用相同 NPU 类型（`huawei.com/ascend-1980`）
   - namespace1 的 runner pod（T1 创建）Pending（本地和虚拟都满了）
   - namespace2 的 runner pod（T2 > T1 创建）有充足本地资源
 - **Pod 配置**：namespace2 的 runner pod
@@ -379,7 +379,7 @@
 ### TC-33: 虚拟节点 Allocatable 中无 NPU 资源
 - **前置条件**：
   - 虚拟节点通过 ResourceSlice 协商了 CPU/memory 但未协商 NPU
-  - `node.Status.Allocatable[huawei.com/ascend-310]` 不存在 → 返回 0
+  - `node.Status.Allocatable[huawei.com/ascend-1980]` 不存在 → 返回 0
 - **Pod 配置**：runner pod `required-npu-count=1`
 - **预期**：虚拟节点 free = 0 - occupied → 负数，不会胜出
 - **验证点**：pod 调度到本地节点（如果本地有资源）
