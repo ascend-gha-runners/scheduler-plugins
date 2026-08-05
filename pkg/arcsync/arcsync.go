@@ -184,6 +184,19 @@ func (pl *ARCSync) isOldestPendingRunner(pod *v1.Pod) bool {
 		if p.Namespace != pod.Namespace {
 			continue
 		}
+		// skip pods with nodeSelector constraints the current pod doesn't share —
+		// they target different node pools (e.g. a pod pinned to a virtual node
+		// shouldn't block a pod that can use local nodes)
+		hasUnsharedConstraint := false
+		for k, v := range p.Spec.NodeSelector {
+			if pod.Spec.NodeSelector[k] != v {
+				hasUnsharedConstraint = true
+				break
+			}
+		}
+		if hasUnsharedConstraint {
+			continue
+		}
 		if p.Labels[RequiredNPUCount] == "" {
 			continue
 		}
