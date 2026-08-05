@@ -35,6 +35,7 @@ type reservation struct {
 	count     int64
 	timestamp time.Time
 	baseName  string
+	namespace string
 }
 
 type ARCSync struct {
@@ -236,6 +237,7 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 	activeWorkflows := make(map[string]bool)
 	knownPodUIDs := make(map[string]bool)
 	nodePhysicalUsage := make(map[string]int64)
+	nsLocalPhysicalUsage := make(map[string]int64)
 	virtualNodes := make(map[string]bool)
 
 	for _, nodeInfo := range nodeInfos {
@@ -245,6 +247,7 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 		}
 		nodeName := node.Name
 		var physUsage int64
+		var nsUsage int64
 		virt := isVirtualNode(node)
 		if virt {
 			virtualNodes[nodeName] = true
@@ -277,11 +280,15 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 				}
 			}
 			physUsage += podUsage
+			if p.Namespace == pod.Namespace {
+				nsUsage += podUsage
+			}
 		}
 		if virt {
 			physUsage = calcVirtualNodeOccupied(nodeInfo, resDomain, resModel)
 		}
 		nodePhysicalUsage[nodeName] = physUsage
+		nsLocalPhysicalUsage[nodeName] = nsUsage
 	}
 
 	nodeTotalOccupied := make(map[string]int64)
@@ -290,6 +297,7 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 	}
 
 	now := time.Now()
+	nsLocalReservated := make(map[string]int64)
 	for uid, res := range pl.inFlightReservations {
 		if !knownPodUIDs[uid] {
 			if now.Sub(res.timestamp) > 10*time.Second {
@@ -304,6 +312,9 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 			continue
 		}
 		nodeTotalOccupied[res.nodeName] += res.count
+		if res.namespace == pod.Namespace {
+			nsLocalReservated[res.nodeName] += res.count
+		}
 	}
 
 	pl.mu.Unlock()
@@ -329,7 +340,11 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 	}
 
 	if nsHasOffloading && nsOffloading != nil {
-		pl.applyLiqoComparison(nodeInfos, pod, resDomain, resModel, fullResourceName, nodeTotalOccupied, nodeFreeNPU, nsOffloading)
+		nsLocalOccupied := make(map[string]int64)
+		for nodeName, usage := range nsLocalPhysicalUsage {
+			nsLocalOccupied[nodeName] = usage + nsLocalReservated[nodeName]
+		}
+		pl.applyLiqoComparison(nodeInfos, pod, resDomain, resModel, fullResourceName, nsLocalOccupied, nodeFreeNPU, nsOffloading)
 	} else {
 		for _, ni := range nodeInfos {
 			node := ni.Node()
@@ -379,7 +394,7 @@ func (pl *ARCSync) applyLiqoComparison(
 	pod *v1.Pod,
 	resDomain, resModel string,
 	fullResourceName v1.ResourceName,
-	nodeTotalOccupied map[string]int64,
+	nsLocalOccupied map[string]int64,
 	nodeFreeNPU map[string]int64,
 	nsOffloading *unstructured.Unstructured,
 ) {
@@ -399,7 +414,7 @@ func (pl *ARCSync) applyLiqoComparison(
 		}
 		allocatable := node.Status.Allocatable[fullResourceName]
 		localTotalAllocatable += allocatable.Value()
-		localTotalOccupied += nodeTotalOccupied[node.Name]
+		localTotalOccupied += nsLocalOccupied[node.Name]
 	}
 
 	localTotalCapacity := localTotalAllocatable
@@ -504,6 +519,7 @@ func (pl *ARCSync) Reserve(ctx context.Context, state *framework.CycleState, pod
 		count:     data.requiredCount,
 		timestamp: time.Now(),
 		baseName:  getBaseName(pod.Name),
+		namespace: pod.Namespace,
 	}
 	klog.InfoS("ARCSync: Reserved NPU slots", "pod", pod.Name, "node", nodeName, "count", data.requiredCount)
 	return framework.NewStatus(framework.Success, "")
