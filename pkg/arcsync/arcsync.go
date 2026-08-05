@@ -7,8 +7,15 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/dynamic/dynamicinformer"
+	"k8s.io/client-go/tools/cache"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
@@ -35,6 +42,9 @@ type ARCSync struct {
 	podLister            corev1listers.PodLister
 	inFlightReservations map[string]reservation
 	mu                   sync.Mutex
+	nsOffloadingLister   nsOffloadingLister
+	queueLister          queueLister
+	nsLister             namespaceLister
 }
 
 type preFilterState struct {
@@ -55,11 +65,54 @@ var _ framework.PostBindPlugin = &ARCSync{}
 var _ framework.EnqueueExtensions = &ARCSync{}
 
 func New(ctx context.Context, _ runtime.Object, h framework.Handle) (framework.Plugin, error) {
-	return &ARCSync{
+	pl := &ARCSync{
 		handle:               h,
 		podLister:            h.SharedInformerFactory().Core().V1().Pods().Lister(),
+		nsLister:             h.SharedInformerFactory().Core().V1().Namespaces().Lister(),
 		inFlightReservations: make(map[string]reservation),
-	}, nil
+	}
+
+	dynamicClient, err := dynamic.NewForConfig(h.KubeConfig())
+	if err != nil {
+		return pl, nil
+	}
+
+	dynamicInformerFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, 30*time.Second)
+
+	var syncs []cache.InformerSynced
+
+	nsOffloadingInformer := dynamicInformerFactory.ForResource(gvrNamespaceOffloading)
+	if crdExists(dynamicClient, ctx, gvrNamespaceOffloading) {
+		pl.nsOffloadingLister = &dynamicNSOffloadingLister{lister: nsOffloadingInformer.Lister()}
+		go nsOffloadingInformer.Informer().Run(ctx.Done())
+		syncs = append(syncs, nsOffloadingInformer.Informer().HasSynced)
+	}
+
+	queueInformer := dynamicInformerFactory.ForResource(gvrQueue)
+	if crdExists(dynamicClient, ctx, gvrQueue) {
+		pl.queueLister = &dynamicQueueLister{lister: queueInformer.Lister()}
+		go queueInformer.Informer().Run(ctx.Done())
+		syncs = append(syncs, queueInformer.Informer().HasSynced)
+	}
+
+	if len(syncs) > 0 {
+		go func() {
+			cache.WaitForCacheSync(ctx.Done(), syncs...)
+		}()
+	}
+
+	return pl, nil
+}
+
+func crdExists(dc dynamic.Interface, ctx context.Context, gvr schema.GroupVersionResource) bool {
+	_, err := dc.Resource(gvr).List(ctx, metav1.ListOptions{Limit: 1})
+	if err == nil {
+		return true
+	}
+	if apierrors.IsNotFound(err) {
+		return false
+	}
+	return true
 }
 
 func (pl *ARCSync) Name() string {
@@ -80,6 +133,15 @@ func canScheduleOnNode(node *v1.Node) bool {
 	return !node.Spec.Unschedulable
 }
 
+func nodeMatchesSelector(node *v1.Node, selector map[string]string) bool {
+	for k, v := range selector {
+		if node.Labels[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
 func getBaseName(name string) string {
 	suffix := "-workflow"
 	if len(name) > len(suffix) && name[len(name)-len(suffix):] == suffix {
@@ -93,6 +155,9 @@ func getBaseName(name string) string {
 // Using CreationTimestamp avoids the backoff side-effect where older (more-retried) pods
 // accumulate longer backoff delays and get jumped by newer pods.
 func (pl *ARCSync) isOldestPendingRunner(pod *v1.Pod) bool {
+	if pl.podLister == nil {
+		return true
+	}
 	resDomain := pod.Labels[ResourceDomain]
 	resModel := pod.Labels[ResourceModel]
 	myTime := pod.CreationTimestamp.Time
@@ -115,7 +180,10 @@ func (pl *ARCSync) isOldestPendingRunner(pod *v1.Pod) bool {
 		if p.Spec.NodeName != "" {
 			continue
 		}
-		// only compare runner pods of the same NPU resource type
+		// only compare runner pods of the same NPU resource type in the same namespace
+		if p.Namespace != pod.Namespace {
+			continue
+		}
 		if p.Labels[RequiredNPUCount] == "" {
 			continue
 		}
@@ -155,10 +223,19 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 	activeWorkflows := make(map[string]bool)
 	knownPodUIDs := make(map[string]bool)
 	nodePhysicalUsage := make(map[string]int64)
+	virtualNodes := make(map[string]bool)
 
 	for _, nodeInfo := range nodeInfos {
-		nodeName := nodeInfo.Node().Name
+		node := nodeInfo.Node()
+		if node == nil {
+			continue
+		}
+		nodeName := node.Name
 		var physUsage int64
+		virt := isVirtualNode(node)
+		if virt {
+			virtualNodes[nodeName] = true
+		}
 		for _, podInfo := range nodeInfo.Pods {
 			p := podInfo.Pod
 			if p.Status.Phase == v1.PodSucceeded || p.Status.Phase == v1.PodFailed || p.UID == pod.UID {
@@ -168,6 +245,9 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 			baseName := getBaseName(p.Name)
 			if p.Name != baseName {
 				activeWorkflows[baseName] = true
+			}
+			if virt {
+				continue
 			}
 			var podUsage int64
 			for _, container := range p.Spec.Containers {
@@ -184,6 +264,9 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 				}
 			}
 			physUsage += podUsage
+		}
+		if virt {
+			physUsage = calcVirtualNodeOccupied(nodeInfo, resDomain, resModel)
 		}
 		nodePhysicalUsage[nodeName] = physUsage
 	}
@@ -204,23 +287,50 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 		if activeWorkflows[res.baseName] {
 			continue
 		}
+		if virtualNodes[res.nodeName] {
+			continue
+		}
 		nodeTotalOccupied[res.nodeName] += res.count
 	}
 
 	pl.mu.Unlock()
 
 	nodeFreeNPU := make(map[string]int64)
-	hasCandidate := false
 	for _, nodeInfo := range nodeInfos {
 		node := nodeInfo.Node()
 		if node == nil || !canScheduleOnNode(node) {
 			continue
 		}
+		if !nodeMatchesSelector(node, pod.Spec.NodeSelector) {
+			continue
+		}
 		allocatable := node.Status.Allocatable[fullResourceName]
 		free := allocatable.Value() - nodeTotalOccupied[node.Name]
 		nodeFreeNPU[node.Name] = free
+	}
+
+	var nsOffloading *unstructured.Unstructured
+	nsHasOffloading := false
+	if pl.nsOffloadingLister != nil {
+		nsOffloading, nsHasOffloading, _ = pl.nsOffloadingLister.Get(pod.Namespace)
+	}
+
+	if nsHasOffloading && nsOffloading != nil {
+		pl.applyLiqoComparison(nodeInfos, pod, resDomain, resModel, fullResourceName, nodeTotalOccupied, nodeFreeNPU, nsOffloading)
+	} else {
+		for _, ni := range nodeInfos {
+			node := ni.Node()
+			if node != nil && isVirtualNode(node) {
+				delete(nodeFreeNPU, node.Name)
+			}
+		}
+	}
+
+	hasCandidate := false
+	for _, free := range nodeFreeNPU {
 		if free >= int64(reqCount) {
 			hasCandidate = true
+			break
 		}
 	}
 
@@ -249,6 +359,78 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 
 func (pl *ARCSync) PreFilterExtensions() framework.PreFilterExtensions {
 	return nil
+}
+
+func (pl *ARCSync) applyLiqoComparison(
+	nodeInfos []*framework.NodeInfo,
+	pod *v1.Pod,
+	resDomain, resModel string,
+	fullResourceName v1.ResourceName,
+	nodeTotalOccupied map[string]int64,
+	nodeFreeNPU map[string]int64,
+	nsOffloading *unstructured.Unstructured,
+) {
+	eligibleVirtuals := getEligibleVirtualNodes(nodeInfos, nsOffloading)
+	if len(eligibleVirtuals) == 0 {
+		return
+	}
+
+	var localTotalAllocatable, localTotalOccupied int64
+	for _, nodeInfo := range nodeInfos {
+		node := nodeInfo.Node()
+		if node == nil || isVirtualNode(node) || !canScheduleOnNode(node) {
+			continue
+		}
+		if _, exists := nodeFreeNPU[node.Name]; !exists {
+			continue
+		}
+		allocatable := node.Status.Allocatable[fullResourceName]
+		localTotalAllocatable += allocatable.Value()
+		localTotalOccupied += nodeTotalOccupied[node.Name]
+	}
+
+	localTotalCapacity := localTotalAllocatable
+	if pl.nsLister != nil {
+		ns, err := pl.nsLister.Get(pod.Namespace)
+		if err == nil && ns != nil {
+			if queueLimit, qFound := getQueueNpuLimit(ns, pl.queueLister, fullResourceName); qFound {
+				if queueLimit < localTotalCapacity {
+					localTotalCapacity = queueLimit
+				}
+			}
+		}
+	}
+
+	localRemaining := localTotalCapacity - localTotalOccupied
+	if localRemaining < 0 {
+		localRemaining = 0
+	}
+
+	var bestVirtNode string
+	var bestVirtRemaining int64
+	for nodeName := range eligibleVirtuals {
+		if free, exists := nodeFreeNPU[nodeName]; exists && free > bestVirtRemaining {
+			bestVirtRemaining = free
+			bestVirtNode = nodeName
+		}
+	}
+
+	if localRemaining >= bestVirtRemaining {
+		for nodeName := range eligibleVirtuals {
+			delete(nodeFreeNPU, nodeName)
+		}
+		klog.InfoS("ARCSync: local wins liqo comparison",
+			"pod", pod.Name, "localRemaining", localRemaining, "bestVirtRemaining", bestVirtRemaining)
+	} else {
+		for nodeName := range nodeFreeNPU {
+			if nodeName != bestVirtNode {
+				delete(nodeFreeNPU, nodeName)
+			}
+		}
+		klog.InfoS("ARCSync: virtual node wins liqo comparison",
+			"pod", pod.Name, "bestVirtNode", bestVirtNode, "bestVirtRemaining", bestVirtRemaining,
+			"localRemaining", localRemaining)
+	}
 }
 
 func (pl *ARCSync) Filter(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
