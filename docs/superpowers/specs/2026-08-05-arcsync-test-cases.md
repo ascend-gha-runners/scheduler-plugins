@@ -1,5 +1,9 @@
 # ARCSync Liqo/Volcano 调度压测用例
 
+> **集群配置**：本地集群 8 张 NPU 卡，远端虚拟节点 20 张 NPU 卡
+> 
+> 资源类型：`huawei.com/ascend-310`
+
 ## 一、基础功能验证
 
 ### TC-01: 无虚拟节点时行为不变
@@ -9,7 +13,7 @@
 - **验证点**：pod 正常调度到空闲最多的本地节点
 
 ### TC-02: 有虚拟节点但 namespace 无 NamespaceOffloading
-- **前置条件**：集群有虚拟节点（带 `liqo.io/remote-cluster-id`），pod 所在 namespace 无 NamespaceOffloading CR
+- **前置条件**：集群有虚拟节点（带 `liqo.io/remote-cluster-id`，Allocatable 20 张），pod 所在 namespace 无 NamespaceOffloading CR
 - **Pod 配置**：runner pod 带 `required-npu-count=1`
 - **预期**：虚拟节点从 `nodeFreeNPU` 中排除，只本地节点参与调度
 - **验证点**：pod 只调度到本地节点，不会卡 Pending
@@ -17,8 +21,8 @@
 ### TC-03: 本地剩余 > 虚拟节点剩余 → 本地胜
 - **前置条件**：
   - namespace1 有 NamespaceOffloading（clusterSelector 匹配虚拟节点）
-  - 本地节点：10 张卡，0 占用 → 本地剩余 10
-  - 虚拟节点：8 张卡，5 张占用（runner pod）→ 虚拟剩余 3
+  - 本地节点：8 张卡，0 占用 → 本地剩余 8
+  - 虚拟节点：20 张卡，15 张占用（runner pod）→ 虚拟剩余 5
 - **Pod 配置**：runner pod `required-npu-count=1`，namespace1
 - **预期**：本地胜出，虚拟节点被 Filter 拒绝，pod 调度到本地节点
 - **验证点**：pod 绑定到本地节点，不绑定到虚拟节点
@@ -26,7 +30,7 @@
 ### TC-04: 虚拟节点剩余 > 本地剩余 → 虚拟节点胜
 - **前置条件**：
   - namespace1 有 NamespaceOffloading
-  - 本地节点：10 张卡，8 张占用 → 本地剩余 2
+  - 本地节点：8 张卡，6 张占用 → 本地剩余 2
   - 虚拟节点：20 张卡，0 占用 → 虚拟剩余 20
 - **Pod 配置**：runner pod `required-npu-count=1`，namespace1
 - **预期**：虚拟节点胜出，本地节点被 Filter 拒绝，pod 调度到虚拟节点
@@ -35,7 +39,8 @@
 ### TC-05: 平局 → 本地优先
 - **前置条件**：
   - namespace1 有 NamespaceOffloading
-  - 本地剩余 = 5，虚拟节点剩余 = 5
+  - 本地节点：8 张卡，4 张占用 → 本地剩余 4
+  - 虚拟节点：20 张卡，16 张占用 → 虚拟剩余 4
 - **Pod 配置**：runner pod `required-npu-count=1`，namespace1
 - **预期**：本地胜出（`>=` 比较），pod 调度到本地节点
 - **验证点**：pod 绑定到本地节点
@@ -43,7 +48,7 @@
 ### TC-06: 胜者侧无足够 NPU → pod 保持 Pending
 - **前置条件**：
   - namespace1 有 NamespaceOffloading
-  - 本地剩余 = 0（全满），虚拟节点剩余 = 0（全满）
+  - 本地剩余 = 0（8 张全满），虚拟节点剩余 = 0（20 张全满）
 - **Pod 配置**：runner pod `required-npu-count=1`，namespace1
 - **预期**：PreFilter 返回 Unschedulable，pod 保持 Pending
 - **验证点**：pod 状态为 Pending，不调度
@@ -56,21 +61,31 @@
 - **前置条件**：
   - namespace1 有 NamespaceOffloading
   - namespace1 annotation `scheduling.volcano.sh/queue-name: q1`
-  - Queue q1 `spec.capability[huawei.com/ascend-310] = 5`
-  - 本地节点总卡数 20，已占用 3 → 物理剩余 17，但 Queue 限额 5 → 本地剩余 = 5-3 = 2
-  - 虚拟节点剩余 10
+  - Queue q1 `spec.capability[huawei.com/ascend-310] = 4`
+  - 本地节点总卡数 8，已占用 2 → 物理剩余 6，但 Queue 限额 4 → 本地剩余 = 4-2 = 2
+  - 虚拟节点剩余 15
 - **Pod 配置**：runner pod `required-npu-count=1`，namespace1
-- **预期**：本地剩余 2 < 虚拟剩余 10 → 虚拟节点胜出
-- **验证点**：pod 调度到虚拟节点（如果没有 Queue cap，本地剩余 17 > 10，本地会胜出）
+- **预期**：本地剩余 2 < 虚拟剩余 15 → 虚拟节点胜出
+- **验证点**：pod 调度到虚拟节点（如果没有 Queue cap，本地剩余 6 < 15，虚拟也会胜出；但如果虚拟剩余为 3，则 6 > 3 本地会胜出，而 2 < 3 虚拟胜出——Queue cap 改变了结果）
+
+### TC-07b: Queue 限额改变调度决策
+- **前置条件**：
+  - namespace1 有 NamespaceOffloading
+  - Queue q1 限额 = 6
+  - 本地总卡数 8，已占用 3 → 物理剩余 5，Queue cap 6 → 本地剩余 = 6-3 = 3
+  - 虚拟节点剩余 4
+- **Pod 配置**：runner pod `required-npu-count=1`，namespace1
+- **预期**：本地剩余 3 < 虚拟剩余 4 → 虚拟节点胜出
+- **验证点**：如果没有 Queue cap，本地剩余 5 >= 4 → 本地会胜出。Queue 限额将本地剩余从 5 降到 3，改变了胜者
 
 ### TC-08: Queue 限额 > 实际总卡数 → 不影响
 - **前置条件**：
   - namespace1 有 NamespaceOffloading
-  - Queue q1 限额 = 100
-  - 本地总卡数 20，已占用 3 → 本地剩余 17
-  - 虚拟节点剩余 10
+  - Queue q1 限额 = 20
+  - 本地总卡数 8，已占用 2 → 本地剩余 6
+  - 虚拟节点剩余 3
 - **Pod 配置**：runner pod `required-npu-count=1`，namespace1
-- **预期**：min(100, 20) = 20，本地剩余 17 > 10 → 本地胜出
+- **预期**：min(20, 8) = 8，本地剩余 6 >= 3 → 本地胜出
 - **验证点**：pod 调度到本地节点
 
 ### TC-09: Queue CRD 不存在 → 退化为实际总卡数
@@ -78,10 +93,10 @@
   - namespace1 有 NamespaceOffloading
   - namespace1 有 annotation `scheduling.volcano.sh/queue-name: q1`
   - Volcano Queue CRD 未安装（informer 为 nil）
-  - 本地总卡数 20，已占用 3 → 本地剩余 17
-  - 虚拟节点剩余 10
+  - 本地总卡数 8，已占用 2 → 本地剩余 6
+  - 虚拟节点剩余 3
 - **Pod 配置**：runner pod `required-npu-count=1`，namespace1
-- **预期**：getQueueNpuLimit 返回 false，本地总量 = 实际总卡数 20，本地剩余 17 > 10 → 本地胜出
+- **预期**：getQueueNpuLimit 返回 false，本地总量 = 实际总卡数 8，本地剩余 6 >= 3 → 本地胜出
 - **验证点**：pod 调度到本地节点，无错误日志
 
 ### TC-10: Queue 中无对应 NPU 资源键 → 退化为实际总卡数
@@ -99,21 +114,21 @@
 ### TC-11: nodeSelector 限定虚拟节点 → 直接调度到该虚拟节点
 - **前置条件**：
   - namespace1 有 NamespaceOffloading（clusterSelector 匹配 gy005 和其他虚拟节点）
-  - 本地节点 100 张空闲
-  - 虚拟节点 gy005 剩余 10 张
-  - 其他虚拟节点剩余 5 张
+  - 本地节点 8 张全空闲
+  - 虚拟节点 gy005 剩余 15 张
+  - 其他虚拟节点剩余 8 张
 - **Pod 配置**：runner pod `required-npu-count=1`，`nodeSelector: {liqo.io/remote-cluster-id: gy005}`
 - **预期**：
-  - nodeFreeNPU 只包含 gy005（nodeSelector 过滤）
-  - liqo 比对：localRemaining=0（无本地节点在 nodeFreeNPU 中），bestVirtRemaining=10
+  - nodeFreeNPU 只包含 gy005（nodeSelector 过滤掉本地和其他虚拟节点）
+  - liqo 比对：localRemaining=0（无本地节点在 nodeFreeNPU 中），bestVirtRemaining=15
   - 虚拟节点自动胜出
 - **验证点**：pod 绑定到 gy005 虚拟节点
 
 ### TC-12: nodeSelector 限定虚拟节点，该虚拟节点满 → pod Pending
 - **前置条件**：
   - namespace1 有 NamespaceOffloading
-  - 虚拟节点 gy005 满（剩余 0）
-  - 本地节点 100 张空闲
+  - 虚拟节点 gy005 满（20 张全占用，剩余 0）
+  - 本地节点 8 张全空闲
 - **Pod 配置**：runner pod `required-npu-count=1`，`nodeSelector: {liqo.io/remote-cluster-id: gy005}`
 - **预期**：
   - nodeFreeNPU 只包含 gy005（free=0）
@@ -127,30 +142,30 @@
 
 ### TC-13: namespace1 的 Queue 限额不影响 namespace2
 - **前置条件**：
-  - namespace1 有 NamespaceOffloading + Queue 限额 50
+  - namespace1 有 NamespaceOffloading + Queue 限额 4
   - namespace2 无 NamespaceOffloading
-  - 本地节点 100 张卡，namespace1 的 workflow pod 占用 50 张
-  - 虚拟节点满
+  - 本地节点 8 张卡，namespace1 的 workflow pod 占用 4 张
+  - 虚拟节点满（20 张全占用）
 - **Pod 配置**：
-  - pod A：namespace1 的 runner pod（本地和虚拟都满了 → Pending）
+  - pod A：namespace1 的 runner pod（本地 Queue 剩余 = min(4,8)-4 = 0，虚拟剩余 0 → Pending）
   - pod B：namespace2 的 runner pod `required-npu-count=1`
 - **预期**：
-  - pod A：本地剩余 = min(50,100)-50 = 0，虚拟剩余 0 → Pending
-  - pod B：nodeFreeNPU[local] = 100-50 = 50（物理剩余，不受 Queue 影响）→ 正常调度
+  - pod A：本地剩余 = 0，虚拟剩余 0 → Pending
+  - pod B：nodeFreeNPU[local] = 8-4 = 4（物理剩余，不受 Queue 影响）→ 正常调度
 - **验证点**：pod B 正常调度到本地节点，不受 namespace1 Queue 限额影响
 
 ### TC-14: namespace1 物理占满本地 → namespace2 也排队
 - **前置条件**：
-  - namespace1 有 workflow pod 占满本地 100 张卡
+  - namespace1 有 workflow pod 占满本地 8 张卡
   - namespace2 无 NamespaceOffloading
 - **Pod 配置**：namespace2 的 runner pod `required-npu-count=1`
-- **预期**：nodeFreeNPU[local] = 100-100 = 0 → hasCandidate = false → Pending
+- **预期**：nodeFreeNPU[local] = 8-8 = 0 → hasCandidate = false → Pending
 - **验证点**：pod B 保持 Pending（物理资源确实耗尽）
 
 ### TC-15: FIFO 不跨 namespace 阻塞
 - **前置条件**：
   - namespace1 和 namespace2 用相同 NPU 类型（`huawei.com/ascend-310`）
-  - namespace1 的 runner pod（T1 创建）Pending（资源不足）
+  - namespace1 的 runner pod（T1 创建）Pending（本地和虚拟都满了）
   - namespace2 的 runner pod（T2 > T1 创建）有充足本地资源
 - **Pod 配置**：namespace2 的 runner pod
 - **预期**：FIFO 检查跳过 namespace1 的 pod（不同 namespace）→ 通过
@@ -163,8 +178,8 @@
 ### TC-16: 同 namespace，runner1 限定虚拟节点（满），runner2 可用本地 → 不阻塞
 - **前置条件**：
   - namespace1 有 NamespaceOffloading
-  - runner1（T1）：`nodeSelector: {liqo.io/remote-cluster-id: gy005}`，虚拟节点满 → Pending
-  - runner2（T2 > T1）：无 nodeSelector，本地有 50 张空闲
+  - runner1（T1）：`nodeSelector: {liqo.io/remote-cluster-id: gy005}`，gy005 虚拟节点满 → Pending
+  - runner2（T2 > T1）：无 nodeSelector，本地有 4 张空闲
 - **Pod 配置**：runner2
 - **预期**：
   - FIFO 检查发现 runner1，但 runner1 有 nodeSelector `{liqo.io/remote-cluster-id: gy005}`
@@ -175,7 +190,7 @@
 ### TC-17: 同 namespace，两个 runner 无 nodeSelector → 正常 FIFO
 - **前置条件**：
   - namespace1，runner1（T1）和 runner2（T2），都无 nodeSelector
-  - 本地资源只够一个
+  - 本地资源只够一个（如本地剩余 1，各需 1 张）
 - **Pod 配置**：runner2
 - **预期**：FIFO 发现 runner1 更老且无 unshared constraint → 阻塞 runner2
 - **验证点**：runner2 保持 Pending，等 runner1 先调度
@@ -184,7 +199,7 @@
 - **前置条件**：
   - namespace1，runner1（T1）和 runner2（T2）
   - 两者都有 `nodeSelector: {liqo.io/remote-cluster-id: gy005}`
-  - gy005 虚拟节点只够一个
+  - gy005 虚拟节点只够一个（剩余 1，各需 1 张）
 - **Pod 配置**：runner2
 - **预期**：nodeSelector 相同 → 无 unshared constraint → FIFO 阻塞 runner2
 - **验证点**：runner2 等 runner1 先调度
@@ -193,7 +208,7 @@
 - **前置条件**：
   - namespace1，runner1（T1）`nodeSelector: {liqo.io/remote-cluster-id: gy005}`
   - runner2（T2）`nodeSelector: {liqo.io/remote-cluster-id: gy006}`
-  - gy005 满，gy006 有资源
+  - gy005 满（20 张全占用），gy006 有资源（剩余 10）
 - **Pod 配置**：runner2
 - **预期**：runner1 的 nodeSelector key `liqo.io/remote-cluster-id` 值 `gy005` ≠ runner2 的 `gy006` → unshared constraint → 跳过 runner1
 - **验证点**：runner2 正常调度到 gy006
@@ -204,39 +219,39 @@
 
 ### TC-20: 虚拟节点占用通过 runner pod 标签累加
 - **前置条件**：
-  - 虚拟节点 8 张卡
-  - 虚拟节点上有 3 个 runner pod：required-npu-count 分别为 2、3、1
-- **预期**：calcVirtualNodeOccupied = 6，虚拟节点剩余 = 8-6 = 2
-- **验证点**：新 runner pod `required-npu-count=3` 时，虚拟节点剩余 2 < 3，不会调度到虚拟节点
+  - 虚拟节点 20 张卡
+  - 虚拟节点上有 3 个 runner pod：required-npu-count 分别为 4、8、2
+- **预期**：calcVirtualNodeOccupied = 14，虚拟节点剩余 = 20-14 = 6
+- **验证点**：新 runner pod `required-npu-count=8` 时，虚拟节点剩余 6 < 8，不会调度到虚拟节点
 
 ### TC-21: 虚拟节点占用只算匹配型号的 runner pod
 - **前置条件**：
-  - 虚拟节点 8 张卡
-  - runner pod A：`ResourceDomain=huawei.com, ResourceModel=ascend-310, required-npu-count=2`
-  - runner pod B：`ResourceDomain=huawei.com, ResourceModel=ascend-910, required-npu-count=3`
+  - 虚拟节点 20 张卡
+  - runner pod A：`ResourceDomain=huawei.com, ResourceModel=ascend-310, required-npu-count=4`
+  - runner pod B：`ResourceDomain=huawei.com, ResourceModel=ascend-910, required-npu-count=8`
 - **Pod 配置**：runner pod `ResourceModel=ascend-310`
-- **预期**：只算 A（ascend-310），占用 = 2，不算 B（ascend-910）
-- **验证点**：虚拟节点剩余 = 8-2 = 6
+- **预期**：只算 A（ascend-310），占用 = 4，不算 B（ascend-910）
+- **验证点**：虚拟节点剩余 = 20-4 = 16
 
 ### TC-22: in-flight 预留不叠加到虚拟节点（避免双重计数）
 - **前置条件**：
   - namespace1 有 NamespaceOffloading
   - 虚拟节点 20 张卡
-  - namespace1 的 runner pod（required-npu-count=10）已绑定到虚拟节点
+  - namespace1 的 runner pod（required-npu-count=8）已绑定到虚拟节点
   - runner pod 的 in-flight 预留仍存在（PostBind 不清除 runner pod 预留）
 - **Pod 配置**：namespace1 的新 runner pod
 - **预期**：
-  - calcVirtualNodeOccupied = 10（runner pod 在 snapshot 中）
+  - calcVirtualNodeOccupied = 8（runner pod 在 snapshot 中）
   - in-flight 预留：virtualNodes[virtNodeName] = true → 跳过（不加）
-  - 虚拟节点总占用 = 10（不是 20），剩余 = 10
-- **验证点**：虚拟节点剩余 10，不是 0（如果没有跳过预留，剩余会是 0）
+  - 虚拟节点总占用 = 8（不是 16），剩余 = 12
+- **验证点**：虚拟节点剩余 12，不是 4（如果没有跳过预留，剩余会是 20-8-8=4）
 
 ---
 
 ## 七、降级与容错
 
 ### TC-23: Liqo CRD 未安装 → 静默降级
-- **前置条件**：Liqo CRD（`offloading.liqo.io`）未安装，集群有虚拟节点（手动创建的带 liqo 标签的 Node）
+- **前置条件**：Liqo CRD（`offloading.liqo.io`）未安装，集群有虚拟节点（手动创建的带 liqo 标签的 Node，20 张卡）
 - **Pod 配置**：runner pod
 - **预期**：
   - crdExists 返回 false → nsOffloadingLister 为 nil
@@ -250,13 +265,13 @@
 - **预期**：
   - queueLister 为 nil
   - applyLiqoComparison 中 `pl.nsLister != nil` 但 getQueueNpuLimit 中 `qLister == nil` → 返回 false
-  - 本地总量 = 实际总卡数（不受 Queue 限额影响）
+  - 本地总量 = 实际总卡数 8（不受 Queue 限额影响）
 - **验证点**：liqo 比对正常执行，只是没有 Queue cap
 
 ### TC-25: NamespaceOffloading 的 clusterSelector 未匹配任何虚拟节点
 - **前置条件**：
   - namespace1 有 NamespaceOffloading，clusterSelector 匹配 `liqo.io/remote-cluster-id: nonexistent`
-  - 集群中无匹配的虚拟节点
+  - 集群中无匹配的虚拟节点（只有 gy005、gy006）
 - **Pod 配置**：namespace1 的 runner pod
 - **预期**：
   - getEligibleVirtualNodes 返回空集合
@@ -268,7 +283,7 @@
 ### TC-26: 动态 informer 缓存未同步时调度
 - **前置条件**：
   - 调度器刚启动，informer 缓存尚未同步
-  - 集群有虚拟节点和 NamespaceOffloading CR
+  - 集群有虚拟节点（20 张卡）和 NamespaceOffloading CR
 - **Pod 配置**：runner pod
 - **预期**：
   - nsOffloadingLister.Get 返回 false（缓存未同步）
@@ -284,26 +299,27 @@
 ### TC-27: 多个虚拟节点，选剩余最多的
 - **前置条件**：
   - namespace1 有 NamespaceOffloading（clusterSelector 匹配所有虚拟节点）
-  - 虚拟节点 A：剩余 3，虚拟节点 B：剩余 8
-  - 本地剩余 5
+  - 虚拟节点 gy005：20 张卡，占用 16 → 剩余 4
+  - 虚拟节点 gy006：20 张卡，占用 6 → 剩余 14
+  - 本地剩余 6
 - **Pod 配置**：runner pod `required-npu-count=1`
 - **预期**：
-  - bestVirtRemaining = 8（虚拟节点 B）
-  - localRemaining 5 < 8 → 虚拟节点 B 胜出
-  - nodeFreeNPU 只保留虚拟节点 B
-- **验证点**：pod 绑定到虚拟节点 B
+  - bestVirtRemaining = 14（gy006）
+  - localRemaining 6 < 14 → gy006 胜出
+  - nodeFreeNPU 只保留 gy006
+- **验证点**：pod 绑定到 gy006
 
 ### TC-28: clusterSelector 过滤部分虚拟节点
 - **前置条件**：
   - namespace1 有 NamespaceOffloading，clusterSelector: `{matchLabels: {liqo.io/remote-cluster-id: gy005}}`
-  - 虚拟节点 gy005：剩余 3
-  - 虚拟节点 gy006：剩余 10（但不匹配 clusterSelector）
-  - 本地剩余 5
+  - 虚拟节点 gy005：剩余 4
+  - 虚拟节点 gy006：剩余 14（但不匹配 clusterSelector）
+  - 本地剩余 6
 - **Pod 配置**：runner pod
 - **预期**：
   - eligibleVirtuals = {gy005}（gy006 不匹配 clusterSelector）
-  - bestVirtRemaining = 3（gy005）
-  - localRemaining 5 >= 3 → 本地胜出
+  - bestVirtRemaining = 4（gy005）
+  - localRemaining 6 >= 4 → 本地胜出
   - gy005 和 gy006 都从 nodeFreeNPU 删除
 - **验证点**：pod 绑定到本地节点，不绑定到 gy005 或 gy006
 
@@ -313,13 +329,15 @@
 
 ### TC-29: 多个 runner pod 并发调度，in-flight 预留防止超卖
 - **前置条件**：
-  - 本地节点 4 张卡，0 占用
-  - 3 个 runner pod 并发提交，各 `required-npu-count=2`
+  - 本地节点 8 张卡，0 占用
+  - 5 个 runner pod 并发提交，各 `required-npu-count=2`
 - **预期**：
-  - 第一个 pod：Reserve 预留 2 张 → 本地剩余 2
-  - 第二个 pod：本地剩余 2 >= 2 → 通过，Reserve 预留 2 张 → 本地剩余 0
-  - 第三个 pod：本地剩余 0 < 2 → Unschedulable
-- **验证点**：只有 2 个 pod 调度成功，第三个 Pending
+  - 第 1 个 pod：Reserve 预留 2 张 → 本地剩余 6
+  - 第 2 个 pod：Reserve 预留 2 张 → 本地剩余 4
+  - 第 3 个 pod：Reserve 预留 2 张 → 本地剩余 2
+  - 第 4 个 pod：Reserve 预留 2 张 → 本地剩余 0
+  - 第 5 个 pod：本地剩余 0 < 2 → Unschedulable
+- **验证点**：只有 4 个 pod 调度成功，第 5 个 Pending
 
 ### TC-30: runner pod 绑定后预留保留，workflow pod 启动后预留清除
 - **前置条件**：
@@ -339,23 +357,23 @@
 
 ### TC-31: 本地总剩余为负（Queue 限额 < 实际占用）→ clamp 到 0
 - **前置条件**：
-  - namespace1 Queue 限额 5
-  - 本地实际占用 8（超过 Queue 限额，可能是 Queue 配置后已有占用）
-  - 虚拟节点剩余 3
+  - namespace1 Queue 限额 4
+  - 本地实际占用 6（超过 Queue 限额，可能是 Queue 配置前已有占用）
+  - 虚拟节点剩余 5
 - **Pod 配置**：runner pod
 - **预期**：
-  - localTotalCapacity = min(5, 100) = 5
-  - localRemaining = 5 - 8 = -3 → clamp 到 0
-  - 0 < 3 → 虚拟节点胜出
+  - localTotalCapacity = min(4, 8) = 4
+  - localRemaining = 4 - 6 = -2 → clamp 到 0
+  - 0 < 5 → 虚拟节点胜出
 - **验证点**：pod 调度到虚拟节点
 
 ### TC-32: required-npu-count 超过任何单节点容量 → Pending
 - **前置条件**：
   - 本地节点单节点最大 8 张卡
-  - 虚拟节点最大 10 张卡
+  - 虚拟节点最大 20 张卡
   - namespace1 有 NamespaceOffloading
-- **Pod 配置**：runner pod `required-npu-count=20`
-- **预期**：无论本地还是虚拟节点，单节点空闲都 < 20 → hasCandidate = false → Pending
+- **Pod 配置**：runner pod `required-npu-count=21`
+- **预期**：虚拟节点最大 20 < 21，本地最大 8 < 21 → hasCandidate = false → Pending
 - **验证点**：pod 保持 Pending
 
 ### TC-33: 虚拟节点 Allocatable 中无 NPU 资源
