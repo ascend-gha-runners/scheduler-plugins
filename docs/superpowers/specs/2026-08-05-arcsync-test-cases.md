@@ -1,6 +1,8 @@
 # ARCSync Liqo/Volcano 调度压测用例
 
-> **集群配置**：本地集群 8 张 NPU 卡，远端虚拟节点 20 张 NPU 卡
+> **集群配置**：
+> - 主集群 gy006：本地节点，8 张 NPU 卡
+> - 虚拟节点 cn12-001：远端集群，20 张 NPU 卡（当前唯一可用虚拟节点）
 > 
 > 资源类型：`huawei.com/ascend-1980`
 
@@ -113,25 +115,25 @@
 
 ### TC-11: nodeSelector 限定虚拟节点 → 直接调度到该虚拟节点
 - **前置条件**：
-  - namespace1 有 NamespaceOffloading（clusterSelector 匹配 gy005 和其他虚拟节点）
+  - namespace1 有 NamespaceOffloading（clusterSelector 匹配 cn12-001 和其他虚拟节点）
   - 本地节点 8 张全空闲
-  - 虚拟节点 gy005 剩余 15 张
+  - 虚拟节点 cn12-001 剩余 15 张
   - 其他虚拟节点剩余 8 张
-- **Pod 配置**：runner pod `required-npu-count=1`，`nodeSelector: {liqo.io/remote-cluster-id: gy005}`
+- **Pod 配置**：runner pod `required-npu-count=1`，`nodeSelector: {liqo.io/remote-cluster-id: cn12-001}`
 - **预期**：
-  - nodeFreeNPU 只包含 gy005（nodeSelector 过滤掉本地和其他虚拟节点）
+  - nodeFreeNPU 只包含 cn12-001（nodeSelector 过滤掉本地和其他虚拟节点）
   - liqo 比对：localRemaining=0（无本地节点在 nodeFreeNPU 中），bestVirtRemaining=15
   - 虚拟节点自动胜出
-- **验证点**：pod 绑定到 gy005 虚拟节点
+- **验证点**：pod 绑定到 cn12-001 虚拟节点
 
 ### TC-12: nodeSelector 限定虚拟节点，该虚拟节点满 → pod Pending
 - **前置条件**：
   - namespace1 有 NamespaceOffloading
-  - 虚拟节点 gy005 满（20 张全占用，剩余 0）
+  - 虚拟节点 cn12-001 满（20 张全占用，剩余 0）
   - 本地节点 8 张全空闲
-- **Pod 配置**：runner pod `required-npu-count=1`，`nodeSelector: {liqo.io/remote-cluster-id: gy005}`
+- **Pod 配置**：runner pod `required-npu-count=1`，`nodeSelector: {liqo.io/remote-cluster-id: cn12-001}`
 - **预期**：
-  - nodeFreeNPU 只包含 gy005（free=0）
+  - nodeFreeNPU 只包含 cn12-001（free=0）
   - 本地节点不匹配 nodeSelector → 不在 nodeFreeNPU 中
   - hasCandidate = false → Unschedulable
 - **验证点**：pod 保持 Pending，不会调度到本地节点
@@ -178,11 +180,11 @@
 ### TC-16: 同 namespace，runner1 限定虚拟节点（满），runner2 可用本地 → 不阻塞
 - **前置条件**：
   - namespace1 有 NamespaceOffloading
-  - runner1（T1）：`nodeSelector: {liqo.io/remote-cluster-id: gy005}`，gy005 虚拟节点满 → Pending
+  - runner1（T1）：`nodeSelector: {liqo.io/remote-cluster-id: cn12-001}`，cn12-001 虚拟节点满 → Pending
   - runner2（T2 > T1）：无 nodeSelector，本地有 4 张空闲
 - **Pod 配置**：runner2
 - **预期**：
-  - FIFO 检查发现 runner1，但 runner1 有 nodeSelector `{liqo.io/remote-cluster-id: gy005}`
+  - FIFO 检查发现 runner1，但 runner1 有 nodeSelector `{liqo.io/remote-cluster-id: cn12-001}`
   - runner2 的 nodeSelector 无此 key → `hasUnsharedConstraint = true` → 跳过 runner1
   - FIFO 通过 → runner2 调度到本地
 - **验证点**：runner2 正常调度，不被 runner1 的 head-of-line blocking 影响
@@ -198,20 +200,21 @@
 ### TC-18: 同 namespace，两个 runner nodeSelector 相同 → 正常 FIFO
 - **前置条件**：
   - namespace1，runner1（T1）和 runner2（T2）
-  - 两者都有 `nodeSelector: {liqo.io/remote-cluster-id: gy005}`
-  - gy005 虚拟节点只够一个（剩余 1，各需 1 张）
+  - 两者都有 `nodeSelector: {liqo.io/remote-cluster-id: cn12-001}`
+  - cn12-001 虚拟节点只够一个（剩余 1，各需 1 张）
 - **Pod 配置**：runner2
 - **预期**：nodeSelector 相同 → 无 unshared constraint → FIFO 阻塞 runner2
 - **验证点**：runner2 等 runner1 先调度
 
-### TC-19: 同 namespace，runner1 限定 gy005，runner2 限定 gy006 → 不互相阻塞
+### TC-19: 同 namespace，runner1 限定 cn12-001，runner2 限定另一虚拟节点 → 不互相阻塞
 - **前置条件**：
-  - namespace1，runner1（T1）`nodeSelector: {liqo.io/remote-cluster-id: gy005}`
-  - runner2（T2）`nodeSelector: {liqo.io/remote-cluster-id: gy006}`
-  - gy005 满（20 张全占用），gy006 有资源（剩余 10）
+  - namespace1，runner1（T1）`nodeSelector: {liqo.io/remote-cluster-id: cn12-001}`
+  - runner2（T2）`nodeSelector: {liqo.io/remote-cluster-id: <其他虚拟节点>}`
+  - cn12-001 满（20 张全占用），另一个虚拟节点有资源
 - **Pod 配置**：runner2
-- **预期**：runner1 的 nodeSelector key `liqo.io/remote-cluster-id` 值 `gy005` ≠ runner2 的 `gy006` → unshared constraint → 跳过 runner1
-- **验证点**：runner2 正常调度到 gy006
+- **预期**：runner1 的 nodeSelector 值 `cn12-001` ≠ runner2 的值 → unshared constraint → 跳过 runner1
+- **验证点**：runner2 正常调度到另一个虚拟节点
+- **注意**：当前环境只有一个虚拟节点 cn12-001，此用例需要新增第二个虚拟节点后才能测试
 
 ---
 
@@ -271,7 +274,7 @@
 ### TC-25: NamespaceOffloading 的 clusterSelector 未匹配任何虚拟节点
 - **前置条件**：
   - namespace1 有 NamespaceOffloading，clusterSelector 匹配 `liqo.io/remote-cluster-id: nonexistent`
-  - 集群中无匹配的虚拟节点（只有 gy005、gy006）
+  - 集群中无匹配的虚拟节点（只有 cn12-001、gy006）
 - **Pod 配置**：namespace1 的 runner pod
 - **预期**：
   - getEligibleVirtualNodes 返回空集合
@@ -296,32 +299,34 @@
 
 ## 八、多虚拟节点场景
 
+> **注意**：当前环境只有一个虚拟节点 cn12-001，以下用例需要新增第二个虚拟节点后才能测试。
+
 ### TC-27: 多个虚拟节点，选剩余最多的
 - **前置条件**：
   - namespace1 有 NamespaceOffloading（clusterSelector 匹配所有虚拟节点）
-  - 虚拟节点 gy005：20 张卡，占用 16 → 剩余 4
-  - 虚拟节点 gy006：20 张卡，占用 6 → 剩余 14
+  - 虚拟节点 cn12-001：20 张卡，占用 16 → 剩余 4
+  - 虚拟节点 cn12-002：20 张卡，占用 6 → 剩余 14
   - 本地剩余 6
 - **Pod 配置**：runner pod `required-npu-count=1`
 - **预期**：
-  - bestVirtRemaining = 14（gy006）
-  - localRemaining 6 < 14 → gy006 胜出
-  - nodeFreeNPU 只保留 gy006
-- **验证点**：pod 绑定到 gy006
+  - bestVirtRemaining = 14（cn12-002）
+  - localRemaining 6 < 14 → cn12-002 胜出
+  - nodeFreeNPU 只保留 cn12-002
+- **验证点**：pod 绑定到 cn12-002
 
 ### TC-28: clusterSelector 过滤部分虚拟节点
 - **前置条件**：
-  - namespace1 有 NamespaceOffloading，clusterSelector: `{matchLabels: {liqo.io/remote-cluster-id: gy005}}`
-  - 虚拟节点 gy005：剩余 4
-  - 虚拟节点 gy006：剩余 14（但不匹配 clusterSelector）
+  - namespace1 有 NamespaceOffloading，clusterSelector: `{matchLabels: {liqo.io/remote-cluster-id: cn12-001}}`
+  - 虚拟节点 cn12-001：剩余 4
+  - 虚拟节点 cn12-002：剩余 14（但不匹配 clusterSelector）
   - 本地剩余 6
 - **Pod 配置**：runner pod
 - **预期**：
-  - eligibleVirtuals = {gy005}（gy006 不匹配 clusterSelector）
-  - bestVirtRemaining = 4（gy005）
+  - eligibleVirtuals = {cn12-001}（cn12-002 不匹配 clusterSelector）
+  - bestVirtRemaining = 4（cn12-001）
   - localRemaining 6 >= 4 → 本地胜出
-  - gy005 和 gy006 都从 nodeFreeNPU 删除
-- **验证点**：pod 绑定到本地节点，不绑定到 gy005 或 gy006
+  - cn12-001 和 cn12-002 都从 nodeFreeNPU 删除
+- **验证点**：pod 绑定到本地节点，不绑定到 cn12-001 或 cn12-002
 
 ---
 
