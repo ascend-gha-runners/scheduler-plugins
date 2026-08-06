@@ -352,6 +352,25 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 		}
 	}
 
+	if queueLimit, qFound := getQueueNpuLimit(pod, pl.queueLister, fullResourceName); qFound {
+		var nsOccupied int64
+		for _, usage := range nsLocalPhysicalUsage {
+			nsOccupied += usage
+		}
+		for _, res := range nsLocalReservated {
+			nsOccupied += res
+		}
+		if nsOccupied+int64(reqCount) > queueLimit {
+			for nodeName := range nodeFreeNPU {
+				if !virtualNodes[nodeName] {
+					delete(nodeFreeNPU, nodeName)
+				}
+			}
+			klog.InfoS("ARCSync: queue limit exceeded, removing local nodes",
+				"pod", pod.Name, "queueLimit", queueLimit, "nsOccupied", nsOccupied, "required", reqCount)
+		}
+	}
+
 	hasCandidate := false
 	for _, free := range nodeFreeNPU {
 		if free >= int64(reqCount) {
