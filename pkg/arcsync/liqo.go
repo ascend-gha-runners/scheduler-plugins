@@ -37,10 +37,6 @@ type queueLister interface {
 	Get(queueName string) (*unstructured.Unstructured, bool, error)
 }
 
-type namespaceLister interface {
-	Get(name string) (*v1.Namespace, error)
-}
-
 type dynamicNSOffloadingLister struct {
 	lister cache.GenericLister
 }

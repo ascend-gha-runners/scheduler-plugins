@@ -8,9 +8,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/defaultbinder"
@@ -178,15 +176,6 @@ func makeNamespaceOffloading(namespace, matchKey, matchVal string) *unstructured
 	return obj
 }
 
-func makeNamespace(name string, annotations map[string]string) *v1.Namespace {
-	return &v1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        name,
-			Annotations: annotations,
-		},
-	}
-}
-
 func makeQueueObject(name string, capability map[string]string) *unstructured.Unstructured {
 	obj := &unstructured.Unstructured{}
 	obj.SetGroupVersionKind(gvrQueue.GroupVersion().WithKind("Queue"))
@@ -217,26 +206,6 @@ func (f *fakeQueueLister) Get(queueName string) (*unstructured.Unstructured, boo
 	return obj, ok, nil
 }
 
-type fakeNamespaceLister struct {
-	namespaces map[string]*v1.Namespace
-}
-
-func (f *fakeNamespaceLister) Get(name string) (*v1.Namespace, error) {
-	ns, ok := f.namespaces[name]
-	if !ok {
-		return nil, fmt.Errorf("namespace %s not found", name)
-	}
-	return ns, nil
-}
-
-func (f *fakeNamespaceLister) List(selector labels.Selector) ([]*v1.Namespace, error) {
-	var result []*v1.Namespace
-	for _, ns := range f.namespaces {
-		result = append(result, ns)
-	}
-	return result, nil
-}
-
 func TestGetQueueNpuLimit(t *testing.T) {
 	queueObj := makeQueueObject("my-queue", map[string]string{
 		string(testFullResName): "8",
@@ -247,32 +216,39 @@ func TestGetQueueNpuLimit(t *testing.T) {
 
 	tests := []struct {
 		name        string
-		ns          *v1.Namespace
+		pod         *v1.Pod
 		expected    int64
 		expectFound bool
 	}{
 		{
-			name:        "queue with matching NPU resource",
-			ns:          makeNamespace("ns1", map[string]string{"scheduling.volcano.sh/queue-name": "my-queue"}),
-			expected:    8,
+			name: "pod with queue annotation",
+			pod:  st.MakePod().Name("p1").Namespace("ns1").UID("p1").Obj(),
+			expected: 8,
 			expectFound: true,
 		},
 		{
-			name:        "no queue annotation",
-			ns:          makeNamespace("ns2", nil),
+			name:        "pod without queue annotation",
+			pod:         st.MakePod().Name("p2").Namespace("ns2").UID("p2").Obj(),
 			expected:    0,
 			expectFound: false,
 		},
 		{
-			name:        "queue not found",
-			ns:          makeNamespace("ns3", map[string]string{"scheduling.volcano.sh/queue-name": "nonexistent"}),
+			name: "queue not found",
+			pod: func() *v1.Pod {
+				p := st.MakePod().Name("p3").Namespace("ns3").UID("p3").Obj()
+				p.Annotations = map[string]string{"scheduling.volcano.sh/queue-name": "nonexistent"}
+				return p
+			}(),
 			expected:    0,
 			expectFound: false,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, found := getQueueNpuLimit(nil, tt.ns, qLister, testFullResName)
+			if tt.name == "pod with queue annotation" {
+				tt.pod.Annotations = map[string]string{"scheduling.volcano.sh/queue-name": "my-queue"}
+			}
+			got, found := getQueueNpuLimit(tt.pod, qLister, testFullResName)
 			if got != tt.expected || found != tt.expectFound {
 				t.Errorf("getQueueNpuLimit() = (%d, %v), want (%d, %v)", got, found, tt.expected, tt.expectFound)
 			}
@@ -445,7 +421,6 @@ func TestPreFilterVolcanoQueueCapsLocal(t *testing.T) {
 
 	fwk, state := setupTestFramework(t, allPods, nodes)
 
-	nsObj := makeNamespace("ns1", map[string]string{"scheduling.volcano.sh/queue-name": "q1"})
 	queueObj := makeQueueObject("q1", map[string]string{string(testFullResName): "5"})
 	nsOffloading := makeNamespaceOffloading("ns1", "liqo.io/remote-cluster-id", "cluster-a")
 	pl := &ARCSync{
@@ -453,10 +428,10 @@ func TestPreFilterVolcanoQueueCapsLocal(t *testing.T) {
 		inFlightReservations: make(map[string]reservation),
 		nsOffloadingLister:   &fakeNSOffloadingLister{objects: map[string]*unstructured.Unstructured{"ns1": nsOffloading}},
 		queueLister:          &fakeQueueLister{objects: map[string]*unstructured.Unstructured{"q1": queueObj}},
-		nsLister:             &fakeNamespaceLister{namespaces: map[string]*v1.Namespace{"ns1": nsObj}},
 	}
 
 	targetPod := makeRunnerPodWithLabels("new-runner", "ns1", 1)
+	targetPod.Annotations = map[string]string{"scheduling.volcano.sh/queue-name": "q1"}
 	_, status := pl.PreFilter(context.TODO(), state, targetPod)
 	if status.Code() != framework.Success {
 		t.Fatalf("PreFilter failed: %v", status.Message())

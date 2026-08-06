@@ -10,17 +10,11 @@ import (
 
 const queueAnnotationKey = "scheduling.volcano.sh/queue-name"
 
-func getQueueNpuLimit(pod *v1.Pod, ns *v1.Namespace, qLister queueLister, fullResourceName v1.ResourceName) (int64, bool) {
-	if qLister == nil {
+func getQueueNpuLimit(pod *v1.Pod, qLister queueLister, fullResourceName v1.ResourceName) (int64, bool) {
+	if pod == nil || qLister == nil {
 		return 0, false
 	}
-	queueName := ""
-	if pod != nil {
-		queueName = pod.Annotations[queueAnnotationKey]
-	}
-	if queueName == "" && ns != nil {
-		queueName = ns.Annotations[queueAnnotationKey]
-	}
+	queueName := pod.Annotations[queueAnnotationKey]
 	if queueName == "" {
 		return 0, false
 	}

@@ -45,7 +45,6 @@ type ARCSync struct {
 	mu                   sync.Mutex
 	nsOffloadingLister   nsOffloadingLister
 	queueLister          queueLister
-	nsLister             namespaceLister
 }
 
 type preFilterState struct {
@@ -69,7 +68,6 @@ func New(ctx context.Context, _ runtime.Object, h framework.Handle) (framework.P
 	pl := &ARCSync{
 		handle:               h,
 		podLister:            h.SharedInformerFactory().Core().V1().Pods().Lister(),
-		nsLister:             h.SharedInformerFactory().Core().V1().Namespaces().Lister(),
 		inFlightReservations: make(map[string]reservation),
 	}
 
@@ -418,20 +416,9 @@ func (pl *ARCSync) applyLiqoComparison(
 	}
 
 	localTotalCapacity := localTotalAllocatable
-	if pl.nsLister != nil {
-		ns, err := pl.nsLister.Get(pod.Namespace)
-		if err == nil && ns != nil {
-			if queueLimit, qFound := getQueueNpuLimit(pod, ns, pl.queueLister, fullResourceName); qFound {
-				if queueLimit < localTotalCapacity {
-					localTotalCapacity = queueLimit
-				}
-			}
-		}
-	} else {
-		if queueLimit, qFound := getQueueNpuLimit(pod, nil, pl.queueLister, fullResourceName); qFound {
-			if queueLimit < localTotalCapacity {
-				localTotalCapacity = queueLimit
-			}
+	if queueLimit, qFound := getQueueNpuLimit(pod, pl.queueLister, fullResourceName); qFound {
+		if queueLimit < localTotalCapacity {
+			localTotalCapacity = queueLimit
 		}
 	}
 
