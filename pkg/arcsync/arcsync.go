@@ -318,12 +318,13 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 	pl.mu.Unlock()
 
 	nodeFreeNPU := make(map[string]int64)
+	hasVirtualNodes := len(virtualNodes) > 0
 	for _, nodeInfo := range nodeInfos {
 		node := nodeInfo.Node()
 		if node == nil || !canScheduleOnNode(node) {
 			continue
 		}
-		if !nodeMatchesSelector(node, pod.Spec.NodeSelector) {
+		if hasVirtualNodes && !nodeMatchesSelector(node, pod.Spec.NodeSelector) {
 			continue
 		}
 		allocatable := node.Status.Allocatable[fullResourceName]
