@@ -272,7 +272,7 @@ func TestGetQueueNpuLimit(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, found := getQueueNpuLimit(tt.ns, qLister, testFullResName)
+			got, found := getQueueNpuLimit(nil, tt.ns, qLister, testFullResName)
 			if got != tt.expected || found != tt.expectFound {
 				t.Errorf("getQueueNpuLimit() = (%d, %v), want (%d, %v)", got, found, tt.expected, tt.expectFound)
 			}

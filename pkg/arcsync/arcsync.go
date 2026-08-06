@@ -421,10 +421,16 @@ func (pl *ARCSync) applyLiqoComparison(
 	if pl.nsLister != nil {
 		ns, err := pl.nsLister.Get(pod.Namespace)
 		if err == nil && ns != nil {
-			if queueLimit, qFound := getQueueNpuLimit(ns, pl.queueLister, fullResourceName); qFound {
+			if queueLimit, qFound := getQueueNpuLimit(pod, ns, pl.queueLister, fullResourceName); qFound {
 				if queueLimit < localTotalCapacity {
 					localTotalCapacity = queueLimit
 				}
+			}
+		}
+	} else {
+		if queueLimit, qFound := getQueueNpuLimit(pod, nil, pl.queueLister, fullResourceName); qFound {
+			if queueLimit < localTotalCapacity {
+				localTotalCapacity = queueLimit
 			}
 		}
 	}
