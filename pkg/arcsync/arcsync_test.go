@@ -81,7 +81,7 @@ func TestCalcVirtualNodeOccupied(t *testing.T) {
 		nodeInfo.AddPod(p)
 	}
 
-	got := calcVirtualNodeOccupied(nodeInfo, testResDomain, testResModel, testFullResName)
+	got := calcVirtualNodeOccupied(nodeInfo, testResDomain, testResModel)
 	if got != 6 {
 		t.Errorf("calcVirtualNodeOccupied() = %d, want 6", got)
 	}
@@ -106,7 +106,7 @@ func TestCalcVirtualNodeOccupiedMismatchedModel(t *testing.T) {
 		nodeInfo.AddPod(p)
 	}
 
-	got := calcVirtualNodeOccupied(nodeInfo, testResDomain, testResModel, testFullResName)
+	got := calcVirtualNodeOccupied(nodeInfo, testResDomain, testResModel)
 	if got != 2 {
 		t.Errorf("calcVirtualNodeOccupied() = %d, want 2 (only matching model)", got)
 	}
