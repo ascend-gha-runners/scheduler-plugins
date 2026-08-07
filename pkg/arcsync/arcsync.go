@@ -153,7 +153,7 @@ func getBaseName(name string) string {
 // This enforces strict FIFO: a runner pod only proceeds when it is the oldest waiting one.
 // Using CreationTimestamp avoids the backoff side-effect where older (more-retried) pods
 // accumulate longer backoff delays and get jumped by newer pods.
-func (pl *ARCSync) isOldestPendingRunner(pod *v1.Pod) bool {
+func (pl *ARCSync) isOldestPendingRunner(pod *v1.Pod, nsHasOffloading bool) bool {
 	if pl.podLister == nil {
 		return true
 	}
@@ -167,33 +167,19 @@ func (pl *ARCSync) isOldestPendingRunner(pod *v1.Pod) bool {
 		return true
 	}
 
+	myPool := npuFIFOPool(pod)
+
 	for _, p := range allPods {
 		if p.UID == pod.UID {
 			continue
 		}
-		// skip completed pods
 		if p.Status.Phase == v1.PodSucceeded || p.Status.Phase == v1.PodFailed {
 			continue
 		}
-		// skip already-bound pods (they are not "pending" in the queue)
 		if p.Spec.NodeName != "" {
 			continue
 		}
-		// only compare runner pods of the same NPU resource type in the same namespace
 		if p.Namespace != pod.Namespace {
-			continue
-		}
-		// skip pods with nodeSelector constraints the current pod doesn't share —
-		// they target different node pools (e.g. a pod pinned to a virtual node
-		// shouldn't block a pod that can use local nodes)
-		hasUnsharedConstraint := false
-		for k, v := range p.Spec.NodeSelector {
-			if pod.Spec.NodeSelector[k] != v {
-				hasUnsharedConstraint = true
-				break
-			}
-		}
-		if hasUnsharedConstraint {
 			continue
 		}
 		if p.Labels[RequiredNPUCount] == "" {
@@ -202,7 +188,22 @@ func (pl *ARCSync) isOldestPendingRunner(pod *v1.Pod) bool {
 		if p.Labels[ResourceDomain] != resDomain || p.Labels[ResourceModel] != resModel {
 			continue
 		}
-		// is p older than current pod?
+		if nsHasOffloading {
+			if npuFIFOPool(p) != myPool {
+				continue
+			}
+		} else {
+			hasUnsharedConstraint := false
+			for k, v := range p.Spec.NodeSelector {
+				if pod.Spec.NodeSelector[k] != v {
+					hasUnsharedConstraint = true
+					break
+				}
+			}
+			if hasUnsharedConstraint {
+				continue
+			}
+		}
 		pTime := p.CreationTimestamp.Time
 		if pTime.Before(myTime) || (pTime.Equal(myTime) && string(p.UID) < string(pod.UID)) {
 			klog.V(4).InfoS("ARCSync: FIFO block — older runner exists",
@@ -212,6 +213,13 @@ func (pl *ARCSync) isOldestPendingRunner(pod *v1.Pod) bool {
 		}
 	}
 	return true
+}
+
+func npuFIFOPool(pod *v1.Pod) string {
+	if v, ok := pod.Spec.NodeSelector["liqo.io/remote-cluster-id"]; ok {
+		return v
+	}
+	return "local"
 }
 
 func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, pod *v1.Pod) (*framework.PreFilterResult, *framework.Status) {
@@ -388,7 +396,7 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 	// FIFO check: only allow the oldest pending runner pod of this NPU type to proceed.
 	// Newer pods that arrive first due to shorter backoff are held here until all older
 	// pods have been scheduled.
-	if !pl.isOldestPendingRunner(pod) {
+	if !pl.isOldestPendingRunner(pod, nsHasOffloading) {
 		klog.InfoS("ARCSync: FIFO hold — waiting for older runner pods",
 			"pod", pod.Name)
 		return nil, framework.NewStatus(framework.Unschedulable, "FIFO: waiting for older runner pods to be scheduled first")
