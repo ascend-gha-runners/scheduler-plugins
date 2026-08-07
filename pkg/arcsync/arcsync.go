@@ -153,7 +153,7 @@ func getBaseName(name string) string {
 // This enforces strict FIFO: a runner pod only proceeds when it is the oldest waiting one.
 // Using CreationTimestamp avoids the backoff side-effect where older (more-retried) pods
 // accumulate longer backoff delays and get jumped by newer pods.
-func (pl *ARCSync) isOldestPendingRunner(pod *v1.Pod, nsHasOffloading bool) bool {
+func (pl *ARCSync) isOldestPendingRunner(pod *v1.Pod, nsHasOffloading bool, virtualNodes map[string]bool) bool {
 	if pl.podLister == nil {
 		return true
 	}
@@ -177,6 +177,9 @@ func (pl *ARCSync) isOldestPendingRunner(pod *v1.Pod, nsHasOffloading bool) bool
 			continue
 		}
 		if p.Spec.NodeName == "" {
+			continue
+		}
+		if virtualNodes[p.Spec.NodeName] {
 			continue
 		}
 		if p.Namespace != pod.Namespace {
@@ -396,7 +399,7 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 	// FIFO check: only allow the oldest pending runner pod of this NPU type to proceed.
 	// Newer pods that arrive first due to shorter backoff are held here until all older
 	// pods have been scheduled.
-	if !pl.isOldestPendingRunner(pod, nsHasOffloading) {
+	if !pl.isOldestPendingRunner(pod, nsHasOffloading, virtualNodes) {
 		klog.InfoS("ARCSync: FIFO hold — waiting for older runner pods",
 			"pod", pod.Name)
 		return nil, framework.NewStatus(framework.Unschedulable, "FIFO: waiting for older runner pods to be scheduled first")
