@@ -350,7 +350,7 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 		for nodeName, usage := range nsLocalPhysicalUsage {
 			nsLocalOccupied[nodeName] = usage + nsLocalReservated[nodeName]
 		}
-		pl.applyLiqoComparison(nodeInfos, pod, resDomain, resModel, fullResourceName, nsLocalOccupied, nodeFreeNPU, nsOffloading)
+		pl.applyLiqoComparison(nodeInfos, pod, resDomain, resModel, fullResourceName, nsLocalOccupied, nodeFreeNPU, nsOffloading, int64(reqCount), virtualNodes)
 
 		if queueLimit, qFound := getQueueNpuLimit(pod, pl.queueLister, fullResourceName); qFound {
 			var nsOccupied int64
@@ -447,6 +447,8 @@ func (pl *ARCSync) applyLiqoComparison(
 	nsLocalOccupied map[string]int64,
 	nodeFreeNPU map[string]int64,
 	nsOffloading *unstructured.Unstructured,
+	reqCount int64,
+	virtualNodes map[string]bool,
 ) {
 	eligibleVirtuals := getEligibleVirtualNodes(nodeInfos, nsOffloading)
 	if len(eligibleVirtuals) == 0 {
@@ -481,9 +483,18 @@ func (pl *ARCSync) applyLiqoComparison(
 
 	var bestVirtNode string
 	var bestVirtRemaining int64
+
+	localHasCandidate := false
+	for nodeName, free := range nodeFreeNPU {
+		if !virtualNodes[nodeName] && free >= int64(reqCount) {
+			localHasCandidate = true
+			break
+		}
+	}
+
 	for nodeName := range eligibleVirtuals {
 		if free, exists := nodeFreeNPU[nodeName]; exists && free > bestVirtRemaining {
-			if hasPendingRunnerOnNode(nodeInfos, nodeName, resDomain, resModel) {
+			if localHasCandidate && hasPendingRunnerOnNode(nodeInfos, nodeName, resDomain, resModel) {
 				continue
 			}
 			bestVirtRemaining = free
