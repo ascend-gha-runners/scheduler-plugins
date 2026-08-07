@@ -396,14 +396,12 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 		return nil, framework.NewStatus(framework.Unschedulable, "No node has enough available NPU slots")
 	}
 
-	// FIFO check: only allow the oldest pending runner pod of this NPU type to proceed.
-	// Newer pods that arrive first due to shorter backoff are held here until all older
-	// pods have been scheduled.
-	if !pl.isOldestPendingRunner(pod, nsHasOffloading, virtualNodes) {
-		klog.InfoS("ARCSync: FIFO hold — waiting for older runner pods",
-			"pod", pod.Name)
-		return nil, framework.NewStatus(framework.Unschedulable, "FIFO: waiting for older runner pods to be scheduled first")
-	}
+	// FIFO check temporarily disabled for debugging
+	// if !pl.isOldestPendingRunner(pod, nsHasOffloading, virtualNodes) {
+	// 	klog.InfoS("ARCSync: FIFO hold — waiting for older runner pods",
+	// 		"pod", pod.Name)
+	// 	return nil, framework.NewStatus(framework.Unschedulable, "FIFO: waiting for older runner pods to be scheduled first")
+	// }
 
 	state.Write(stateKey, &preFilterState{
 		requiredCount: int64(reqCount),
