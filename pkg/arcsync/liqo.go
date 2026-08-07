@@ -82,7 +82,7 @@ func isVirtualNode(node *v1.Node) bool {
 	return exists
 }
 
-func calcVirtualNodeOccupied(nodeInfo *framework.NodeInfo, resDomain, resModel string) int64 {
+func calcVirtualNodeOccupied(nodeInfo *framework.NodeInfo, resDomain, resModel string, fullResourceName v1.ResourceName) int64 {
 	if nodeInfo == nil {
 		return 0
 	}
@@ -95,17 +95,27 @@ func calcVirtualNodeOccupied(nodeInfo *framework.NodeInfo, resDomain, resModel s
 		if p.Status.Phase == v1.PodSucceeded || p.Status.Phase == v1.PodFailed {
 			continue
 		}
-		if p.Labels[RequiredNPUCount] == "" {
-			continue
+		var podUsage int64
+		for _, container := range p.Spec.Containers {
+			if q, exists := container.Resources.Requests[fullResourceName]; exists {
+				podUsage += q.Value()
+			}
 		}
-		if p.Labels[ResourceDomain] != resDomain || p.Labels[ResourceModel] != resModel {
-			continue
+		if val, exists := p.Labels[AllocatedNPUCount]; exists {
+			if p.Labels[ResourceDomain] == resDomain && p.Labels[ResourceModel] == resModel {
+				count, _ := strconv.ParseInt(val, 10, 64)
+				if count > podUsage {
+					podUsage = count
+				}
+			}
 		}
-		count, err := strconv.ParseInt(p.Labels[RequiredNPUCount], 10, 64)
-		if err != nil {
-			continue
+		if p.Labels[RequiredNPUCount] != "" && p.Labels[ResourceDomain] == resDomain && p.Labels[ResourceModel] == resModel {
+			count, err := strconv.ParseInt(p.Labels[RequiredNPUCount], 10, 64)
+			if err == nil && count > podUsage {
+				podUsage = count
+			}
 		}
-		occupied += count
+		occupied += podUsage
 	}
 	return occupied
 }

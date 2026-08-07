@@ -291,7 +291,7 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 			}
 		}
 		if virt {
-			physUsage = calcVirtualNodeOccupied(nodeInfo, resDomain, resModel)
+			physUsage = calcVirtualNodeOccupied(nodeInfo, resDomain, resModel, fullResourceName)
 		}
 		nodePhysicalUsage[nodeName] = physUsage
 		nsLocalPhysicalUsage[nodeName] = nsUsage
