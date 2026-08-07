@@ -414,6 +414,31 @@ func (pl *ARCSync) PreFilterExtensions() framework.PreFilterExtensions {
 	return nil
 }
 
+func hasPendingRunnerOnNode(nodeInfos []*framework.NodeInfo, nodeName, resDomain, resModel string) bool {
+	for _, ni := range nodeInfos {
+		if ni.Node() == nil || ni.Node().Name != nodeName {
+			continue
+		}
+		for _, podInfo := range ni.Pods {
+			p := podInfo.Pod
+			if p == nil {
+				continue
+			}
+			if p.Labels[RequiredNPUCount] == "" {
+				continue
+			}
+			if p.Labels[ResourceDomain] != resDomain || p.Labels[ResourceModel] != resModel {
+				continue
+			}
+			if p.Status.Phase == v1.PodPending {
+				return true
+			}
+		}
+		return false
+	}
+	return false
+}
+
 func (pl *ARCSync) applyLiqoComparison(
 	nodeInfos []*framework.NodeInfo,
 	pod *v1.Pod,
@@ -458,6 +483,9 @@ func (pl *ARCSync) applyLiqoComparison(
 	var bestVirtRemaining int64
 	for nodeName := range eligibleVirtuals {
 		if free, exists := nodeFreeNPU[nodeName]; exists && free > bestVirtRemaining {
+			if hasPendingRunnerOnNode(nodeInfos, nodeName, resDomain, resModel) {
+				continue
+			}
 			bestVirtRemaining = free
 			bestVirtNode = nodeName
 		}
