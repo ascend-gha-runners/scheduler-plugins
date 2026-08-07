@@ -176,7 +176,7 @@ func (pl *ARCSync) isOldestPendingRunner(pod *v1.Pod, nsHasOffloading bool) bool
 		if p.Status.Phase == v1.PodSucceeded || p.Status.Phase == v1.PodFailed {
 			continue
 		}
-		if p.Spec.NodeName != "" {
+		if p.Spec.NodeName == "" {
 			continue
 		}
 		if p.Namespace != pod.Namespace {
