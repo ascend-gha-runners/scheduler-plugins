@@ -738,28 +738,23 @@ func TestFilterRunnerPodPassesCPUNode(t *testing.T) {
 }
 
 func TestPreFilterRejectsWhenRunnerReservationsExceedNPU(t *testing.T) {
-	// NPU node has 16 NPU. 4 runner pods already reserved 4 each on CPU
-	// nodes (total 16). The 5th runner must be rejected — reservations on
-	// CPU nodes appear as negative free (0 − 4 = −4) and correctly reduce
-	// the cluster total to 0.
+	// NPU node has 16 NPU. 4 runner pods already reserved 4 each on the NPU
+	// node (total 16). The 5th runner must be rejected — per-node hasCandidate
+	// sees free = 16 − 16 = 0 < 4.
 	npuNode := makeNodeWithNPU("npu-1", 16, nil)
-	cpuNode1 := makeNodeWithNPU("cpu-1", 0, nil)
-	cpuNode1.Status.Allocatable = v1.ResourceList{}
-	cpuNode2 := makeNodeWithNPU("cpu-2", 0, nil)
-	cpuNode2.Status.Allocatable = v1.ResourceList{}
 
 	allPods := []*v1.Pod{makeRunnerPodWithLabels("runner5", "ns1", 4)}
-	nodes := []*v1.Node{npuNode, cpuNode1, cpuNode2}
+	nodes := []*v1.Node{npuNode}
 
 	fwk, state := setupTestFramework(t, allPods, nodes)
 	now := time.Now()
 	pl := &ARCSync{
 		handle:               fwk,
 		inFlightReservations: map[string]reservation{
-			"runner1-uid": {nodeName: "cpu-1", count: 4, timestamp: now, baseName: "runner1", namespace: "ns1"},
-			"runner2-uid": {nodeName: "cpu-2", count: 4, timestamp: now, baseName: "runner2", namespace: "ns1"},
-			"runner3-uid": {nodeName: "cpu-1", count: 4, timestamp: now, baseName: "runner3", namespace: "ns1"},
-			"runner4-uid": {nodeName: "cpu-2", count: 4, timestamp: now, baseName: "runner4", namespace: "ns1"},
+			"runner1-uid": {nodeName: "npu-1", count: 4, timestamp: now, baseName: "runner1", namespace: "ns1"},
+			"runner2-uid": {nodeName: "npu-1", count: 4, timestamp: now, baseName: "runner2", namespace: "ns1"},
+			"runner3-uid": {nodeName: "npu-1", count: 4, timestamp: now, baseName: "runner3", namespace: "ns1"},
+			"runner4-uid": {nodeName: "npu-1", count: 4, timestamp: now, baseName: "runner4", namespace: "ns1"},
 		},
 	}
 
@@ -771,31 +766,27 @@ func TestPreFilterRejectsWhenRunnerReservationsExceedNPU(t *testing.T) {
 }
 
 func TestPreFilterAllowsRunnerWhenReservationsBelowNPU(t *testing.T) {
-	// NPU node has 16 NPU. 3 runner pods reserved 4 each on CPU nodes
-	// (total 12). The 4th runner (needs 4) should pass: total free = 16 − 12 = 4.
+	// NPU node has 16 NPU. 3 runner pods reserved 4 each on the NPU node
+	// (total 12). The 4th runner (needs 4) should pass: per-node free = 16 − 12 = 4.
 	npuNode := makeNodeWithNPU("npu-1", 16, nil)
-	cpuNode1 := makeNodeWithNPU("cpu-1", 0, nil)
-	cpuNode1.Status.Allocatable = v1.ResourceList{}
-	cpuNode2 := makeNodeWithNPU("cpu-2", 0, nil)
-	cpuNode2.Status.Allocatable = v1.ResourceList{}
 
 	allPods := []*v1.Pod{makeRunnerPodWithLabels("runner4", "ns1", 4)}
-	nodes := []*v1.Node{npuNode, cpuNode1, cpuNode2}
+	nodes := []*v1.Node{npuNode}
 
 	fwk, state := setupTestFramework(t, allPods, nodes)
 	now := time.Now()
 	pl := &ARCSync{
 		handle:               fwk,
 		inFlightReservations: map[string]reservation{
-			"runner1-uid": {nodeName: "cpu-1", count: 4, timestamp: now, baseName: "runner1", namespace: "ns1"},
-			"runner2-uid": {nodeName: "cpu-2", count: 4, timestamp: now, baseName: "runner2", namespace: "ns1"},
-			"runner3-uid": {nodeName: "cpu-1", count: 4, timestamp: now, baseName: "runner3", namespace: "ns1"},
+			"runner1-uid": {nodeName: "npu-1", count: 4, timestamp: now, baseName: "runner1", namespace: "ns1"},
+			"runner2-uid": {nodeName: "npu-1", count: 4, timestamp: now, baseName: "runner2", namespace: "ns1"},
+			"runner3-uid": {nodeName: "npu-1", count: 4, timestamp: now, baseName: "runner3", namespace: "ns1"},
 		},
 	}
 
 	targetPod := makeRunnerPodWithLabels("runner4", "ns1", 4)
 	_, status := pl.PreFilter(context.TODO(), state, targetPod)
 	if status.Code() != framework.Success {
-		t.Errorf("expected Success (total free = 16 − 12 = 4 >= 4), got %v: %v", status.Code(), status.Message())
+		t.Errorf("expected Success (per-node free = 16 − 12 = 4 >= 4), got %v: %v", status.Code(), status.Message())
 	}
 }

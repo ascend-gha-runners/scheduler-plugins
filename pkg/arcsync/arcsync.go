@@ -382,29 +382,30 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 		}
 	}
 
-	// hasCandidate checks total NPU capacity across all local nodes
-	// (regardless of the pod's nodeSelector) plus eligible virtual nodes.
-	// Runner pods carry required-npu-count for reservation but may be bound
-	// to CPU nodes by the default scheduler — the Reserve plugin stores the
-	// reservation on the bound (CPU) node, not the NPU node. By summing
-	// (allocatable - nodeTotalOccupied) across ALL nodes, reservations on
-	// CPU nodes appear as negative values (0 − reservation) and correctly
-	// reduce the cluster-wide total, preventing over-commitment.
-	var totalNPUFree int64
+	// hasCandidate checks if any single local node has enough free NPU,
+	// or if any eligible virtual node (after liqo comparison) has enough.
+	// This mirrors the original per-node admission logic: the runner pod is
+	// admitted only when at least one node can satisfy the NPU requirement.
+	hasCandidate := false
 	for _, nodeInfo := range nodeInfos {
 		node := nodeInfo.Node()
 		if node == nil || !canScheduleOnNode(node) {
 			continue
 		}
 		if isVirtualNode(node) {
-			if _, exists := nodeFreeNPU[node.Name]; !exists {
-				continue
+			if free, exists := nodeFreeNPU[node.Name]; exists && free >= int64(reqCount) {
+				hasCandidate = true
+				break
 			}
+			continue
 		}
 		allocatable := node.Status.Allocatable[fullResourceName]
-		totalNPUFree += allocatable.Value() - nodeTotalOccupied[node.Name]
+		free := allocatable.Value() - nodeTotalOccupied[node.Name]
+		if free >= int64(reqCount) {
+			hasCandidate = true
+			break
+		}
 	}
-	hasCandidate := totalNPUFree >= int64(reqCount)
 
 	if !hasCandidate {
 		klog.InfoS("ARCSync: PreFilter rejected pod (no node has enough NPU)",
@@ -412,12 +413,11 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 		return nil, framework.NewStatus(framework.Unschedulable, "No node has enough available NPU slots")
 	}
 
-	// FIFO check temporarily disabled for debugging
-	// if !pl.isOldestPendingRunner(pod, nsHasOffloading, virtualNodes) {
-	// 	klog.InfoS("ARCSync: FIFO hold — waiting for older runner pods",
-	// 		"pod", pod.Name)
-	// 	return nil, framework.NewStatus(framework.Unschedulable, "FIFO: waiting for older runner pods to be scheduled first")
-	// }
+	if !pl.isOldestPendingRunner(pod, nsHasOffloading, virtualNodes) {
+		klog.InfoS("ARCSync: FIFO hold — waiting for older runner pods",
+			"pod", pod.Name)
+		return nil, framework.NewStatus(framework.Unschedulable, "FIFO: waiting for older runner pods to be scheduled first")
+	}
 
 	state.Write(stateKey, &preFilterState{
 		requiredCount: int64(reqCount),
