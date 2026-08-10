@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"testing"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -141,6 +142,35 @@ func TestGetEligibleVirtualNodes(t *testing.T) {
 	}
 }
 
+func TestGetEligibleVirtualNodesExcludesNonTargetedCluster(t *testing.T) {
+	offloading := makeNamespaceOffloading("ns1", "liqo.io/remote-cluster-id", "gy004")
+
+	virtGy004 := makeNodeWithNPU("gy004", 224, map[string]string{
+		"liqo.io/remote-cluster-id": "gy004",
+	})
+	virtGy005 := makeNodeWithNPU("gy005", 144, map[string]string{
+		"liqo.io/remote-cluster-id": "gy005",
+	})
+
+	nodeInfos := []*framework.NodeInfo{
+		framework.NewNodeInfo(),
+		framework.NewNodeInfo(),
+	}
+	nodeInfos[0].SetNode(virtGy004)
+	nodeInfos[1].SetNode(virtGy005)
+
+	got := getEligibleVirtualNodes(nodeInfos, offloading)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 eligible virtual node (gy004 only), got %d: %v", len(got), got)
+	}
+	if !got["gy004"] {
+		t.Errorf("expected gy004 to be eligible, got %v", got)
+	}
+	if got["gy005"] {
+		t.Errorf("gy005 must NOT be eligible (not in clusterSelector), but was selected: %v", got)
+	}
+}
+
 func TestGetEligibleVirtualNodesNoSelector(t *testing.T) {
 	obj := &unstructured.Unstructured{}
 	obj.SetGroupVersionKind(gvrNamespaceOffloading.GroupVersion().WithKind("NamespaceOffloading"))
@@ -168,8 +198,16 @@ func makeNamespaceOffloading(namespace, matchKey, matchVal string) *unstructured
 	obj.SetName(namespace)
 	obj.SetNamespace(namespace)
 	selectorMap := map[string]interface{}{
-		"matchLabels": map[string]interface{}{
-			matchKey: matchVal,
+		"nodeSelectorTerms": []interface{}{
+			map[string]interface{}{
+				"matchExpressions": []interface{}{
+					map[string]interface{}{
+						"key":      matchKey,
+						"operator": "In",
+						"values":   []interface{}{matchVal},
+					},
+				},
+			},
 		},
 	}
 	unstructured.SetNestedMap(obj.Object, selectorMap, "spec", "clusterSelector")
@@ -585,5 +623,179 @@ func TestPreFilterNodeSelectorTargetsVirtual(t *testing.T) {
 	}
 	if _, exists := preState.nodeFreeNPU["virt-other"]; exists {
 		t.Errorf("expected virt-other to be excluded (doesn't match nodeSelector)")
+	}
+}
+
+func TestPreFilterNonEligibleVirtualRemovedWhenLocalWins(t *testing.T) {
+	localNode := makeNodeWithNPU("local-1", 100, nil)
+	virtGy004 := makeNodeWithNPU("gy004", 8, map[string]string{"liqo.io/remote-cluster-id": "gy004"})
+	virtGy005 := makeNodeWithNPU("gy005", 144, map[string]string{"liqo.io/remote-cluster-id": "gy005"})
+
+	allPods := []*v1.Pod{makeRunnerPodWithLabels("new-runner", "ns1", 1)}
+	nodes := []*v1.Node{localNode, virtGy004, virtGy005}
+
+	fwk, state := setupTestFramework(t, allPods, nodes)
+
+	nsOffloading := makeNamespaceOffloading("ns1", "liqo.io/remote-cluster-id", "gy004")
+	pl := &ARCSync{
+		handle:               fwk,
+		inFlightReservations: make(map[string]reservation),
+		nsOffloadingLister:   &fakeNSOffloadingLister{objects: map[string]*unstructured.Unstructured{"ns1": nsOffloading}},
+		queueLister:          &fakeQueueLister{objects: map[string]*unstructured.Unstructured{}},
+	}
+
+	targetPod := makeRunnerPodWithLabels("new-runner", "ns1", 1)
+	_, status := pl.PreFilter(context.TODO(), state, targetPod)
+	if status.Code() != framework.Success {
+		t.Fatalf("PreFilter failed: %v", status.Message())
+	}
+
+	data, err := state.Read(stateKey)
+	if err != nil {
+		t.Fatalf("failed to read state: %v", err)
+	}
+	preState := data.(*preFilterState)
+	if _, exists := preState.nodeFreeNPU["local-1"]; !exists {
+		t.Errorf("expected local-1 in nodeFreeNPU (local wins: localRemaining=100 > gy004 free=8)")
+	}
+	if _, exists := preState.nodeFreeNPU["gy004"]; exists {
+		t.Errorf("expected gy004 to be excluded (local won liqo comparison)")
+	}
+	if _, exists := preState.nodeFreeNPU["gy005"]; exists {
+		t.Errorf("gy005 is NOT targeted by clusterSelector (only gy004) and must be excluded, but leaked into nodeFreeNPU")
+	}
+}
+
+func TestPreFilterRunnerPodWithArchNodeSelectorSchedules(t *testing.T) {
+	// Simulates triton-ascend: runner pod has required-npu-count=4 and
+	// nodeSelector arch=amd64. All NPU nodes are arm64. The pod doesn't
+	// request NPU in its containers — it only needs NPU reserved somewhere.
+	// PreFilter should succeed because NPU capacity exists on arm64 nodes
+	// (checked across all nodes, not just nodeSelector-matching ones).
+	localNPUNode := makeNodeWithNPU("npu-arm-1", 16, map[string]string{"kubernetes.io/arch": "arm64"})
+	localCPUNode := makeNodeWithNPU("cpu-amd-1", 0, map[string]string{"kubernetes.io/arch": "amd64"})
+	localCPUNode.Status.Allocatable = v1.ResourceList{}
+
+	allPods := []*v1.Pod{makeRunnerPodWithLabels("new-runner", "ns1", 4)}
+	nodes := []*v1.Node{localNPUNode, localCPUNode}
+
+	fwk, state := setupTestFramework(t, allPods, nodes)
+
+	pl := &ARCSync{
+		handle:               fwk,
+		inFlightReservations: make(map[string]reservation),
+	}
+
+	targetPod := makeRunnerPodWithLabels("new-runner", "ns1", 4)
+	targetPod.Spec.NodeSelector = map[string]string{"kubernetes.io/arch": "amd64"}
+	_, status := pl.PreFilter(context.TODO(), state, targetPod)
+	if status.Code() != framework.Success {
+		t.Fatalf("PreFilter should succeed (arm64 NPU node has free NPU even though pod targets amd64): %v", status.Message())
+	}
+
+	data, err := state.Read(stateKey)
+	if err != nil {
+		t.Fatalf("failed to read state: %v", err)
+	}
+	preState := data.(*preFilterState)
+	// arm64 NPU node is NOT in nodeFreeNPU (doesn't match nodeSelector arch=amd64),
+	// but hasCandidate checked it separately and found NPU capacity.
+	if _, exists := preState.nodeFreeNPU["npu-arm-1"]; exists {
+		t.Errorf("npu-arm-1 should NOT be in nodeFreeNPU (doesn't match nodeSelector arch=amd64)")
+	}
+	// amd64 CPU node IS in nodeFreeNPU (matches nodeSelector), free=0
+	if _, exists := preState.nodeFreeNPU["cpu-amd-1"]; !exists {
+		t.Errorf("expected cpu-amd-1 in nodeFreeNPU (matches nodeSelector)")
+	}
+}
+
+func TestFilterRunnerPodPassesCPUNode(t *testing.T) {
+	// Runner pod (no NPU request in containers) should pass Filter on a CPU
+	// node with free=0, so the default scheduler can place it there.
+	localCPUNode := makeNodeWithNPU("cpu-1", 0, nil)
+	localCPUNode.Status.Allocatable = v1.ResourceList{}
+	localNPUNode := makeNodeWithNPU("npu-1", 16, nil)
+
+	allPods := []*v1.Pod{makeRunnerPodWithLabels("runner", "ns1", 4)}
+	nodes := []*v1.Node{localCPUNode, localNPUNode}
+
+	fwk, state := setupTestFramework(t, allPods, nodes)
+	pl := &ARCSync{handle: fwk, inFlightReservations: make(map[string]reservation)}
+
+	targetPod := makeRunnerPodWithLabels("runner", "ns1", 4)
+	_, status := pl.PreFilter(context.TODO(), state, targetPod)
+	if status.Code() != framework.Success {
+		t.Fatalf("PreFilter failed: %v", status.Message())
+	}
+
+	// Filter should pass the CPU node (free=0) for runner pods
+	ni := framework.NewNodeInfo()
+	ni.SetNode(localCPUNode)
+	filterStatus := pl.Filter(context.TODO(), state, targetPod, ni)
+	if filterStatus.Code() != framework.Success {
+		t.Errorf("Filter should pass CPU node for runner pod (no NPU request), got %v: %v", filterStatus.Code(), filterStatus.Message())
+	}
+}
+
+func TestPreFilterRejectsWhenRunnerReservationsExceedNPU(t *testing.T) {
+	// NPU node has 16 NPU. 4 runner pods already reserved 4 each on CPU
+	// nodes (total 16). The 5th runner must be rejected — reservations on
+	// CPU nodes appear as negative free (0 − 4 = −4) and correctly reduce
+	// the cluster total to 0.
+	npuNode := makeNodeWithNPU("npu-1", 16, nil)
+	cpuNode1 := makeNodeWithNPU("cpu-1", 0, nil)
+	cpuNode1.Status.Allocatable = v1.ResourceList{}
+	cpuNode2 := makeNodeWithNPU("cpu-2", 0, nil)
+	cpuNode2.Status.Allocatable = v1.ResourceList{}
+
+	allPods := []*v1.Pod{makeRunnerPodWithLabels("runner5", "ns1", 4)}
+	nodes := []*v1.Node{npuNode, cpuNode1, cpuNode2}
+
+	fwk, state := setupTestFramework(t, allPods, nodes)
+	now := time.Now()
+	pl := &ARCSync{
+		handle:               fwk,
+		inFlightReservations: map[string]reservation{
+			"runner1-uid": {nodeName: "cpu-1", count: 4, timestamp: now, baseName: "runner1", namespace: "ns1"},
+			"runner2-uid": {nodeName: "cpu-2", count: 4, timestamp: now, baseName: "runner2", namespace: "ns1"},
+			"runner3-uid": {nodeName: "cpu-1", count: 4, timestamp: now, baseName: "runner3", namespace: "ns1"},
+			"runner4-uid": {nodeName: "cpu-2", count: 4, timestamp: now, baseName: "runner4", namespace: "ns1"},
+		},
+	}
+
+	targetPod := makeRunnerPodWithLabels("runner5", "ns1", 4)
+	_, status := pl.PreFilter(context.TODO(), state, targetPod)
+	if status.Code() != framework.Unschedulable {
+		t.Errorf("expected Unschedulable (4 reservations × 4 = 16 = full NPU), got %v: %v", status.Code(), status.Message())
+	}
+}
+
+func TestPreFilterAllowsRunnerWhenReservationsBelowNPU(t *testing.T) {
+	// NPU node has 16 NPU. 3 runner pods reserved 4 each on CPU nodes
+	// (total 12). The 4th runner (needs 4) should pass: total free = 16 − 12 = 4.
+	npuNode := makeNodeWithNPU("npu-1", 16, nil)
+	cpuNode1 := makeNodeWithNPU("cpu-1", 0, nil)
+	cpuNode1.Status.Allocatable = v1.ResourceList{}
+	cpuNode2 := makeNodeWithNPU("cpu-2", 0, nil)
+	cpuNode2.Status.Allocatable = v1.ResourceList{}
+
+	allPods := []*v1.Pod{makeRunnerPodWithLabels("runner4", "ns1", 4)}
+	nodes := []*v1.Node{npuNode, cpuNode1, cpuNode2}
+
+	fwk, state := setupTestFramework(t, allPods, nodes)
+	now := time.Now()
+	pl := &ARCSync{
+		handle:               fwk,
+		inFlightReservations: map[string]reservation{
+			"runner1-uid": {nodeName: "cpu-1", count: 4, timestamp: now, baseName: "runner1", namespace: "ns1"},
+			"runner2-uid": {nodeName: "cpu-2", count: 4, timestamp: now, baseName: "runner2", namespace: "ns1"},
+			"runner3-uid": {nodeName: "cpu-1", count: 4, timestamp: now, baseName: "runner3", namespace: "ns1"},
+		},
+	}
+
+	targetPod := makeRunnerPodWithLabels("runner4", "ns1", 4)
+	_, status := pl.PreFilter(context.TODO(), state, targetPod)
+	if status.Code() != framework.Success {
+		t.Errorf("expected Success (total free = 16 − 12 = 4 >= 4), got %v: %v", status.Code(), status.Message())
 	}
 }

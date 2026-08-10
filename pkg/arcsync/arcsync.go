@@ -382,13 +382,29 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 		}
 	}
 
-	hasCandidate := false
-	for _, free := range nodeFreeNPU {
-		if free >= int64(reqCount) {
-			hasCandidate = true
-			break
+	// hasCandidate checks total NPU capacity across all local nodes
+	// (regardless of the pod's nodeSelector) plus eligible virtual nodes.
+	// Runner pods carry required-npu-count for reservation but may be bound
+	// to CPU nodes by the default scheduler — the Reserve plugin stores the
+	// reservation on the bound (CPU) node, not the NPU node. By summing
+	// (allocatable - nodeTotalOccupied) across ALL nodes, reservations on
+	// CPU nodes appear as negative values (0 − reservation) and correctly
+	// reduce the cluster-wide total, preventing over-commitment.
+	var totalNPUFree int64
+	for _, nodeInfo := range nodeInfos {
+		node := nodeInfo.Node()
+		if node == nil || !canScheduleOnNode(node) {
+			continue
 		}
+		if isVirtualNode(node) {
+			if _, exists := nodeFreeNPU[node.Name]; !exists {
+				continue
+			}
+		}
+		allocatable := node.Status.Allocatable[fullResourceName]
+		totalNPUFree += allocatable.Value() - nodeTotalOccupied[node.Name]
 	}
+	hasCandidate := totalNPUFree >= int64(reqCount)
 
 	if !hasCandidate {
 		klog.InfoS("ARCSync: PreFilter rejected pod (no node has enough NPU)",
@@ -452,6 +468,18 @@ func (pl *ARCSync) applyLiqoComparison(
 	virtualNodes map[string]bool,
 ) {
 	eligibleVirtuals := getEligibleVirtualNodes(nodeInfos, nsOffloading)
+
+	// Remove virtual nodes that are not targeted by the NamespaceOffloading
+	// clusterSelector. These must never receive pods from this namespace,
+	// regardless of the local-vs-remote comparison outcome. Without this,
+	// non-eligible virtual nodes would leak into the candidate set when local
+	// wins the comparison or when eligibleVirtuals is empty.
+	for nodeName := range nodeFreeNPU {
+		if virtualNodes[nodeName] && !eligibleVirtuals[nodeName] {
+			delete(nodeFreeNPU, nodeName)
+		}
+	}
+
 	if len(eligibleVirtuals) == 0 {
 		return
 	}
@@ -533,10 +561,27 @@ func (pl *ARCSync) Filter(ctx context.Context, state *framework.CycleState, pod 
 	if !exists {
 		return framework.NewStatus(framework.Unschedulable, "node not eligible for NPU scheduling")
 	}
+	// Runner pods carry required-npu-count for reservation but don't request
+	// NPU in their containers — they run on CPU nodes while NPU is reserved
+	// elsewhere. Only enforce NPU capacity for pods that actually request NPU
+	// resources in their containers; for others, let the default scheduler's
+	// NodeResourcesFit and NodeAffinity filters handle placement.
+	if !podRequestsNPU(pod, data.resourceName) {
+		return framework.NewStatus(framework.Success, "")
+	}
 	if free < data.requiredCount {
 		return framework.NewStatus(framework.Unschedulable, "insufficient NPU on node")
 	}
 	return framework.NewStatus(framework.Success, "")
+}
+
+func podRequestsNPU(pod *v1.Pod, resourceName v1.ResourceName) bool {
+	for _, container := range pod.Spec.Containers {
+		if _, exists := container.Resources.Requests[resourceName]; exists {
+			return true
+		}
+	}
+	return false
 }
 
 func (pl *ARCSync) Score(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeName string) (int64, *framework.Status) {
