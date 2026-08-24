@@ -1,0 +1,36 @@
+pkg/arcsync/arcsync.go
+  s_290eff0586d150::t_c13bc8463c329f 146,149
+  s_290eff0586d150::t_814ed1239ac100 20
+  s_290eff0586d150::t_128e90caaf72cc 357,419
+  s_290eff0586d150::t_baf1993abae9f5 129-145,147-148
+  s_290eff0586d150::t_46b8a03693a125 19,512
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "0417102ff0271036b7f572d4f9b5284c579a654e",
+  "prompts": {},
+  "sessions": {
+    "s_290eff0586d150": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a8ba902094bbd79edc5a9e7",
+        "model": "DeepSeek-V4-Pro-Official"
+      },
+      "human_author": "Longwt123 <1075015495@qq.com>",
+      "custom_attributes": {
+        "client_type": "ide",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "edit_kind": "file_edit",
+        "runtime_client": "trae-tob-git-ai",
+        "tool_type": "builtin",
+        "tool_use_id": "6a8bb1b5094bbd79edc5aa9d",
+        "dedupe_key": "6a8ba902094bbd79edc5a9e7:6a8bb1b5094bbd79edc5aa9d:afterEdit:fcc48ec1",
+        "external_session_id": "6a8ba902094bbd79edc5a9e7",
+        "source_scene": "agent",
+        "operation_id": "6a8bb1b5094bbd79edc5aa9d",
+        "session_id": "6a8ba902094bbd79edc5a9e7"
+      }
+    }
+  }
+}
