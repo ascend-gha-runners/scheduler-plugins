@@ -3,7 +3,6 @@ package arcsync
 import (
 	"context"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -128,11 +127,10 @@ func (pl *ARCSync) EventsToRegister(_ context.Context) ([]framework.ClusterEvent
 }
 
 // canScheduleOnNode excludes cordoned nodes (Unschedulable: true) and any node
-// carrying a business NoSchedule taint that the pod does not tolerate (e.g.
-// dedicated=752t). Platform taints are intentionally ignored so ARCSync keeps
-// scheduling pods onto Liqo virtual nodes: NoExecute taints (runtime eviction)
-// and system taints under the reserved node.kubernetes.io/ and
-// virtual-node.liqo.io/ prefixes are managed by their own controllers.
+// carrying NoSchedule/NoExecute taints that the pod does not tolerate. Liqo
+// virtual nodes ship with their own taints, which Liqo tolerates on offloaded
+// pods, so those nodes remain eligible; a custom taint (e.g. 752t) that the pod
+// does not tolerate correctly removes the node from the candidate set.
 func canScheduleOnNode(pod *v1.Pod, node *v1.Node) bool {
 	if node.Spec.Unschedulable {
 		return false
@@ -140,20 +138,13 @@ func canScheduleOnNode(pod *v1.Pod, node *v1.Node) bool {
 	return podToleratesNodeTaints(pod, node)
 }
 
-// podToleratesNodeTaints reports whether pod tolerates every business
-// NoSchedule taint on node. It ignores NoExecute (a runtime eviction signal,
-// not a scheduling admission check), node.kubernetes.io/* condition taints
-// (e.g. route-unreachable) and virtual-node.liqo.io/* platform taints (e.g.
-// not-allowed), all of which are handled outside this scheduling path.
+// podToleratesNodeTaints reports whether pod tolerates all NoSchedule/NoExecute
+// taints on node. PreferNoSchedule is intentionally ignored: it is a soft
+// preference, not a hard scheduling constraint (matching the built-in
+// TaintToleration filter).
 func podToleratesNodeTaints(pod *v1.Pod, node *v1.Node) bool {
 	_, isUntolerated := corev1helpers.FindMatchingUntoleratedTaint(node.Spec.Taints, pod.Spec.Tolerations, func(t *v1.Taint) bool {
-		if t.Effect != v1.TaintEffectNoSchedule {
-			return false
-		}
-		if strings.HasPrefix(t.Key, "node.kubernetes.io/") || strings.HasPrefix(t.Key, "virtual-node.liqo.io/") {
-			return false
-		}
-		return true
+		return t.Effect == v1.TaintEffectNoSchedule || t.Effect == v1.TaintEffectNoExecute
 	})
 	return !isUntolerated
 }
