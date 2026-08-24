@@ -15,8 +15,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
-	"k8s.io/client-go/tools/cache"
 	corev1listers "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/cache"
+	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 )
@@ -125,11 +126,27 @@ func (pl *ARCSync) EventsToRegister(_ context.Context) ([]framework.ClusterEvent
 	}, nil
 }
 
-// canScheduleOnNode excludes only cordoned nodes (Unschedulable: true).
-// Tainted nodes are included — their NPU capacity is physically present and
-// counts toward global admission decisions.
-func canScheduleOnNode(node *v1.Node) bool {
-	return !node.Spec.Unschedulable
+// canScheduleOnNode excludes cordoned nodes (Unschedulable: true) and any node
+// carrying NoSchedule/NoExecute taints that the pod does not tolerate. Liqo
+// virtual nodes ship with their own taints, which Liqo tolerates on offloaded
+// pods, so those nodes remain eligible; a custom taint (e.g. 752t) that the pod
+// does not tolerate correctly removes the node from the candidate set.
+func canScheduleOnNode(pod *v1.Pod, node *v1.Node) bool {
+	if node.Spec.Unschedulable {
+		return false
+	}
+	return podToleratesNodeTaints(pod, node)
+}
+
+// podToleratesNodeTaints reports whether pod tolerates all NoSchedule/NoExecute
+// taints on node. PreferNoSchedule is intentionally ignored: it is a soft
+// preference, not a hard scheduling constraint (matching the built-in
+// TaintToleration filter).
+func podToleratesNodeTaints(pod *v1.Pod, node *v1.Node) bool {
+	_, isUntolerated := corev1helpers.FindMatchingUntoleratedTaint(node.Spec.Taints, pod.Spec.Tolerations, func(t *v1.Taint) bool {
+		return t.Effect == v1.TaintEffectNoSchedule || t.Effect == v1.TaintEffectNoExecute
+	})
+	return !isUntolerated
 }
 
 func nodeMatchesSelector(node *v1.Node, selector map[string]string) bool {
@@ -337,7 +354,7 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 	nodeFreeNPU := make(map[string]int64)
 	for _, nodeInfo := range nodeInfos {
 		node := nodeInfo.Node()
-		if node == nil || !canScheduleOnNode(node) {
+		if node == nil || !canScheduleOnNode(pod, node) {
 			continue
 		}
 		if !nodeMatchesSelector(node, pod.Spec.NodeSelector) {
@@ -399,7 +416,7 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 	var totalNPUFree int64
 	for _, nodeInfo := range nodeInfos {
 		node := nodeInfo.Node()
-		if node == nil || !canScheduleOnNode(node) {
+		if node == nil || !canScheduleOnNode(pod, node) {
 			continue
 		}
 		if isVirtualNode(node) {
@@ -492,7 +509,7 @@ func (pl *ARCSync) applyLiqoComparison(
 	var localTotalAllocatable, localTotalOccupied int64
 	for _, nodeInfo := range nodeInfos {
 		node := nodeInfo.Node()
-		if node == nil || isVirtualNode(node) || !canScheduleOnNode(node) {
+		if node == nil || isVirtualNode(node) || !canScheduleOnNode(pod, node) {
 			continue
 		}
 		if _, exists := nodeFreeNPU[node.Name]; !exists {
