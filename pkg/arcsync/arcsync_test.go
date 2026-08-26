@@ -310,6 +310,19 @@ func makePodOnNode(name, namespace, nodeName string, npuCount int) *v1.Pod {
 	return pod
 }
 
+// makeWorkloadPod 创建一个真正在容器里 request NPU 的 pod（用于占满本地节点，
+// 与只带 required-npu-count label、不实际 request NPU 的 runner pod 区分）。
+func makeWorkloadPod(name, namespace, nodeName string, npuReq int64) *v1.Pod {
+	pod := st.MakePod().Name(name).Namespace(namespace).Node(nodeName).UID(name).Obj()
+	pod.Spec.Containers = []v1.Container{{
+		Name: "main",
+		Resources: v1.ResourceRequirements{
+			Requests: v1.ResourceList{testFullResName: *resource.NewQuantity(npuReq, resource.DecimalSI)},
+		},
+	}}
+	return pod
+}
+
 type fakeSharedLister struct {
 	nodeInfos []*framework.NodeInfo
 	nodeMap   map[string]*framework.NodeInfo
@@ -485,6 +498,48 @@ func TestPreFilterVolcanoQueueCapsLocal(t *testing.T) {
 	}
 	if _, exists := preState.nodeFreeNPU["local-1"]; exists {
 		t.Errorf("expected local-1 to be excluded")
+	}
+}
+
+func TestPreFilterVirtualWinsWhenLocalOccupiedByOtherNamespace(t *testing.T) {
+	// 本地节点被其他 namespace 的 workload 占满，当前 namespace 在本地无占用。
+	// 修复前 localRemaining 用 nsLocalOccupied（仅当前 ns）计算会高估本地剩余，
+	// 误判 local wins 而删掉虚拟节点；修复后应正确走 virtual wins。
+	localNode := makeNodeWithNPU("local-1", 10, nil)
+	virtNode := makeNodeWithNPU("virt-1", 8, map[string]string{"liqo.io/remote-cluster-id": "cluster-a"})
+
+	existingPods := []*v1.Pod{
+		makeWorkloadPod("workload-1", "other-ns", "local-1", 10),
+	}
+	allPods := append(existingPods, makeRunnerPodWithLabels("new-runner", "ns1", 1))
+	nodes := []*v1.Node{localNode, virtNode}
+
+	fwk, state := setupTestFramework(t, allPods, nodes)
+
+	nsOffloading := makeNamespaceOffloading("ns1", "liqo.io/remote-cluster-id", "cluster-a")
+	pl := &ARCSync{
+		handle:               fwk,
+		inFlightReservations: make(map[string]reservation),
+		nsOffloadingLister:   &fakeNSOffloadingLister{objects: map[string]*unstructured.Unstructured{"ns1": nsOffloading}},
+		queueLister:          &fakeQueueLister{objects: map[string]*unstructured.Unstructured{}},
+	}
+
+	targetPod := makeRunnerPodWithLabels("new-runner", "ns1", 1)
+	_, status := pl.PreFilter(context.TODO(), state, targetPod)
+	if status.Code() != framework.Success {
+		t.Fatalf("PreFilter failed: %v", status.Message())
+	}
+
+	data, err := state.Read(stateKey)
+	if err != nil {
+		t.Fatalf("failed to read state: %v", err)
+	}
+	preState := data.(*preFilterState)
+	if _, exists := preState.nodeFreeNPU["virt-1"]; !exists {
+		t.Errorf("expected virt-1 in nodeFreeNPU (local-1 fully occupied by other namespace)")
+	}
+	if _, exists := preState.nodeFreeNPU["local-1"]; exists {
+		t.Errorf("expected local-1 to be excluded (fully occupied by other namespace)")
 	}
 }
 

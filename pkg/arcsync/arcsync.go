@@ -506,28 +506,31 @@ func (pl *ARCSync) applyLiqoComparison(
 		return
 	}
 
-	var localTotalAllocatable, localTotalOccupied int64
-	for _, nodeInfo := range nodeInfos {
-		node := nodeInfo.Node()
-		if node == nil || isVirtualNode(node) || !canScheduleOnNode(pod, node) {
-			continue
+	// localRemaining 表示本地物理节点还能容纳的 NPU 数：累加所有本地节点的
+	// nodeFreeNPU（其值已经是 allocatable - 全量占用，口径正确）。此前用
+	// nsLocalOccupied（仅当前 namespace 的占用）做减数，会在本地被其他 namespace
+	// 占满时高估 localRemaining，从而误判"本地赢"并删除虚拟节点，导致 pod 无处可调。
+	var localRemaining int64
+	for nodeName, free := range nodeFreeNPU {
+		if !virtualNodes[nodeName] {
+			localRemaining += free
 		}
-		if _, exists := nodeFreeNPU[node.Name]; !exists {
-			continue
-		}
-		allocatable := node.Status.Allocatable[fullResourceName]
-		localTotalAllocatable += allocatable.Value()
-		localTotalOccupied += nsLocalOccupied[node.Name]
 	}
 
-	localTotalCapacity := localTotalAllocatable
+	// 若存在 Volcano Queue 配额，本地剩余还需受 namespace 配额剩余约束。
 	if queueLimit, qFound := getQueueNpuLimit(pod, pl.queueLister, fullResourceName); qFound {
-		if queueLimit < localTotalCapacity {
-			localTotalCapacity = queueLimit
+		var nsOccupied int64
+		for _, usage := range nsLocalOccupied {
+			nsOccupied += usage
+		}
+		quotaRemaining := queueLimit - nsOccupied
+		if quotaRemaining < 0 {
+			quotaRemaining = 0
+		}
+		if quotaRemaining < localRemaining {
+			localRemaining = quotaRemaining
 		}
 	}
-
-	localRemaining := localTotalCapacity - localTotalOccupied
 	if localRemaining < 0 {
 		localRemaining = 0
 	}
