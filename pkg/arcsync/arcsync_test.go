@@ -9,11 +9,14 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	corev1listers "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
-	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/defaultbinder"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/queuesort"
+	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	tf "k8s.io/kubernetes/pkg/scheduler/testing/framework"
 )
@@ -259,9 +262,9 @@ func TestGetQueueNpuLimit(t *testing.T) {
 		expectFound bool
 	}{
 		{
-			name: "pod with queue annotation",
-			pod:  st.MakePod().Name("p1").Namespace("ns1").UID("p1").Obj(),
-			expected: 8,
+			name:        "pod with queue annotation",
+			pod:         st.MakePod().Name("p1").Namespace("ns1").UID("p1").Obj(),
+			expected:    8,
 			expectFound: true,
 		},
 		{
@@ -350,11 +353,13 @@ func newFakeSharedLister(pods []*v1.Pod, nodes []*v1.Node) framework.SharedListe
 	return &fakeSharedLister{nodeInfos: nodeInfos, nodeMap: nodeInfoMap}
 }
 
-func (f *fakeSharedLister) NodeInfos() framework.NodeInfoLister { return f }
-func (f *fakeSharedLister) StorageInfos() framework.StorageInfoLister { return nil }
-func (f *fakeSharedLister) List() ([]*framework.NodeInfo, error) { return f.nodeInfos, nil }
+func (f *fakeSharedLister) NodeInfos() framework.NodeInfoLister                      { return f }
+func (f *fakeSharedLister) StorageInfos() framework.StorageInfoLister                { return nil }
+func (f *fakeSharedLister) List() ([]*framework.NodeInfo, error)                     { return f.nodeInfos, nil }
 func (f *fakeSharedLister) HavePodsWithAffinityList() ([]*framework.NodeInfo, error) { return nil, nil }
-func (f *fakeSharedLister) HavePodsWithRequiredAntiAffinityList() ([]*framework.NodeInfo, error) { return nil, nil }
+func (f *fakeSharedLister) HavePodsWithRequiredAntiAffinityList() ([]*framework.NodeInfo, error) {
+	return nil, nil
+}
 func (f *fakeSharedLister) Get(nodeName string) (*framework.NodeInfo, error) {
 	ni, ok := f.nodeMap[nodeName]
 	if !ok {
@@ -804,7 +809,7 @@ func TestPreFilterRejectsWhenRunnerReservationsExceedNPU(t *testing.T) {
 	fwk, state := setupTestFramework(t, allPods, nodes)
 	now := time.Now()
 	pl := &ARCSync{
-		handle:               fwk,
+		handle: fwk,
 		inFlightReservations: map[string]reservation{
 			"runner1-uid": {nodeName: "npu-1", count: 4, timestamp: now, baseName: "runner1", namespace: "ns1"},
 			"runner2-uid": {nodeName: "npu-1", count: 4, timestamp: now, baseName: "runner2", namespace: "ns1"},
@@ -831,7 +836,7 @@ func TestPreFilterAllowsRunnerWhenReservationsBelowNPU(t *testing.T) {
 	fwk, state := setupTestFramework(t, allPods, nodes)
 	now := time.Now()
 	pl := &ARCSync{
-		handle:               fwk,
+		handle: fwk,
 		inFlightReservations: map[string]reservation{
 			"runner1-uid": {nodeName: "npu-1", count: 4, timestamp: now, baseName: "runner1", namespace: "ns1"},
 			"runner2-uid": {nodeName: "npu-1", count: 4, timestamp: now, baseName: "runner2", namespace: "ns1"},
@@ -843,5 +848,256 @@ func TestPreFilterAllowsRunnerWhenReservationsBelowNPU(t *testing.T) {
 	_, status := pl.PreFilter(context.TODO(), state, targetPod)
 	if status.Code() != framework.Success {
 		t.Errorf("expected Success (per-node free = 16 − 12 = 4 >= 4), got %v: %v", status.Code(), status.Message())
+	}
+}
+
+func newFakePodLister(t *testing.T, pods ...*v1.Pod) corev1listers.PodLister {
+	t.Helper()
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	for _, p := range pods {
+		if err := indexer.Add(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return corev1listers.NewPodLister(indexer)
+}
+
+// makeWorkflowPodOnNode builds a bound pod that occupies NPU on a local node
+// via the AllocatedNPUCount label.
+func makeWorkflowPodOnNode(name, namespace, nodeName string, npuCount int) *v1.Pod {
+	pod := st.MakePod().Name(name).Namespace(namespace).Node(nodeName).UID(name).Obj()
+	pod.Labels = map[string]string{
+		AllocatedNPUCount: strconv.Itoa(npuCount),
+		ResourceDomain:    testResDomain,
+		ResourceModel:     testResModel,
+	}
+	return pod
+}
+
+func makePendingRunner(name, namespace string, npuCount int, created time.Time) *v1.Pod {
+	pod := makeRunnerPodWithLabels(name, namespace, npuCount)
+	pod.CreationTimestamp = metav1.NewTime(created)
+	return pod
+}
+
+// TestBackfillFragmentedHead is the head-of-line-blocking scenario: an 8-card
+// head cannot fit on any single node (fragments of 3 and 6), so it drains
+// npu-b (the pinned target), while a younger 1-card pod backfills the
+// 3-free fragment on npu-a instead of idling.
+func TestBackfillFragmentedHead(t *testing.T) {
+	nodeA := makeNodeWithNPU("npu-a", 8, nil)
+	nodeB := makeNodeWithNPU("npu-b", 8, nil)
+
+	boundPods := []*v1.Pod{
+		makeWorkflowPodOnNode("wf-a", "ns1", "npu-a", 5), // npu-a free = 3
+		makeWorkflowPodOnNode("wf-b", "ns1", "npu-b", 2), // npu-b free = 6
+	}
+	t0 := time.Now().Add(-time.Hour)
+	head := makePendingRunner("head-8", "ns1", 8, t0)
+	younger := makePendingRunner("young-1", "ns1", 1, t0.Add(time.Minute))
+
+	fwk, headState := setupTestFramework(t, boundPods, []*v1.Node{nodeA, nodeB})
+	pl := &ARCSync{
+		handle:               fwk,
+		podLister:            newFakePodLister(t, head, younger),
+		inFlightReservations: make(map[string]reservation),
+	}
+
+	// Head passes PreFilter (total free 9 >= 8) and pins its drain target...
+	_, status := pl.PreFilter(context.TODO(), headState, head)
+	if status.Code() != framework.Success {
+		t.Fatalf("head PreFilter should succeed on aggregate capacity: %v", status.Message())
+	}
+	target, ok := pl.poolDrainTargets[fifoPoolKey(head, false)]
+	if !ok || target.nodeName != "npu-b" {
+		t.Fatalf("expected drain target npu-b pinned for head, got %+v", pl.poolDrainTargets)
+	}
+	// ...but fails Filter on every node (3 < 8, 6 < 8): head pends, draining npu-b.
+	// (Head is a runner pod without container NPU requests, so Filter passes it;
+	// the per-node arithmetic is what a workflow pod with requests would face.)
+
+	// Younger pod backfills: aggregate 9-1=8 >= 8 holds, npu-b is pruned
+	// (draining), npu-a's 3-free fragment is usable.
+	youngState := framework.NewCycleState()
+	_, status = pl.PreFilter(context.TODO(), youngState, younger)
+	if status.Code() != framework.Success {
+		t.Fatalf("younger pod should backfill the fragment on npu-a: %v", status.Message())
+	}
+	data, err := youngState.Read(stateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preState := data.(*preFilterState)
+	if _, exists := preState.nodeFreeNPU["npu-b"]; exists {
+		t.Errorf("npu-b is the drain target and must be pruned from the younger pod's candidates")
+	}
+	if free, exists := preState.nodeFreeNPU["npu-a"]; !exists || free != 3 {
+		t.Errorf("expected npu-a (free=3) available for backfill, got %v", preState.nodeFreeNPU)
+	}
+}
+
+// TestBackfillAggregateHold: when total free NPU barely covers the head,
+// younger pods are held so capacity accumulates (no aggregate surplus to
+// backfill from).
+func TestBackfillAggregateHold(t *testing.T) {
+	nodeA := makeNodeWithNPU("npu-a", 8, nil)
+	nodeB := makeNodeWithNPU("npu-b", 8, nil)
+
+	boundPods := []*v1.Pod{
+		makeWorkflowPodOnNode("wf-a", "ns1", "npu-a", 3), // free 5
+		makeWorkflowPodOnNode("wf-b", "ns1", "npu-b", 3), // free 5
+	}
+	t0 := time.Now().Add(-time.Hour)
+	head := makePendingRunner("head-16", "ns1", 16, t0)
+	younger := makePendingRunner("young-4", "ns1", 4, t0.Add(time.Minute))
+
+	fwk, state := setupTestFramework(t, boundPods, []*v1.Node{nodeA, nodeB})
+	pl := &ARCSync{
+		handle:               fwk,
+		podLister:            newFakePodLister(t, head, younger),
+		inFlightReservations: make(map[string]reservation),
+	}
+
+	// total free = 10, head needs 16 (aggregate, runner pod): 10-4 < 16 → hold.
+	_, status := pl.PreFilter(context.TODO(), state, younger)
+	if status.Code() != framework.Unschedulable {
+		t.Fatalf("expected backfill hold (10 free - 4 < 16 for head), got %v: %v", status.Code(), status.Message())
+	}
+}
+
+// TestBackfillSurplusPassesAggregate: with surplus beyond the head's need,
+// younger pods schedule, but the drain target keeps a full block for the head.
+func TestBackfillSurplusPassesAggregate(t *testing.T) {
+	nodeA := makeNodeWithNPU("npu-a", 8, nil)
+	nodeB := makeNodeWithNPU("npu-b", 8, nil)
+
+	boundPods := []*v1.Pod{
+		makeWorkflowPodOnNode("wf-a", "ns1", "npu-a", 5), // free 3
+	}
+	t0 := time.Now().Add(-time.Hour)
+	head := makePendingRunner("head-8", "ns1", 8, t0)
+	younger := makePendingRunner("young-2", "ns1", 2, t0.Add(time.Minute))
+
+	fwk, state := setupTestFramework(t, boundPods, []*v1.Node{nodeA, nodeB})
+	pl := &ARCSync{
+		handle:               fwk,
+		podLister:            newFakePodLister(t, head, younger),
+		inFlightReservations: make(map[string]reservation),
+	}
+
+	// total free = 11, head needs 8: 11-2 >= 8 → pass. npu-b (free 8) is the
+	// head's block: 8-2 < 8 → pruned. npu-a fragment stays.
+	_, status := pl.PreFilter(context.TODO(), state, younger)
+	if status.Code() != framework.Success {
+		t.Fatalf("younger pod should pass with aggregate surplus: %v", status.Message())
+	}
+	data, err := state.Read(stateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preState := data.(*preFilterState)
+	if _, exists := preState.nodeFreeNPU["npu-b"]; exists {
+		t.Errorf("npu-b holds the head's only full block and must be pruned")
+	}
+	if _, exists := preState.nodeFreeNPU["npu-a"]; !exists {
+		t.Errorf("expected npu-a available for backfill, got %v", preState.nodeFreeNPU)
+	}
+}
+
+// TestBackfillImpossibleHeadDoesNotHoldPool: a workflow head whose per-node
+// requirement exceeds every node's allocatable can never be satisfied and
+// must not freeze the pool.
+func TestBackfillImpossibleHeadDoesNotHoldPool(t *testing.T) {
+	nodeA := makeNodeWithNPU("npu-a", 8, nil)
+	nodeB := makeNodeWithNPU("npu-b", 8, nil)
+
+	t0 := time.Now().Add(-time.Hour)
+	head := makePendingRunner("head-16", "ns1", 16, t0)
+	head.Spec.Containers = []v1.Container{{
+		Name: "main",
+		Resources: v1.ResourceRequirements{
+			Requests: v1.ResourceList{testFullResName: *resource.NewQuantity(16, resource.DecimalSI)},
+		},
+	}}
+	younger := makePendingRunner("young-1", "ns1", 1, t0.Add(time.Minute))
+
+	fwk, state := setupTestFramework(t, nil, []*v1.Node{nodeA, nodeB})
+	pl := &ARCSync{
+		handle:               fwk,
+		podLister:            newFakePodLister(t, head, younger),
+		inFlightReservations: make(map[string]reservation),
+	}
+
+	_, status := pl.PreFilter(context.TODO(), state, younger)
+	if status.Code() != framework.Success {
+		t.Fatalf("impossible head (needs 16 on one node, max allocatable 8) must not hold the pool: %v", status.Message())
+	}
+	data, err := state.Read(stateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preState := data.(*preFilterState)
+	if len(preState.nodeFreeNPU) != 2 {
+		t.Errorf("expected both nodes available (no drain target for impossible head), got %v", preState.nodeFreeNPU)
+	}
+}
+
+func TestUpdateDrainTargetSticky(t *testing.T) {
+	pl := &ARCSync{}
+	head := makeRunnerPodWithLabels("head", "ns1", 8)
+
+	got := pl.updateDrainTarget("pool", head, map[string]int64{"npu-a": 3, "npu-b": 6})
+	if got != "npu-b" {
+		t.Fatalf("expected initial pick npu-b (max free), got %q", got)
+	}
+	// Free values shift, but the pin must stick while npu-b stays a candidate.
+	got = pl.updateDrainTarget("pool", head, map[string]int64{"npu-a": 7, "npu-b": 2})
+	if got != "npu-b" {
+		t.Errorf("expected sticky target npu-b, got %q", got)
+	}
+	// Pinned node drops out of the candidate set → re-pick.
+	got = pl.updateDrainTarget("pool", head, map[string]int64{"npu-a": 7})
+	if got != "npu-a" {
+		t.Errorf("expected re-pick npu-a after npu-b left candidates, got %q", got)
+	}
+	// New head → fresh pick.
+	head2 := makeRunnerPodWithLabels("head2", "ns1", 8)
+	got = pl.updateDrainTarget("pool", head2, map[string]int64{"npu-a": 1, "npu-b": 5})
+	if got != "npu-b" {
+		t.Errorf("expected fresh pick npu-b for new head, got %q", got)
+	}
+	// No candidates → target cleared.
+	got = pl.updateDrainTarget("pool", head2, map[string]int64{})
+	if got != "" {
+		t.Errorf("expected empty target with no candidates, got %q", got)
+	}
+	if _, ok := pl.poolDrainTargets["pool"]; ok {
+		t.Errorf("expected pool entry removed when no candidates remain")
+	}
+}
+
+func TestScoreBestFit(t *testing.T) {
+	pl := &ARCSync{}
+	state := framework.NewCycleState()
+	state.Write(stateKey, &preFilterState{
+		requiredCount: 2,
+		resourceName:  testFullResName,
+		nodeFreeNPU:   map[string]int64{"npu-tight": 2, "npu-empty": 8},
+	})
+	pod := makeRunnerPodWithLabels("p", "ns1", 2)
+
+	tight, status := pl.Score(context.TODO(), state, pod, "npu-tight")
+	if status.Code() != framework.Success {
+		t.Fatal(status.Message())
+	}
+	empty, status := pl.Score(context.TODO(), state, pod, "npu-empty")
+	if status.Code() != framework.Success {
+		t.Fatal(status.Message())
+	}
+	if tight <= empty {
+		t.Errorf("best-fit must prefer the tighter node: score(free=2)=%d should exceed score(free=8)=%d", tight, empty)
+	}
+	if tight != framework.MaxNodeScore-2 || empty != framework.MaxNodeScore-8 {
+		t.Errorf("unexpected scores: tight=%d empty=%d", tight, empty)
 	}
 }

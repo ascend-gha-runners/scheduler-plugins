@@ -2,6 +2,8 @@ package arcsync
 
 import (
 	"context"
+	"fmt"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -13,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	corev1listers "k8s.io/client-go/listers/core/v1"
@@ -39,10 +42,19 @@ type reservation struct {
 	namespace string
 }
 
+// drainTarget pins one node per scheduling pool whose free NPU is being
+// accumulated for the pool head. Keyed by the head's UID so a new head
+// triggers a fresh pick.
+type drainTarget struct {
+	headUID  types.UID
+	nodeName string
+}
+
 type ARCSync struct {
 	handle               framework.Handle
 	podLister            corev1listers.PodLister
 	inFlightReservations map[string]reservation
+	poolDrainTargets     map[string]drainTarget
 	mu                   sync.Mutex
 	nsOffloadingLister   nsOffloadingLister
 	queueLister          queueLister
@@ -70,6 +82,7 @@ func New(ctx context.Context, _ runtime.Object, h framework.Handle) (framework.P
 		handle:               h,
 		podLister:            h.SharedInformerFactory().Core().V1().Pods().Lister(),
 		inFlightReservations: make(map[string]reservation),
+		poolDrainTargets:     make(map[string]drainTarget),
 	}
 
 	dynamicClient, err := dynamic.NewForConfig(h.KubeConfig())
@@ -166,12 +179,23 @@ func getBaseName(name string) string {
 	return name
 }
 
-// isOldestPendingRunner returns true if no older unbound runner pod (same NPU type,
-// same namespace, same scheduling pool) exists.
-// This enforces strict FIFO within a scheduling pool: a runner pod only proceeds
-// when it is the oldest waiting one in its pool. Using CreationTimestamp avoids the
-// backoff side-effect where older (more-retried) pods accumulate longer backoff
-// delays and get jumped by newer pods.
+// podSchedulesBefore orders pods by CreationTimestamp (UID tie-break).
+// Using CreationTimestamp avoids the backoff side-effect where older
+// (more-retried) pods accumulate longer backoff delays and get jumped by
+// newer pods.
+func podSchedulesBefore(a, b *v1.Pod) bool {
+	at, bt := a.CreationTimestamp.Time, b.CreationTimestamp.Time
+	if !at.Equal(bt) {
+		return at.Before(bt)
+	}
+	return string(a.UID) < string(b.UID)
+}
+
+// olderPoolHead returns the pool head — the oldest unbound runner pod (same
+// NPU type, same namespace, same scheduling pool) older than pod — or nil
+// when pod itself is the head. The head schedules unconditionally (FIFO);
+// younger pods may only backfill capacity that provably cannot delay the
+// head (see backfillCheck).
 //
 // Only unbound pods (Spec.NodeName == "") are compared — pods already assigned to
 // a node are past the scheduling decision and must not block new pods. Namespace
@@ -179,22 +203,22 @@ func getBaseName(name string) string {
 // npuFIFOPool when NamespaceOffloading is active, or nodeSelector comparison
 // otherwise) ensures that runners targeting different scheduling pools do not
 // block each other.
-func (pl *ARCSync) isOldestPendingRunner(pod *v1.Pod, nsHasOffloading bool) bool {
+func (pl *ARCSync) olderPoolHead(pod *v1.Pod, nsHasOffloading bool) *v1.Pod {
 	if pl.podLister == nil {
-		return true
+		return nil
 	}
 	resDomain := pod.Labels[ResourceDomain]
 	resModel := pod.Labels[ResourceModel]
-	myTime := pod.CreationTimestamp.Time
 
 	allPods, err := pl.podLister.List(labels.Everything())
 	if err != nil {
 		klog.ErrorS(err, "ARCSync: failed to list pods for FIFO check, failing open")
-		return true
+		return nil
 	}
 
 	myPool := npuFIFOPool(pod)
 
+	var head *v1.Pod
 	for _, p := range allPods {
 		if p.UID == pod.UID {
 			continue
@@ -230,15 +254,11 @@ func (pl *ARCSync) isOldestPendingRunner(pod *v1.Pod, nsHasOffloading bool) bool
 				continue
 			}
 		}
-		pTime := p.CreationTimestamp.Time
-		if pTime.Before(myTime) || (pTime.Equal(myTime) && string(p.UID) < string(pod.UID)) {
-			klog.V(4).InfoS("ARCSync: FIFO block — older runner exists",
-				"pod", pod.Name, "olderPod", p.Name,
-				"podCreated", myTime, "olderCreated", pTime)
-			return false
+		if podSchedulesBefore(p, pod) && (head == nil || podSchedulesBefore(p, head)) {
+			head = p
 		}
 	}
-	return true
+	return head
 }
 
 func npuFIFOPool(pod *v1.Pod) string {
@@ -246,6 +266,151 @@ func npuFIFOPool(pod *v1.Pod) string {
 		return v
 	}
 	return "local"
+}
+
+// fifoPoolKey identifies a scheduling pool for drain-target bookkeeping.
+// Callers must derive the key from the pool head so all members of a pool
+// agree on it. Without NamespaceOffloading, pools are nodeSelector
+// equivalence classes, so the selector is folded into the key to keep
+// distinct classes from sharing one drain target.
+func fifoPoolKey(pod *v1.Pod, nsHasOffloading bool) string {
+	key := pod.Namespace + "/" + pod.Labels[ResourceDomain] + "/" + pod.Labels[ResourceModel] + "/" + npuFIFOPool(pod)
+	if !nsHasOffloading {
+		keys := make([]string, 0, len(pod.Spec.NodeSelector))
+		for k := range pod.Spec.NodeSelector {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			key += "|" + k + "=" + pod.Spec.NodeSelector[k]
+		}
+	}
+	return key
+}
+
+// headCouldHostFree returns, for every node that could ever host the pool
+// head's complete requirement (allocatable >= headReq, honoring the head's
+// nodeSelector, tolerations and the namespace's virtual-node eligibility),
+// that node's current free NPU. Free capacity on other nodes can never become
+// a complete block for the head, so younger pods may consume it without
+// delaying the head. The second return value is the head's total allocatable
+// NPU across all its eligible nodes, used to detect heads that can never be
+// satisfied at all.
+func headCouldHostFree(head *v1.Pod, headReq int64, nodeInfos []*framework.NodeInfo, fullResourceName v1.ResourceName, nodeTotalOccupied map[string]int64, nsHasOffloading bool, nsOffloading *unstructured.Unstructured) (map[string]int64, int64) {
+	var eligibleVirtuals map[string]bool
+	if nsHasOffloading && nsOffloading != nil {
+		eligibleVirtuals = getEligibleVirtualNodes(nodeInfos, nsOffloading)
+	}
+	couldHost := make(map[string]int64)
+	var totalAllocatable int64
+	for _, ni := range nodeInfos {
+		node := ni.Node()
+		if node == nil || !canScheduleOnNode(head, node) {
+			continue
+		}
+		if !nodeMatchesSelector(node, head.Spec.NodeSelector) {
+			continue
+		}
+		if isVirtualNode(node) && !eligibleVirtuals[node.Name] {
+			continue
+		}
+		allocatable := node.Status.Allocatable[fullResourceName]
+		totalAllocatable += allocatable.Value()
+		if allocatable.Value() >= headReq {
+			couldHost[node.Name] = allocatable.Value() - nodeTotalOccupied[node.Name]
+		}
+	}
+	return couldHost, totalAllocatable
+}
+
+// updateDrainTarget pins one node per pool whose free NPU is left to
+// accumulate for the pool head, and returns it ("" when the head has no
+// eligible node). The pin is sticky for a given head: re-picking the argmax
+// every cycle would drain several nodes at once and never finish any of them.
+// It is re-picked only when the head changes or the pinned node stops being
+// a candidate (cordoned, tainted, reconfigured).
+func (pl *ARCSync) updateDrainTarget(key string, head *v1.Pod, couldHostFree map[string]int64) string {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	if pl.poolDrainTargets == nil {
+		pl.poolDrainTargets = make(map[string]drainTarget)
+	}
+	if cur, ok := pl.poolDrainTargets[key]; ok && cur.headUID == head.UID {
+		if _, stillCandidate := couldHostFree[cur.nodeName]; stillCandidate {
+			return cur.nodeName
+		}
+	}
+	best := ""
+	var bestFree int64
+	for name, free := range couldHostFree {
+		if best == "" || free > bestFree || (free == bestFree && name < best) {
+			best, bestFree = name, free
+		}
+	}
+	if best == "" {
+		delete(pl.poolDrainTargets, key)
+		return ""
+	}
+	pl.poolDrainTargets[key] = drainTarget{headUID: head.UID, nodeName: best}
+	klog.InfoS("ARCSync: pinned drain target for pool head",
+		"pool", key, "head", head.Name, "node", best, "freeNPU", bestFree)
+	return best
+}
+
+// backfillCheck relaxes the former strict-FIFO hold into EASY-style backfill:
+// a younger pod may schedule ahead of the pool head as long as it provably
+// does not delay the head. Two protections:
+//
+//  1. Aggregate headroom: after placing this pod, enough total free NPU must
+//     remain for the head. When the pool is already below the head's need,
+//     every card a younger pod takes pushes the head further out, so the pod
+//     is held and capacity accumulates (cluster-level drain).
+//  2. Drain-target protection: when the head's need is per-node (workflow
+//     pods must fit on a single node) and fragmentation is what blocks it,
+//     one sticky target node accumulates free NPU for it. Younger pods may
+//     not consume that node unless it retains a full block for the head;
+//     all other nodes stay open for backfill.
+//
+// Only the pool head is protected (EASY backfill): pod #3 may briefly delay
+// pod #2, but every pod gains full protection once it becomes head, so a
+// large job waits at most one drain ahead of its turn. A head that can never
+// be satisfied (requirement above every eligible node's allocatable, or above
+// the pool's total capacity) must not hold the pool hostage; backfill runs
+// unrestricted and the head is left to operator intervention.
+//
+// Returns nil when the pod may proceed; nodeFreeNPU may have been pruned.
+func (pl *ARCSync) backfillCheck(pod *v1.Pod, reqCount int64, head *v1.Pod, nsHasOffloading bool, nsOffloading *unstructured.Unstructured, nodeInfos []*framework.NodeInfo, fullResourceName v1.ResourceName, nodeTotalOccupied map[string]int64, nodeFreeNPU map[string]int64, totalNPUFree int64) *framework.Status {
+	headReq, err := strconv.ParseInt(head.Labels[RequiredNPUCount], 10, 64)
+	if err != nil || headReq <= 0 {
+		return nil
+	}
+
+	headFree, headTotalAllocatable := headCouldHostFree(head, headReq, nodeInfos, fullResourceName, nodeTotalOccupied, nsHasOffloading, nsOffloading)
+	impossible := headTotalAllocatable < headReq ||
+		(podRequestsNPU(head, fullResourceName) && len(headFree) == 0)
+	if impossible {
+		klog.InfoS("ARCSync: pool head can never be satisfied, backfilling without hold",
+			"pod", pod.Name, "head", head.Name, "headRequired", headReq)
+		return nil
+	}
+
+	if totalNPUFree-reqCount < headReq {
+		klog.V(4).InfoS("ARCSync: backfill hold — preserving aggregate NPU for pool head",
+			"pod", pod.Name, "head", head.Name, "headRequired", headReq, "totalFree", totalNPUFree)
+		return framework.NewStatus(framework.Unschedulable,
+			fmt.Sprintf("backfill: preserving %d NPU for older pod %s", headReq, head.Name))
+	}
+
+	if target := pl.updateDrainTarget(fifoPoolKey(head, nsHasOffloading), head, headFree); target != "" {
+		if free, ok := nodeFreeNPU[target]; ok && free-reqCount < headReq {
+			delete(nodeFreeNPU, target)
+		}
+		if len(nodeFreeNPU) == 0 {
+			return framework.NewStatus(framework.Unschedulable,
+				fmt.Sprintf("backfill: node %s is draining for older pod %s", target, head.Name))
+		}
+	}
+	return nil
 }
 
 func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, pod *v1.Pod) (*framework.PreFilterResult, *framework.Status) {
@@ -435,10 +600,13 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 		return nil, framework.NewStatus(framework.Unschedulable, "No node has enough available NPU slots")
 	}
 
-	if !pl.isOldestPendingRunner(pod, nsHasOffloading) {
-		klog.InfoS("ARCSync: FIFO hold — waiting for older runner pods",
-			"pod", pod.Name)
-		return nil, framework.NewStatus(framework.Unschedulable, "FIFO: waiting for older runner pods to be scheduled first")
+	if head := pl.olderPoolHead(pod, nsHasOffloading); head == nil {
+		// This pod is the pool head. Pin the node it is draining toward so
+		// backfilling younger pods keep off it while it waits.
+		headFree, _ := headCouldHostFree(pod, int64(reqCount), nodeInfos, fullResourceName, nodeTotalOccupied, nsHasOffloading, nsOffloading)
+		pl.updateDrainTarget(fifoPoolKey(pod, nsHasOffloading), pod, headFree)
+	} else if st := pl.backfillCheck(pod, int64(reqCount), head, nsHasOffloading, nsOffloading, nodeInfos, fullResourceName, nodeTotalOccupied, nodeFreeNPU, totalNPUFree); st != nil {
+		return nil, st
 	}
 
 	state.Write(stateKey, &preFilterState{
@@ -616,7 +784,14 @@ func (pl *ARCSync) Score(ctx context.Context, state *framework.CycleState, pod *
 	}
 	data := s.(*preFilterState)
 	free := data.nodeFreeNPU[nodeName]
-	score := free
+	// Best-fit: prefer the node with the least free NPU that still passed
+	// Filter. Packing small jobs into partially-used nodes preserves large
+	// contiguous blocks for large jobs, reducing the fragmentation that
+	// forces drain waits. (The previous most-free scoring was worst-fit: it
+	// sent every small job to the emptiest node, breaking up exactly the
+	// blocks the 8/16-card jobs need.) For runner pods this also prefers
+	// NPU-less nodes, keeping them off NPU nodes entirely.
+	score := framework.MaxNodeScore - free
 	if score > framework.MaxNodeScore {
 		score = framework.MaxNodeScore
 	}
