@@ -323,6 +323,83 @@ func makeWorkloadPod(name, namespace, nodeName string, npuReq int64) *v1.Pod {
 	return pod
 }
 
+// withRequiredNodeAffinity 给 pod 设置 requiredDuringSchedulingIgnoredDuringExecution
+// 形式的 nodeAffinity。
+func withRequiredNodeAffinity(pod *v1.Pod, terms ...v1.NodeSelectorTerm) *v1.Pod {
+	pod.Spec.Affinity = &v1.Affinity{
+		NodeAffinity: &v1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{NodeSelectorTerms: terms},
+		},
+	}
+	return pod
+}
+
+func TestNodeMatchesPodSelection(t *testing.T) {
+	virtAIF := makeNodeWithNPU("virt-aif", 8, map[string]string{
+		"liqo.io/remote-cluster-id": "aiframework",
+		"liqo.io/type":              "virtual-node",
+	})
+	localNode := makeNodeWithNPU("local-1", 8, nil)
+
+	clusterInTerm := func(vals ...string) v1.NodeSelectorTerm {
+		return v1.NodeSelectorTerm{MatchExpressions: []v1.NodeSelectorRequirement{{
+			Key: "liqo.io/remote-cluster-id", Operator: v1.NodeSelectorOpIn, Values: vals,
+		}}}
+	}
+	notVirtualTerm := v1.NodeSelectorTerm{MatchExpressions: []v1.NodeSelectorRequirement{{
+		Key: "liqo.io/type", Operator: v1.NodeSelectorOpNotIn, Values: []string{"virtual-node"},
+	}}}
+
+	tests := []struct {
+		name string
+		node *v1.Node
+		pod  *v1.Pod
+		want bool
+	}{
+		{
+			name: "no affinity matches anything",
+			node: virtAIF,
+			pod:  makeRunnerPodWithLabels("p1", "ns1", 1),
+			want: true,
+		},
+		{
+			name: "affinity listing the cluster admits the virtual node",
+			node: virtAIF,
+			pod:  withRequiredNodeAffinity(makeRunnerPodWithLabels("p1", "ns1", 1), clusterInTerm("gy005", "aiframework"), notVirtualTerm),
+			want: true,
+		},
+		{
+			name: "affinity missing the cluster excludes the virtual node",
+			node: virtAIF,
+			pod:  withRequiredNodeAffinity(makeRunnerPodWithLabels("p1", "ns1", 1), clusterInTerm("gy005", "mind-third-ci"), notVirtualTerm),
+			want: false,
+		},
+		{
+			name: "not-in virtual-node term admits local node (label missing)",
+			node: localNode,
+			pod:  withRequiredNodeAffinity(makeRunnerPodWithLabels("p1", "ns1", 1), clusterInTerm("gy005", "mind-third-ci"), notVirtualTerm),
+			want: true,
+		},
+		{
+			name: "nodeSelector still enforced",
+			node: virtAIF,
+			pod: func() *v1.Pod {
+				pod := makeRunnerPodWithLabels("p1", "ns1", 1)
+				pod.Spec.NodeSelector = map[string]string{"liqo.io/remote-cluster-id": "gy005"}
+				return pod
+			}(),
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := nodeMatchesPodSelection(tt.node, tt.pod); got != tt.want {
+				t.Errorf("nodeMatchesPodSelection() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 type fakeSharedLister struct {
 	nodeInfos []*framework.NodeInfo
 	nodeMap   map[string]*framework.NodeInfo
@@ -540,6 +617,82 @@ func TestPreFilterVirtualWinsWhenLocalOccupiedByOtherNamespace(t *testing.T) {
 	}
 	if _, exists := preState.nodeFreeNPU["local-1"]; exists {
 		t.Errorf("expected local-1 to be excluded (fully occupied by other namespace)")
+	}
+}
+
+func TestPreFilterAffinityExcludesNonTargetedVirtual(t *testing.T) {
+	// 复现线上问题：pod 通过 nodeAffinity 只允许 gy005/mind-third-ci（及本地），
+	// 而 NamespaceOffloading clusterSelector 新增了剩余更多的 aiframework。
+	// 修复前 ARCSync 会选 aiframework 为 bestVirtNode 并删掉 mind-third-ci，
+	// 随后被默认 NodeAffinity 插件拒绝，pod 无处可调；修复后 aiframework 在
+	// PreFilter 就被排除，virtual-wins 只保留允许的 mind-third-ci。
+	localNode := makeNodeWithNPU("local-1", 2, nil)
+	virtGy005 := makeNodeWithNPU("virt-gy005", 8, map[string]string{
+		"liqo.io/remote-cluster-id": "gy005", "liqo.io/type": "virtual-node"})
+	virtMind := makeNodeWithNPU("virt-mind", 10, map[string]string{
+		"liqo.io/remote-cluster-id": "mind-third-ci", "liqo.io/type": "virtual-node"})
+	virtAIF := makeNodeWithNPU("virt-aif", 20, map[string]string{
+		"liqo.io/remote-cluster-id": "aiframework", "liqo.io/type": "virtual-node"})
+
+	pod := makeRunnerPodWithLabels("new-runner", "ns1", 1)
+	withRequiredNodeAffinity(pod,
+		v1.NodeSelectorTerm{MatchExpressions: []v1.NodeSelectorRequirement{{
+			Key: "liqo.io/remote-cluster-id", Operator: v1.NodeSelectorOpIn,
+			Values: []string{"gy005", "mind-third-ci"},
+		}}},
+		v1.NodeSelectorTerm{MatchExpressions: []v1.NodeSelectorRequirement{{
+			Key: "liqo.io/type", Operator: v1.NodeSelectorOpNotIn,
+			Values: []string{"virtual-node"},
+		}}},
+	)
+
+	allPods := []*v1.Pod{pod}
+	nodes := []*v1.Node{localNode, virtGy005, virtMind, virtAIF}
+
+	fwk, state := setupTestFramework(t, allPods, nodes)
+
+	// clusterSelector 覆盖全部三个 cluster（含新增的 aiframework）
+	nsOffloading := &unstructured.Unstructured{Object: map[string]interface{}{}}
+	selectorMap := map[string]interface{}{
+		"nodeSelectorTerms": []interface{}{
+			map[string]interface{}{
+				"matchExpressions": []interface{}{
+					map[string]interface{}{
+						"key":      "liqo.io/remote-cluster-id",
+						"operator": "In",
+						"values":   []interface{}{"gy005", "mind-third-ci", "aiframework"},
+					},
+				},
+			},
+		},
+	}
+	unstructured.SetNestedMap(nsOffloading.Object, selectorMap, "spec", "clusterSelector")
+
+	pl := &ARCSync{
+		handle:               fwk,
+		inFlightReservations: make(map[string]reservation),
+		nsOffloadingLister:   &fakeNSOffloadingLister{objects: map[string]*unstructured.Unstructured{"ns1": nsOffloading}},
+		queueLister:          &fakeQueueLister{objects: map[string]*unstructured.Unstructured{}},
+	}
+
+	_, status := pl.PreFilter(context.TODO(), state, pod)
+	if status.Code() != framework.Success {
+		t.Fatalf("PreFilter failed: %v", status.Message())
+	}
+
+	data, err := state.Read(stateKey)
+	if err != nil {
+		t.Fatalf("failed to read state: %v", err)
+	}
+	preState := data.(*preFilterState)
+	if _, exists := preState.nodeFreeNPU["virt-aif"]; exists {
+		t.Errorf("virt-aif must NOT be in nodeFreeNPU (excluded by pod nodeAffinity)")
+	}
+	if _, exists := preState.nodeFreeNPU["virt-mind"]; !exists {
+		t.Errorf("expected virt-mind in nodeFreeNPU (virtual wins: 10 > local 2, 10 > gy005 8)")
+	}
+	if _, exists := preState.nodeFreeNPU["virt-gy005"]; exists {
+		t.Errorf("virt-gy005 should be excluded by virtual-wins (only bestVirtNode virt-mind kept)")
 	}
 }
 
