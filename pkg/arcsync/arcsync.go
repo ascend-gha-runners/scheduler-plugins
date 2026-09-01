@@ -149,13 +149,24 @@ func podToleratesNodeTaints(pod *v1.Pod, node *v1.Node) bool {
 	return !isUntolerated
 }
 
-func nodeMatchesSelector(node *v1.Node, selector map[string]string) bool {
-	for k, v := range selector {
+// nodeMatchesPodSelection 判断节点是否同时满足 pod 的两类放置约束： 
+// spec.nodeSelector（label 精确相等）与
+// spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution
+// （terms 之间 OR，term 内条件 AND，复用 liqo.go 的 nodeSelectorTermsMatch）。
+func nodeMatchesPodSelection(node *v1.Node, pod *v1.Pod) bool {
+	for k, v := range pod.Spec.NodeSelector {
 		if node.Labels[k] != v {
 			return false
 		}
 	}
-	return true
+	if pod.Spec.Affinity == nil || pod.Spec.Affinity.NodeAffinity == nil {
+		return true
+	}
+	required := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	if required == nil {
+		return true
+	}
+	return nodeSelectorTermsMatch(labels.Set(node.Labels), required.NodeSelectorTerms)
 }
 
 func getBaseName(name string) string {
@@ -357,7 +368,7 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 		if node == nil || !canScheduleOnNode(pod, node) {
 			continue
 		}
-		if !nodeMatchesSelector(node, pod.Spec.NodeSelector) {
+		if !nodeMatchesPodSelection(node, pod) {
 			continue
 		}
 		allocatable := node.Status.Allocatable[fullResourceName]
