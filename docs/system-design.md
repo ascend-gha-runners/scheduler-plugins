@@ -464,9 +464,9 @@ Pod `metadata.labels`：`ascend-ci.com/required-npu-count`、`ascend-ci.com/npu-
 
 #### 5.1.8 验收与验证说明
 
-- **TC-01-01**：TC-01A：标签缺失 → 插件 PreFilter 返回 Success 且不写 `ARCSync/state`（源码推导；需补独立测试）。
-- **TC-01-02**：TC-01B：`required-npu-count=2`、资源域 `huawei.com`、型号 `npu` → 拼为 `huawei.com/npu`（源码推导）。
-- **TC-01-03**：TC-01C：`required-npu-count=abc` → `Atoi` 错误被忽略，不能断言拒绝（需回归记录）。
+- **TC-01-01**：标签缺失 → 插件 PreFilter 返回 Success 且不写 `ARCSync/state`（源码推导；需补独立测试）。
+- **TC-01-02**：`required-npu-count=2`、资源域 `huawei.com`、型号 `npu` → 拼为 `huawei.com/npu`（源码推导）。
+- **TC-01-03**：`required-npu-count=abc` → `Atoi` 错误被忽略，不能断言拒绝（需回归记录）。
 
 **判定规则**：现有测试函数只说明代码仓包含该测试，不能在本次未执行 Go Test 或没有集群访问的情况下声称测试已通过。对于风险复现用例，预期结果应保持与当前源码一致。
 
@@ -479,7 +479,7 @@ Pod `metadata.labels`：`ascend-ci.com/required-npu-count`、`ascend-ci.com/npu-
 | 影响（可靠性/可用性） | 错误输入可能获得错误的准入判断 |
 | 已有控制措施 | 源码无严格输入校验 |
 | 检测与验证 | 非法标签 Pod 对比 Status、CycleState 和 Events |
-| 剩余风险 | 当前控制不能提供跨组件或运行态的完整保证；第 6 章对应 GAP 不属于已实现功能 |
+| 剩余风险 | 非法或缺失需求标签可能令零需求/错误资源名进入后续准入路径；即使框架调度成功，也无法证明 Runner 标签与 Workflow NPU Requests 一致。 |
 
 **共性 DFX 约束与证据口径**：见 5.13；本节仅分析本 SR 特有失效模式及控制。
 
@@ -563,9 +563,9 @@ Kubernetes `Node.status.allocatable`；Pod `containers[].resources.requests`；P
 
 #### 5.2.8 验收与验证说明
 
-- **TC-02-01**：TC-02A：虚拟 Node 上同型号 2+3+1 卡 → 计算 6（现有 `TestCalcVirtualNodeOccupied`）。
-- **TC-02-02**：TC-02B：异型号 Pod 被忽略（现有 `TestCalcVirtualNodeOccupiedMismatchedModel`）。
-- **TC-02-03**：TC-02C：本地 Requests=2 与匹配 label=4 → 计 4（逻辑可由代码推导，本轮未发现专门单测）。
+- **TC-02-01**：虚拟 Node 上同型号 2+3+1 卡 → 计算 6（现有 `TestCalcVirtualNodeOccupied`）。
+- **TC-02-02**：异型号 Pod 被忽略（现有 `TestCalcVirtualNodeOccupiedMismatchedModel`）。
+- **TC-02-03**：本地 Requests=2 与匹配 label=4 → 计 4（逻辑可由代码推导，本轮未发现专门单测）。
 
 **判定规则**：现有测试函数只说明代码仓包含该测试，不能在本次未执行 Go Test 或没有集群访问的情况下声称测试已通过。对于风险复现用例，预期结果应保持与当前源码一致。
 
@@ -578,7 +578,7 @@ Kubernetes `Node.status.allocatable`；Pod `containers[].resources.requests`；P
 | 影响（可靠性/可用性） | 准入误放行或错误拒绝 |
 | 已有控制措施 | 读取当前 Snapshot，按资源类型计数 |
 | 检测与验证 | 构造 requests/label 冲突、延迟快照与虚拟 Pod 场景 |
-| 剩余风险 | 当前控制不能提供跨组件或运行态的完整保证；第 6 章对应 GAP 不属于已实现功能 |
+| 剩余风险 | Snapshot 更新滞后、InitContainer 申请未按同等语义核算或虚拟节点标签缺失时，节点占用可能被低估；目前没有真实设备占用的闭环校验。 |
 
 **共性 DFX 约束与证据口径**：见 5.13；本节仅分析本 SR 特有失效模式及控制。
 
@@ -663,11 +663,11 @@ sequenceDiagram
 
 #### 5.3.8 验收与验证说明
 
-- **TC-03-01**：TC-03A：剩余总量低于请求 → Unschedulable（需隔离 FIFO 影响）。
-- **TC-03-02**：TC-03B：Runner 预约超过 NPU 总量 → 拒绝（现有 `TestPreFilterRejectsWhenRunnerReservationsExceedNPU`）。
-- **TC-03-03**：TC-03C：预约未超过总量 → 准入（现有 `TestPreFilterAllowsRunnerWhenReservationsBelowNPU`）。
-- **TC-03-04**：TC-03D：两个节点分别空闲 4 卡，申请 8 卡 → 当前聚合条件可能通过（风险复现实验，不得作为单节点可行性功能验收）。
-- **TC-03-05**：TC-03E：本地空闲 8 卡、合格 Liqo 远端单节点空闲 10 卡、Runner 申请 12 卡且无其它限制 → 核查 Liqo 选择远端、聚合按 18 卡放行、远端不足 12 卡；这是待补的回归场景，并非已有自动化测试。
+- **TC-03-01**：剩余总量低于请求 → Unschedulable（需隔离 FIFO 影响）。
+- **TC-03-02**：Runner 预约超过 NPU 总量 → 拒绝（现有 `TestPreFilterRejectsWhenRunnerReservationsExceedNPU`）。
+- **TC-03-03**：预约未超过总量 → 准入（现有 `TestPreFilterAllowsRunnerWhenReservationsBelowNPU`）。
+- **TC-03-04**：两个节点分别空闲 4 卡，申请 8 卡 → 当前聚合条件可能通过（风险复现实验，不得作为单节点可行性功能验收）。
+- **TC-03-05**：本地空闲 8 卡、合格 Liqo 远端单节点空闲 10 卡、Runner 申请 12 卡且无其它限制 → 核查 Liqo 选择远端、聚合按 18 卡放行、远端不足 12 卡；这是待补的回归场景，并非已有自动化测试。
 
 **判定规则**：现有测试函数只说明代码仓包含该测试，不能在本次未执行 Go Test 或没有集群访问的情况下声称测试已通过。对于风险复现用例，预期结果应保持与当前源码一致。
 
@@ -680,7 +680,7 @@ sequenceDiagram
 | 影响（可靠性/可用性） | 未来 Workflow 长时间 Pending |
 | 已有控制措施 | Filter 与默认插件只验证当前被绑定 Pod |
 | 检测与验证 | 两节点各 4 卡、申请 8 卡及定向 selector 场景 |
-| 剩余风险 | 当前控制不能提供跨组件或运行态的完整保证；第 6 章对应 GAP 不属于已实现功能 |
+| 剩余风险 | 本地/远端余量聚合可满足需求但获胜池单节点不足，或本地聚合计入不满足 NodeSelector 的节点；后续 Workflow 仍可能长期 Pending。 |
 
 **共性 DFX 约束与证据口径**：见 5.13；本节仅分析本 SR 特有失效模式及控制。
 
@@ -761,10 +761,10 @@ sequenceDiagram
 
 #### 5.4.8 验收与验证说明
 
-- **TC-04-01**：TC-04A：预留 2 卡后，下一轮剩余计量减少 2；配合 CPU Runner 预约测试。
-- **TC-04-02**：TC-04B：Unreserve 删除当前 UID 预约（源码推导，未发现独立单测）。
-- **TC-04-03**：TC-04C：UID 不在快照且预约 age>10s 才删除；在快照中不因时间自然过期。
-- **TC-04-04**：TC-04D：进程重启后 map 重新初始化为空（设计限制验证）。
+- **TC-04-01**：预留 2 卡后，下一轮剩余计量减少 2；配合 CPU Runner 预约测试。
+- **TC-04-02**：Unreserve 删除当前 UID 预约（源码推导，未发现独立单测）。
+- **TC-04-03**：UID 不在快照且预约 age>10s 才删除；在快照中不因时间自然过期。
+- **TC-04-04**：进程重启后 map 重新初始化为空（设计限制验证）。
 
 **判定规则**：现有测试函数只说明代码仓包含该测试，不能在本次未执行 Go Test 或没有集群访问的情况下声称测试已通过。对于风险复现用例，预期结果应保持与当前源码一致。
 
@@ -777,7 +777,7 @@ sequenceDiagram
 | 影响（可靠性/可用性） | 重复准入、容量计算不稳定 |
 | 已有控制措施 | 进程内 mutex + Unreserve + 条件性快照清理 |
 | 检测与验证 | 重启前后及并发多 Runner，比较 map 与快照 |
-| 剩余风险 | 当前控制不能提供跨组件或运行态的完整保证；第 6 章对应 GAP 不属于已实现功能 |
+| 剩余风险 | Scheduler 重启使内存预约丢失；快照尚未出现的 UID 满足清理条件也可能被删，竞争调度器同时准入时仍可能重复分配逻辑容量。 |
 
 **共性 DFX 约束与证据口径**：见 5.13；本节仅分析本 SR 特有失效模式及控制。
 
@@ -859,9 +859,9 @@ Workflow Pod 的 `metadata.name`、namespace、container Requests、npu-count �
 
 #### 5.5.8 验收与验证说明
 
-- **TC-05-01**：TC-05A：同 baseName Workflow 出现后，对应 Runner 预约跳过计数（源码推导，需独立单测）。
-- **TC-05-02**：TC-05B：不同 namespace 的同名 baseName 可能误跳过预留（已知风险复现）。
-- **TC-05-03**：TC-05C：PostBind 回调是否执行，必须以实际 Framework 配置/运行日志确认；不能只跑纯 Go 方法测试证明部署调用。
+- **TC-05-01**：同 baseName Workflow 出现后，对应 Runner 预约跳过计数（源码推导，需独立单测）。
+- **TC-05-02**：不同 namespace 的同名 baseName 可能误跳过预留（已知风险复现）。
+- **TC-05-03**：PostBind 回调是否执行，必须以实际 Framework 配置/运行日志确认；不能只跑纯 Go 方法测试证明部署调用。
 
 **判定规则**：现有测试函数只说明代码仓包含该测试，不能在本次未执行 Go Test 或没有集群访问的情况下声称测试已通过。对于风险复现用例，预期结果应保持与当前源码一致。
 
@@ -874,7 +874,7 @@ Workflow Pod 的 `metadata.name`、namespace、container Requests、npu-count �
 | 影响（可靠性/可用性） | 占用少计，引起过量准入 |
 | 已有控制措施 | Snapshot 观察到同名 Workflow 时跳过逻辑预约 |
 | 检测与验证 | 双 namespace 同 baseName、Workflow 创建/删除时序 |
-| 剩余风险 | 当前控制不能提供跨组件或运行态的完整保证；第 6 章对应 GAP 不属于已实现功能 |
+| 剩余风险 | 跨 namespace 相同 baseName 的 Workflow 可能错误跳过其他 Runner 预约；Workflow 不按约定命名时预约与真实占用也可能并存而重复计数。 |
 
 **共性 DFX 约束与证据口径**：见 5.13；本节仅分析本 SR 特有失效模式及控制。
 
@@ -957,10 +957,10 @@ sequenceDiagram
 
 #### 5.6.8 验收与验证说明
 
-- **TC-06-01**：TC-06A：匹配指定远端 → 仅匹配 Node 保留（`TestGetEligibleVirtualNodes`）。
-- **TC-06-02**：TC-06B：非目标远端排除（`TestGetEligibleVirtualNodesExcludesNonTargetedCluster`）。
-- **TC-06-03**：TC-06C：无有效 selector terms → 当前实现允许所有虚拟 Node（`TestGetEligibleVirtualNodesNoSelector`）。
-- **TC-06-04**：TC-06D：无 NamespaceOffloading 时虚拟 Node 被删除（`TestPreFilterNoNamespaceOffloading`）。
+- **TC-06-01**：匹配指定远端 → 仅匹配 Node 保留（`TestGetEligibleVirtualNodes`）。
+- **TC-06-02**：非目标远端排除（`TestGetEligibleVirtualNodesExcludesNonTargetedCluster`）。
+- **TC-06-03**：无有效 selector terms → 当前实现允许所有虚拟 Node（`TestGetEligibleVirtualNodesNoSelector`）。
+- **TC-06-04**：无 NamespaceOffloading 时虚拟 Node 被删除（`TestPreFilterNoNamespaceOffloading`）。
 
 **判定规则**：现有测试函数只说明代码仓包含该测试，不能在本次未执行 Go Test 或没有集群访问的情况下声称测试已通过。对于风险复现用例，预期结果应保持与当前源码一致。
 
@@ -973,7 +973,7 @@ sequenceDiagram
 | 影响（可靠性/可用性） | 任务可能选择不符合预期的池 |
 | 已有控制措施 | NamespaceOffloading 节点过滤与择优 |
 | 检测与验证 | 空/合法 selector、未同步缓存 |
-| 剩余风险 | 当前控制不能提供跨组件或运行态的完整保证；第 6 章对应 GAP 不属于已实现功能 |
+| 剩余风险 | 空 clusterSelector terms 会扩大虚拟节点候选范围；NamespaceOffloading informer 尚未同步时，候选集可能不符合预期远端授权。 |
 
 **共性 DFX 约束与证据口径**：见 5.13；本节仅分析本 SR 特有失效模式及控制。
 
@@ -1057,11 +1057,11 @@ Pod 所在 namespace 的 NamespaceOffloading、Node label、Pod 节点约束；�
 
 #### 5.7.8 验收与验证说明
 
-- **TC-07-01**：TC-07A：本地余量大于远端 → 本地胜（`TestPreFilterLocalWins`）。
-- **TC-07-02**：TC-07B：远端余量大于本地 → 远端胜（`TestPreFilterVirtualWins`）。
-- **TC-07-03**：TC-07C：本地被其他 namespace 占满 → 应按全量占用核算（`TestPreFilterVirtualWinsWhenLocalOccupiedByOtherNamespace`）。
-- **TC-07-04**：TC-07D：NodeAffinity 不允许虚拟 Node → 不被选为最佳（`TestPreFilterAffinityExcludesNonTargetedVirtual`）。
-- **TC-07-05**：TC-07E：本地 8 卡、远端 10 卡、需求 12 卡 → 检查远端胜出但本地仍计入聚合；结果以源码执行路径为准（待添加测试，不声称测试已通过）。
+- **TC-07-01**：本地余量大于远端 → 本地胜（`TestPreFilterLocalWins`）。
+- **TC-07-02**：远端余量大于本地 → 远端胜（`TestPreFilterVirtualWins`）。
+- **TC-07-03**：本地被其他 namespace 占满 → 应按全量占用核算（`TestPreFilterVirtualWinsWhenLocalOccupiedByOtherNamespace`）。
+- **TC-07-04**：NodeAffinity 不允许虚拟 Node → 不被选为最佳（`TestPreFilterAffinityExcludesNonTargetedVirtual`）。
+- **TC-07-05**：本地 8 卡、远端 10 卡、需求 12 卡 → 检查远端胜出但本地仍计入聚合；结果以源码执行路径为准（待添加测试，不声称测试已通过）。
 
 **判定规则**：现有测试函数只说明代码仓包含该测试，不能在本次未执行 Go Test 或没有集群访问的情况下声称测试已通过。对于风险复现用例，预期结果应保持与当前源码一致。
 
@@ -1074,7 +1074,7 @@ Pod 所在 namespace 的 NamespaceOffloading、Node label、Pod 节点约束；�
 | 影响（可靠性/可用性） | 跨池放置结果偏离资源可行性 |
 | 已有控制措施 | 已有 applyLiqoComparison |
 | 检测与验证 | 本地与远端容量相等、局部不足的场景 |
-| 剩余风险 | 当前控制不能提供跨组件或运行态的完整保证；第 6 章对应 GAP 不属于已实现功能 |
+| 剩余风险 | 本地总余量与远端单节点最大余量比较口径不同，选中远端仍可能缺乏完整单节点容量；池选择平局规则也不能保证未来 Workflow 放置。 |
 
 **共性 DFX 约束与证据口径**：见 5.13；本节仅分析本 SR 特有失效模式及控制。
 
@@ -1156,10 +1156,10 @@ Pod annotation `scheduling.volcano.sh/queue-name: my-queue`；外部 `Queue.spec
 
 #### 5.8.8 验收与验证说明
 
-- **TC-08-01**：TC-08A：合法 Queue capability 返回数值（`TestGetQueueNpuLimit`）。
-- **TC-08-02**：TC-08B：Queue 限额降低本地优势使远端获胜（`TestPreFilterVolcanoQueueCapsLocal`）。
-- **TC-08-03**：TC-08C：只有 Namespace annotation、没有 Pod annotation → 当前代码不会读取 Queue（待复现实验）。
-- **TC-08-04**：TC-08D：无 NamespaceOffloading 时即使有 Queue annotation，也不执行本地 Queue 限制（源码推导）。
+- **TC-08-01**：合法 Queue capability 返回数值（`TestGetQueueNpuLimit`）。
+- **TC-08-02**：Queue 限额降低本地优势使远端获胜（`TestPreFilterVolcanoQueueCapsLocal`）。
+- **TC-08-03**：只有 Namespace annotation、没有 Pod annotation → 当前代码不会读取 Queue（待复现实验）。
+- **TC-08-04**：无 NamespaceOffloading 时即使有 Queue annotation，也不执行本地 Queue 限制（源码推导）。
 
 **判定规则**：现有测试函数只说明代码仓包含该测试，不能在本次未执行 Go Test 或没有集群访问的情况下声称测试已通过。对于风险复现用例，预期结果应保持与当前源码一致。
 
@@ -1172,7 +1172,7 @@ Pod annotation `scheduling.volcano.sh/queue-name: my-queue`；外部 `Queue.spec
 | 影响（可靠性/可用性） | 配额超预期或不公平 |
 | 已有控制措施 | 仅对本地剩余额度和候选进行裁剪 |
 | 检测与验证 | 有无 offloading、缺失注解、无效 Queue CR |
-| 剩余风险 | 当前控制不能提供跨组件或运行态的完整保证；第 6 章对应 GAP 不属于已实现功能 |
+| 剩余风险 | Queue 缺失、读取失败或未进入 offloading 分支时限制可能不生效；即使 Queue 限制在本地生效，远端候选仍未由该分支强制限制。 |
 
 **共性 DFX 约束与证据口径**：见 5.13；本节仅分析本 SR 特有失效模式及控制。
 
@@ -1260,10 +1260,10 @@ Pod nodeSelector、tolerations、nodeAffinity、container Requests；没有独�
 
 #### 5.9.8 验收与验证说明
 
-- **TC-09-01**：TC-09A：Runner 仅标签要求 NPU，实际放在 CPU Node 时 Filter 返回 Success（`TestFilterRunnerPodPassesCPUNode`）。
-- **TC-09-02**：TC-09B：NodeAffinity 禁止远端时不进入候选（`TestNodeMatchesPodSelection`）。
-- **TC-09-03**：TC-09C：不在 nodeFreeNPU 的 Node 返回 `node not eligible...`（源码推导）。
-- **TC-09-04**：TC-09D：free=8 分数为 8、free=150 截为 100、free<0 截为 0（源码推导）。
+- **TC-09-01**：Runner 仅标签要求 NPU，实际放在 CPU Node 时 Filter 返回 Success（`TestFilterRunnerPodPassesCPUNode`）。
+- **TC-09-02**：NodeAffinity 禁止远端时不进入候选（`TestNodeMatchesPodSelection`）。
+- **TC-09-03**：不在 nodeFreeNPU 的 Node 返回 `node not eligible...`（源码推导）。
+- **TC-09-04**：free=8 分数为 8、free=150 截为 100、free<0 截为 0（源码推导）。
 
 **判定规则**：现有测试函数只说明代码仓包含该测试，不能在本次未执行 Go Test 或没有集群访问的情况下声称测试已通过。对于风险复现用例，预期结果应保持与当前源码一致。
 
@@ -1276,7 +1276,7 @@ Pod nodeSelector、tolerations、nodeAffinity、container Requests；没有独�
 | 影响（可靠性/可用性） | 节点选择不符合预期，性能波动 |
 | 已有控制措施 | Framework 默认 Filter 与本插件 Filter/Score |
 | 检测与验证 | 缺失 state、CPU Runner、NPU Request Pod |
-| 剩余风险 | 当前控制不能提供跨组件或运行态的完整保证；第 6 章对应 GAP 不属于已实现功能 |
+| 剩余风险 | CycleState 缺失时 Filter/Score 的成功或零分回退可能掩盖未执行的 NPU 检查；Runner 绑定节点的高分不保证未来 Workflow 容量。 |
 
 **共性 DFX 约束与证据口径**：见 5.13；本节仅分析本 SR 特有失效模式及控制。
 
@@ -1363,11 +1363,11 @@ Pod `metadata.creationTimestamp`、UID、namespace、ResourceDomain/ResourceMode
 
 #### 5.10.8 验收与验证说明
 
-- **TC-10-01**：TC-10A：同 namespace 同型号两个未绑定 Runner，较新的 Pod 应由 FIFO 阻止（源码规则，需独立单测）。
-- **TC-10-02**：TC-10B：已绑定、终态、异型号、跨 namespace 不阻止当前 Pod（源码规则）。
-- **TC-10-03**：TC-10C：同一时间戳以 UID 小者优先（源码规则）。
-- **TC-10-04**：TC-10D：无法获得 Pod 列表时 fail-open（源码规则）。
-- **TC-10-05**：TC-10E：大卡数头部资源暂缺造成后续小任务阻塞（已知行为，不作为优化已完成）。
+- **TC-10-01**：同 namespace 同型号两个未绑定 Runner，较新的 Pod 应由 FIFO 阻止（源码规则，需独立单测）。
+- **TC-10-02**：已绑定、终态、异型号、跨 namespace 不阻止当前 Pod（源码规则）。
+- **TC-10-03**：同一时间戳以 UID 小者优先（源码规则）。
+- **TC-10-04**：无法获得 Pod 列表时 fail-open（源码规则）。
+- **TC-10-05**：大卡数头部资源暂缺造成后续小任务阻塞（已知行为，不作为优化已完成）。
 
 **判定规则**：现有测试函数只说明代码仓包含该测试，不能在本次未执行 Go Test 或没有集群访问的情况下声称测试已通过。对于风险复现用例，预期结果应保持与当前源码一致。
 
@@ -1380,7 +1380,7 @@ Pod `metadata.creationTimestamp`、UID、namespace、ResourceDomain/ResourceMode
 | 影响（可靠性/可用性） | 小任务饥饿或部分任务比较范围不一致 |
 | 已有控制措施 | CreationTimestamp + UID 检查；同范围拦截 |
 | 检测与验证 | 旧大任务/新小任务、对称性、Lister 错误 |
-| 剩余风险 | 当前控制不能提供跨组件或运行态的完整保证；第 6 章对应 GAP 不属于已实现功能 |
+| 剩余风险 | 严格 FIFO 可能让无法满足的大任务长期阻塞同范围小任务；非 Liqo 路径的非对称 selector 比较使不同 Runner 观察到的前驱集合不一致。 |
 
 **共性 DFX 约束与证据口径**：见 5.13；本节仅分析本 SR 特有失效模式及控制。
 
@@ -1464,10 +1464,10 @@ sequenceDiagram
 
 #### 5.11.8 验收与验证说明
 
-- **TC-11-01**：TC-11A：声明 Pod Add/Update/Delete 和 Node Add/Update（源码检查）。
-- **TC-11-02**：TC-11B：Liqo CRD 不存在时 pl.nsOffloadingLister 为 nil（源码行为）。
-- **TC-11-03**：TC-11C：CRD 缓存尚未同步时可能只有本地候选（行为复现）。
-- **TC-11-04**：TC-11D：只更新 Queue/NamespaceOffloading CR 是否立刻使 Pending Runner 重排——不可从本代码保证，需要集成验证。
+- **TC-11-01**：声明 Pod Add/Update/Delete 和 Node Add/Update（源码检查）。
+- **TC-11-02**：Liqo CRD 不存在时 pl.nsOffloadingLister 为 nil（源码行为）。
+- **TC-11-03**：CRD 缓存尚未同步时可能只有本地候选（行为复现）。
+- **TC-11-04**：只更新 Queue/NamespaceOffloading CR 是否立刻使 Pending Runner 重排——不可从本代码保证，需要集成验证。
 
 **判定规则**：现有测试函数只说明代码仓包含该测试，不能在本次未执行 Go Test 或没有集群访问的情况下声称测试已通过。对于风险复现用例，预期结果应保持与当前源码一致。
 
@@ -1480,7 +1480,7 @@ sequenceDiagram
 | 影响（可靠性/可用性） | 配置变化生效滞后 |
 | 已有控制措施 | Pod/Node 事件注册、informer 缓存 |
 | 检测与验证 | 仅修改 CR 与修改 Pod/Node 对比重试时间 |
-| 剩余风险 | 当前控制不能提供跨组件或运行态的完整保证；第 6 章对应 GAP 不属于已实现功能 |
+| 剩余风险 | Queue/NamespaceOffloading CR 单独更新不触发显式重新入队事件；缓存同步延迟可能使待调度 Runner 继续使用过期策略。 |
 
 **共性 DFX 约束与证据口径**：见 5.13；本节仅分析本 SR 特有失效模式及控制。
 
@@ -1563,10 +1563,10 @@ GitOps YAML；Runner Pod.spec.schedulerName；Pod labels。没有 ARCSync 自定
 
 #### 5.12.8 验收与验证说明
 
-- **TC-12-01**：TC-12A：静态检查主配置启用四个扩展点且 schedulerName=npu-scheduler（已核对 YAML）。
-- **TC-12-02**：TC-12B：实际 Pod spec.image 与 status.containerStatuses[].imageID 必须在目标集群核对（尚未执行）。
-- **TC-12-03**：TC-12C：运行时是否触发 PostBind 需要实际 Scheduler 调用链验证。
-- **TC-12-04**：TC-12D：单副本终止或重启期间 Pending 行为须在线观察（尚未执行）。
+- **TC-12-01**：静态检查主配置启用四个扩展点且 schedulerName=npu-scheduler（已核对 YAML）。
+- **TC-12-02**：实际 Pod spec.image 与 status.containerStatuses[].imageID 必须在目标集群核对（尚未执行）。
+- **TC-12-03**：运行时是否触发 PostBind 需要实际 Scheduler 调用链验证。
+- **TC-12-04**：单副本终止或重启期间 Pending 行为须在线观察（尚未执行）。
 
 **判定规则**：现有测试函数只说明代码仓包含该测试，不能在本次未执行 Go Test 或没有集群访问的情况下声称测试已通过。对于风险复现用例，预期结果应保持与当前源码一致。
 
@@ -1579,7 +1579,7 @@ GitOps YAML；Runner Pod.spec.schedulerName；Pod labels。没有 ARCSync 自定
 | 影响（可靠性/可用性） | 调度暂停、风险扩大、重启预约丢失 |
 | 已有控制措施 | GitOps 部署声明；K8s 控制平面 |
 | 检测与验证 | 只读检查 live imageID/RBAC、重启前后行为 |
-| 剩余风险 | 当前控制不能提供跨组件或运行态的完整保证；第 6 章对应 GAP 不属于已实现功能 |
+| 剩余风险 | 单副本无选主在故障/升级时中断专用调度；cluster-admin 扩大受损影响面，重启又会清空进程内预约账本。 |
 
 **共性 DFX 约束与证据口径**：见 5.13；本节仅分析本 SR 特有失效模式及控制。
 
