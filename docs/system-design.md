@@ -259,7 +259,7 @@ TotalFree = \sum_{n\in EligibleLocal} (Allocatable_n - ObservedOccupied_n - InFl
 - 对**未在容器 Requests 声明 NPU 的 Runner**，`Filter` 只检查节点是否在候选 map 中，不在此处要求该节点本身具有足够 NPU。正是因此 Runner 可以放置在 CPU 节点，未来 Workflow 另外申请 NPU。
 - 因外部 Workflow 可使用其它调度器，**不能保证**其实际运行位置、拓扑和其他资源都能满足。
 
-### 4.2.3 准入算法、正确性边界与反例
+#### 4.2.3 准入算法、正确性边界与反例
 
 **当前算法（AS-IS，不构成资源承诺）**：
 
@@ -279,6 +279,8 @@ TotalFree = \sum_{n\in EligibleLocal} (Allocatable_n - ObservedOccupied_n - InFl
 | 非法或负数 `required-npu-count` | 不保证拒绝 | 转换错误被忽略，不能声称正整数验证已实现 |
 | Snapshot 延迟、外部 Workflow 启动 | 依旧使用已读取的快照 | 可能发生容量估计偏差、资源竞争 |
 
+**Liqo 决策与聚合准入不一致的组合反例（源码静态推导）**：假定本地物理节点剩余 8 卡、一个合格远端虚拟节点剩余 10 卡、Runner 标签声明 12 卡；`NamespaceOffloading` 已配置且节点满足筛选条件，没有 Queue 限制、其它 Pod 占用或额外约束。Liqo 择优比较中，远端单节点 10 > 本地合计 8，因此可能只在 `nodeFreeNPU` 中保留远端节点；但随后 `PreFilter` 聚合步骤仍计算**所有满足 canScheduleOnNode 的本地节点**，加上仍在候选映射的远端，得到 `8 + 10 = 18 >= 12`，故容量预检可能通过。最终远端单节点仅有 10 卡，不足以运行申请 12 卡的 Workflow。**关键点**：Liqo 节点筛选与聚合准入的计入范围并不相同；这不是单纯的本地资源碎片。是否真正绑定还取决于 Filter、默认调度插件和 Workflow 自身调度器。
+
 **正确性边界**：当前实现可讨论的保证仅限一次调度判断的计算规则、同一插件实例的 map 互斥写入，以及相同 FIFO 比较范围的旧任务拦截。不能声称单节点可执行、跨实例全局预约、Workflow 必定启动或长期无饥饿。评审应分别验证“聚合资源准入”“Runner Pod 绑定”“Workflow 真实 NPU 分配”，不以其中一项替代另一项。
 
 ### 4.3 FIFO 公平规格
@@ -296,7 +298,7 @@ TotalFree = \sum_{n\in EligibleLocal} (Allocatable_n - ObservedOccupied_n - InFl
 - 该 FIFO 判断发生在聚合容量检查之后；如果容量不足，先返回容量错误，再不进入 FIFO 判断。
 - 严格 FIFO 可能导致一个不可满足的大任务阻塞后续较小任务，作为当前设计的**已知特性/风险**记录。
 
-### 4.3.3 FIFO 比较关系、顺序性质及边界
+#### 4.3.3 FIFO 比较关系、顺序性质及边界
 
 设 `Older(a,b)` 当 `a.CreationTimestamp < b.CreationTimestamp`，时间相同则按 UID 字典序排序。当前 Pod `b` 被拦截，当且仅当 Lister 中存在满足下面**比较谓词**的 `a`，且 `Older(a,b)`：
 
@@ -325,7 +327,7 @@ TotalFree = \sum_{n\in EligibleLocal} (Allocatable_n - ObservedOccupied_n - InFl
 - 仅在已找到 NamespaceOffloading 的分支中调用 Queue 额度逻辑。先用 Queue 剩余额度截断本地 `localRemaining`；若当前 namespace 本地占用加本次请求超过额度，删除本地候选 Node。虚拟节点不在此删除循环中。
 - Queue 读取或解析失败则视为没有额度，不构成强制拒绝；所以不是完整 Volcano Queue 强制配额系统。
 
-### 4.4.3 Liqo / Volcano 联合决策表
+#### 4.4.3 Liqo / Volcano 联合决策表
 
 下表按当前执行路径描述**插件自身规则**；Kubernetes 默认 Filter 和外部 Liqo/Volcano 控制器仍会影响最终调度。不要将它理解为最终节点的唯一决策表。
 
@@ -337,6 +339,8 @@ TotalFree = \sum_{n\in EligibleLocal} (Allocatable_n - ObservedOccupied_n - InFl
 | 存在，Queue 名称缺失/读取失败/内容无效 | 依前述 selector | 依资源比较 | 无有效限额，路径可能继续 | **fail-open 风险**，并非强制配额 |
 | 存在，但当前 Runner 只约束特定 NodeSelector/affinity | 依本代码筛选和后续 Filter | 仍进行池比较 | 条件生效 | 聚合总量与最终可绑定候选可能不同 |
 
+**跨阶段反例（对应 4.2.3）**：本地空闲 8 卡、远端单虚拟节点空闲 10 卡，Runner 请求 12 卡。满足 Liqo offloading 条件且无其它限制时，Liqo 可能选远端（10 > 8），但聚合检查仍可计入本地 8 与远端 10（18 >= 12），导致通过容量预检却不存在可直接承载 12 卡的远端单节点。这表明“池选择候选”与“聚合准入节点”不同域，不能把通过聚合检查解释为获胜池的资源保证。
+
 **优先关系**：先根据外部 offloading 信息构造/收缩候选，执行代码中的本地与远端择优及条件性 Queue 计算，最后执行聚合准入与 Framework 后续 Filter/Score。Queue 只影响源码实际修改的本地可用量和本地候选，不等同于对远端强制限制。对组合条件的优先级及平局细节应以 `applyLiqoComparison` 和 `PreFilter` 中实际调用顺序为准。
 
 ### 4.5 在途预约与交接规格
@@ -347,7 +351,7 @@ TotalFree = \sum_{n\in EligibleLocal} (Allocatable_n - ObservedOccupied_n - InFl
 - 交接键**仅为 baseName，不带 namespace/UID**；跨 namespace 同名产生误匹配的可能性需要作为现有设计风险记录。未发现持久化、重启恢复机制。
 - 如果 map 中 Pod UID 已不在 NodeInfo 快照，且自预约时间已超过 10 秒，PreFilter 会删除该预约；不能把此规则写成“10 秒后所有预留都超时”。
 
-### 4.5.1 预约状态、转换与账本不变量
+#### 4.5.1 预约状态、转换与账本不变量
 
 **状态是分析视图，不是新增 CRD/状态机实现。** `inFlightReservations` 是进程内 `map[PodUID]reservation`，在 `Reserve` 写入；它没有显式的“已交接”状态字段。
 
@@ -477,7 +481,7 @@ Pod `metadata.labels`：`ascend-ci.com/required-npu-count`、`ascend-ci.com/npu-
 | 检测与验证 | 非法标签 Pod 对比 Status、CycleState 和 Events |
 | 剩余风险 | 当前控制不能提供跨组件或运行态的完整保证；第 6 章对应 GAP 不属于已实现功能 |
 
-**安全性**：检查 Pod 元数据可信边界、namespace 隔离及服务账户权限在此功能中的影响，不把输入标签当成可信的物理资源凭据。**性能**：当前执行基于 Snapshot/Pod Lister 的遍历；单次调用规模随节点数 `N`、可观察 Pod 数 `P` 和在途预约数 `R` 增长，锁覆盖预约相关处理；不将该理论成本写成实测延迟。**可服务性**：现有日志与 Kubernetes Events 可用于定位部分拒绝，缺少已证明的端到端 Runner→Workflow 关联、预约健康度和 CR 缓存同步告警。**FMEA 证据边界**：未采集失效频率、检出率、恢复时间，故不虚构 S/O/D、RPN 或 SLA 达标率。
+**共性 DFX 约束与证据口径**：见 5.13；本节仅分析本 SR 特有失效模式及控制。
 
 
 **代码与配置证据**：[pkg/arcsync/arcsync.go#L25-L31](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/arcsync.go#L25-L31)；[pkg/arcsync/arcsync.go#L262-L275](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/arcsync.go#L262-L275)；[cmd/scheduler/main.go#L33-L43](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/cmd/scheduler/main.go#L33-L43)。
@@ -576,7 +580,7 @@ Kubernetes `Node.status.allocatable`；Pod `containers[].resources.requests`；P
 | 检测与验证 | 构造 requests/label 冲突、延迟快照与虚拟 Pod 场景 |
 | 剩余风险 | 当前控制不能提供跨组件或运行态的完整保证；第 6 章对应 GAP 不属于已实现功能 |
 
-**安全性**：检查 Pod 元数据可信边界、namespace 隔离及服务账户权限在此功能中的影响，不把输入标签当成可信的物理资源凭据。**性能**：当前执行基于 Snapshot/Pod Lister 的遍历；单次调用规模随节点数 `N`、可观察 Pod 数 `P` 和在途预约数 `R` 增长，锁覆盖预约相关处理；不将该理论成本写成实测延迟。**可服务性**：现有日志与 Kubernetes Events 可用于定位部分拒绝，缺少已证明的端到端 Runner→Workflow 关联、预约健康度和 CR 缓存同步告警。**FMEA 证据边界**：未采集失效频率、检出率、恢复时间，故不虚构 S/O/D、RPN 或 SLA 达标率。
+**共性 DFX 约束与证据口径**：见 5.13；本节仅分析本 SR 特有失效模式及控制。
 
 
 **代码与配置证据**：[pkg/arcsync/arcsync.go#L278-L340](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/arcsync.go#L278-L340)；[pkg/arcsync/liqo.go#L76-L110](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/liqo.go#L76-L110)；[pkg/arcsync/arcsync_test.go#L49-L115](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/arcsync_test.go#L49-L115)。
@@ -663,6 +667,7 @@ sequenceDiagram
 - **TC-03-02**：TC-03B：Runner 预约超过 NPU 总量 → 拒绝（现有 `TestPreFilterRejectsWhenRunnerReservationsExceedNPU`）。
 - **TC-03-03**：TC-03C：预约未超过总量 → 准入（现有 `TestPreFilterAllowsRunnerWhenReservationsBelowNPU`）。
 - **TC-03-04**：TC-03D：两个节点分别空闲 4 卡，申请 8 卡 → 当前聚合条件可能通过（风险复现实验，不得作为单节点可行性功能验收）。
+- **TC-03-05**：TC-03E：本地空闲 8 卡、合格 Liqo 远端单节点空闲 10 卡、Runner 申请 12 卡且无其它限制 → 核查 Liqo 选择远端、聚合按 18 卡放行、远端不足 12 卡；这是待补的回归场景，并非已有自动化测试。
 
 **判定规则**：现有测试函数只说明代码仓包含该测试，不能在本次未执行 Go Test 或没有集群访问的情况下声称测试已通过。对于风险复现用例，预期结果应保持与当前源码一致。
 
@@ -677,7 +682,7 @@ sequenceDiagram
 | 检测与验证 | 两节点各 4 卡、申请 8 卡及定向 selector 场景 |
 | 剩余风险 | 当前控制不能提供跨组件或运行态的完整保证；第 6 章对应 GAP 不属于已实现功能 |
 
-**安全性**：检查 Pod 元数据可信边界、namespace 隔离及服务账户权限在此功能中的影响，不把输入标签当成可信的物理资源凭据。**性能**：当前执行基于 Snapshot/Pod Lister 的遍历；单次调用规模随节点数 `N`、可观察 Pod 数 `P` 和在途预约数 `R` 增长，锁覆盖预约相关处理；不将该理论成本写成实测延迟。**可服务性**：现有日志与 Kubernetes Events 可用于定位部分拒绝，缺少已证明的端到端 Runner→Workflow 关联、预约健康度和 CR 缓存同步告警。**FMEA 证据边界**：未采集失效频率、检出率、恢复时间，故不虚构 S/O/D、RPN 或 SLA 达标率。
+**共性 DFX 约束与证据口径**：见 5.13；本节仅分析本 SR 特有失效模式及控制。
 
 
 **代码与配置证据**：[pkg/arcsync/arcsync.go#L419-L461](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/arcsync.go#L419-L461)；[pkg/arcsync/arcsync_test.go#L948-L1001](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/arcsync_test.go#L948-L1001)。
@@ -774,7 +779,7 @@ sequenceDiagram
 | 检测与验证 | 重启前后及并发多 Runner，比较 map 与快照 |
 | 剩余风险 | 当前控制不能提供跨组件或运行态的完整保证；第 6 章对应 GAP 不属于已实现功能 |
 
-**安全性**：检查 Pod 元数据可信边界、namespace 隔离及服务账户权限在此功能中的影响，不把输入标签当成可信的物理资源凭据。**性能**：当前执行基于 Snapshot/Pod Lister 的遍历；单次调用规模随节点数 `N`、可观察 Pod 数 `P` 和在途预约数 `R` 增长，锁覆盖预约相关处理；不将该理论成本写成实测延迟。**可服务性**：现有日志与 Kubernetes Events 可用于定位部分拒绝，缺少已证明的端到端 Runner→Workflow 关联、预约健康度和 CR 缓存同步告警。**FMEA 证据边界**：未采集失效频率、检出率、恢复时间，故不虚构 S/O/D、RPN 或 SLA 达标率。
+**共性 DFX 约束与证据口径**：见 5.13；本节仅分析本 SR 特有失效模式及控制。
 
 
 **代码与配置证据**：[pkg/arcsync/arcsync.go#L34-L49](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/arcsync.go#L34-L49)；[pkg/arcsync/arcsync.go#L342-L363](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/arcsync.go#L342-L363)；[pkg/arcsync/arcsync.go#L644-L678](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/arcsync.go#L644-L678)。
@@ -871,7 +876,7 @@ Workflow Pod 的 `metadata.name`、namespace、container Requests、npu-count �
 | 检测与验证 | 双 namespace 同 baseName、Workflow 创建/删除时序 |
 | 剩余风险 | 当前控制不能提供跨组件或运行态的完整保证；第 6 章对应 GAP 不属于已实现功能 |
 
-**安全性**：检查 Pod 元数据可信边界、namespace 隔离及服务账户权限在此功能中的影响，不把输入标签当成可信的物理资源凭据。**性能**：当前执行基于 Snapshot/Pod Lister 的遍历；单次调用规模随节点数 `N`、可观察 Pod 数 `P` 和在途预约数 `R` 增长，锁覆盖预约相关处理；不将该理论成本写成实测延迟。**可服务性**：现有日志与 Kubernetes Events 可用于定位部分拒绝，缺少已证明的端到端 Runner→Workflow 关联、预约健康度和 CR 缓存同步告警。**FMEA 证据边界**：未采集失效频率、检出率、恢复时间，故不虚构 S/O/D、RPN 或 SLA 达标率。
+**共性 DFX 约束与证据口径**：见 5.13；本节仅分析本 SR 特有失效模式及控制。
 
 
 **代码与配置证据**：[pkg/arcsync/arcsync.go#L172-L178](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/arcsync.go#L172-L178)；[pkg/arcsync/arcsync.go#L298-L363](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/arcsync.go#L298-L363)；[pkg/arcsync/arcsync.go#L680-L704](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/arcsync.go#L680-L704)。
@@ -970,7 +975,7 @@ sequenceDiagram
 | 检测与验证 | 空/合法 selector、未同步缓存 |
 | 剩余风险 | 当前控制不能提供跨组件或运行态的完整保证；第 6 章对应 GAP 不属于已实现功能 |
 
-**安全性**：检查 Pod 元数据可信边界、namespace 隔离及服务账户权限在此功能中的影响，不把输入标签当成可信的物理资源凭据。**性能**：当前执行基于 Snapshot/Pod Lister 的遍历；单次调用规模随节点数 `N`、可观察 Pod 数 `P` 和在途预约数 `R` 增长，锁覆盖预约相关处理；不将该理论成本写成实测延迟。**可服务性**：现有日志与 Kubernetes Events 可用于定位部分拒绝，缺少已证明的端到端 Runner→Workflow 关联、预约健康度和 CR 缓存同步告警。**FMEA 证据边界**：未采集失效频率、检出率、恢复时间，故不虚构 S/O/D、RPN 或 SLA 达标率。
+**共性 DFX 约束与证据口径**：见 5.13；本节仅分析本 SR 特有失效模式及控制。
 
 
 **代码与配置证据**：[pkg/arcsync/liqo.go#L16-L28](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/liqo.go#L16-L28)；[pkg/arcsync/liqo.go#L112-L183](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/liqo.go#L112-L183)；[pkg/arcsync/arcsync.go#L379-L417](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/arcsync.go#L379-L417)。
@@ -1056,6 +1061,7 @@ Pod 所在 namespace 的 NamespaceOffloading、Node label、Pod 节点约束；�
 - **TC-07-02**：TC-07B：远端余量大于本地 → 远端胜（`TestPreFilterVirtualWins`）。
 - **TC-07-03**：TC-07C：本地被其他 namespace 占满 → 应按全量占用核算（`TestPreFilterVirtualWinsWhenLocalOccupiedByOtherNamespace`）。
 - **TC-07-04**：TC-07D：NodeAffinity 不允许虚拟 Node → 不被选为最佳（`TestPreFilterAffinityExcludesNonTargetedVirtual`）。
+- **TC-07-05**：TC-07E：本地 8 卡、远端 10 卡、需求 12 卡 → 检查远端胜出但本地仍计入聚合；结果以源码执行路径为准（待添加测试，不声称测试已通过）。
 
 **判定规则**：现有测试函数只说明代码仓包含该测试，不能在本次未执行 Go Test 或没有集群访问的情况下声称测试已通过。对于风险复现用例，预期结果应保持与当前源码一致。
 
@@ -1070,7 +1076,7 @@ Pod 所在 namespace 的 NamespaceOffloading、Node label、Pod 节点约束；�
 | 检测与验证 | 本地与远端容量相等、局部不足的场景 |
 | 剩余风险 | 当前控制不能提供跨组件或运行态的完整保证；第 6 章对应 GAP 不属于已实现功能 |
 
-**安全性**：检查 Pod 元数据可信边界、namespace 隔离及服务账户权限在此功能中的影响，不把输入标签当成可信的物理资源凭据。**性能**：当前执行基于 Snapshot/Pod Lister 的遍历；单次调用规模随节点数 `N`、可观察 Pod 数 `P` 和在途预约数 `R` 增长，锁覆盖预约相关处理；不将该理论成本写成实测延迟。**可服务性**：现有日志与 Kubernetes Events 可用于定位部分拒绝，缺少已证明的端到端 Runner→Workflow 关联、预约健康度和 CR 缓存同步告警。**FMEA 证据边界**：未采集失效频率、检出率、恢复时间，故不虚构 S/O/D、RPN 或 SLA 达标率。
+**共性 DFX 约束与证据口径**：见 5.13；本节仅分析本 SR 特有失效模式及控制。
 
 
 **代码与配置证据**：[pkg/arcsync/arcsync.go#L492-L586](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/arcsync.go#L492-L586)；[pkg/arcsync/arcsync_test.go#L462-L699](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/arcsync_test.go#L462-L699)。
@@ -1168,7 +1174,7 @@ Pod annotation `scheduling.volcano.sh/queue-name: my-queue`；外部 `Queue.spec
 | 检测与验证 | 有无 offloading、缺失注解、无效 Queue CR |
 | 剩余风险 | 当前控制不能提供跨组件或运行态的完整保证；第 6 章对应 GAP 不属于已实现功能 |
 
-**安全性**：检查 Pod 元数据可信边界、namespace 隔离及服务账户权限在此功能中的影响，不把输入标签当成可信的物理资源凭据。**性能**：当前执行基于 Snapshot/Pod Lister 的遍历；单次调用规模随节点数 `N`、可观察 Pod 数 `P` 和在途预约数 `R` 增长，锁覆盖预约相关处理；不将该理论成本写成实测延迟。**可服务性**：现有日志与 Kubernetes Events 可用于定位部分拒绝，缺少已证明的端到端 Runner→Workflow 关联、预约健康度和 CR 缓存同步告警。**FMEA 证据边界**：未采集失效频率、检出率、恢复时间，故不虚构 S/O/D、RPN 或 SLA 达标率。
+**共性 DFX 约束与证据口径**：见 5.13；本节仅分析本 SR 特有失效模式及控制。
 
 
 **代码与配置证据**：[pkg/arcsync/volcano.go#L11-L42](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/volcano.go#L11-L42)；[pkg/arcsync/arcsync.go#L385-L409](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/arcsync.go#L385-L409)；[pkg/arcsync/arcsync.go#L531-L544](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/arcsync.go#L531-L544)。
@@ -1272,7 +1278,7 @@ Pod nodeSelector、tolerations、nodeAffinity、container Requests；没有独�
 | 检测与验证 | 缺失 state、CPU Runner、NPU Request Pod |
 | 剩余风险 | 当前控制不能提供跨组件或运行态的完整保证；第 6 章对应 GAP 不属于已实现功能 |
 
-**安全性**：检查 Pod 元数据可信边界、namespace 隔离及服务账户权限在此功能中的影响，不把输入标签当成可信的物理资源凭据。**性能**：当前执行基于 Snapshot/Pod Lister 的遍历；单次调用规模随节点数 `N`、可观察 Pod 数 `P` 和在途预约数 `R` 增长，锁覆盖预约相关处理；不将该理论成本写成实测延迟。**可服务性**：现有日志与 Kubernetes Events 可用于定位部分拒绝，缺少已证明的端到端 Runner→Workflow 关联、预约健康度和 CR 缓存同步告警。**FMEA 证据边界**：未采集失效频率、检出率、恢复时间，故不虚构 S/O/D、RPN 或 SLA 达标率。
+**共性 DFX 约束与证据口径**：见 5.13；本节仅分析本 SR 特有失效模式及控制。
 
 
 **代码与配置证据**：[pkg/arcsync/arcsync.go#L129-L169](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/arcsync.go#L129-L169)；[pkg/arcsync/arcsync.go#L365-L377](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/arcsync.go#L365-L377)；[pkg/arcsync/arcsync.go#L588-L641](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/arcsync.go#L588-L641)。
@@ -1376,7 +1382,7 @@ Pod `metadata.creationTimestamp`、UID、namespace、ResourceDomain/ResourceMode
 | 检测与验证 | 旧大任务/新小任务、对称性、Lister 错误 |
 | 剩余风险 | 当前控制不能提供跨组件或运行态的完整保证；第 6 章对应 GAP 不属于已实现功能 |
 
-**安全性**：检查 Pod 元数据可信边界、namespace 隔离及服务账户权限在此功能中的影响，不把输入标签当成可信的物理资源凭据。**性能**：当前执行基于 Snapshot/Pod Lister 的遍历；单次调用规模随节点数 `N`、可观察 Pod 数 `P` 和在途预约数 `R` 增长，锁覆盖预约相关处理；不将该理论成本写成实测延迟。**可服务性**：现有日志与 Kubernetes Events 可用于定位部分拒绝，缺少已证明的端到端 Runner→Workflow 关联、预约健康度和 CR 缓存同步告警。**FMEA 证据边界**：未采集失效频率、检出率、恢复时间，故不虚构 S/O/D、RPN 或 SLA 达标率。
+**共性 DFX 约束与证据口径**：见 5.13；本节仅分析本 SR 特有失效模式及控制。
 
 
 **代码与配置证据**：[pkg/arcsync/arcsync.go#L180-L260](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/arcsync.go#L180-L260)；[pkg/arcsync/arcsync.go#L443-L461](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/arcsync.go#L443-L461)。
@@ -1476,7 +1482,7 @@ sequenceDiagram
 | 检测与验证 | 仅修改 CR 与修改 Pod/Node 对比重试时间 |
 | 剩余风险 | 当前控制不能提供跨组件或运行态的完整保证；第 6 章对应 GAP 不属于已实现功能 |
 
-**安全性**：检查 Pod 元数据可信边界、namespace 隔离及服务账户权限在此功能中的影响，不把输入标签当成可信的物理资源凭据。**性能**：当前执行基于 Snapshot/Pod Lister 的遍历；单次调用规模随节点数 `N`、可观察 Pod 数 `P` 和在途预约数 `R` 增长，锁覆盖预约相关处理；不将该理论成本写成实测延迟。**可服务性**：现有日志与 Kubernetes Events 可用于定位部分拒绝，缺少已证明的端到端 Runner→Workflow 关联、预约健康度和 CR 缓存同步告警。**FMEA 证据边界**：未采集失效频率、检出率、恢复时间，故不虚构 S/O/D、RPN 或 SLA 达标率。
+**共性 DFX 约束与证据口径**：见 5.13；本节仅分析本 SR 特有失效模式及控制。
 
 
 **代码与配置证据**：[pkg/arcsync/arcsync.go#L68-L127](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/arcsync.go#L68-L127)；[pkg/arcsync/liqo.go#L18-L74](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/pkg/arcsync/liqo.go#L18-L74)。
@@ -1575,12 +1581,14 @@ GitOps YAML；Runner Pod.spec.schedulerName；Pod labels。没有 ARCSync 自定
 | 检测与验证 | 只读检查 live imageID/RBAC、重启前后行为 |
 | 剩余风险 | 当前控制不能提供跨组件或运行态的完整保证；第 6 章对应 GAP 不属于已实现功能 |
 
-**安全性**：检查 Pod 元数据可信边界、namespace 隔离及服务账户权限在此功能中的影响，不把输入标签当成可信的物理资源凭据。**性能**：当前执行基于 Snapshot/Pod Lister 的遍历；单次调用规模随节点数 `N`、可观察 Pod 数 `P` 和在途预约数 `R` 增长，锁覆盖预约相关处理；不将该理论成本写成实测延迟。**可服务性**：现有日志与 Kubernetes Events 可用于定位部分拒绝，缺少已证明的端到端 Runner→Workflow 关联、预约健康度和 CR 缓存同步告警。**FMEA 证据边界**：未采集失效频率、检出率、恢复时间，故不虚构 S/O/D、RPN 或 SLA 达标率。
+**共性 DFX 约束与证据口径**：见 5.13；本节仅分析本 SR 特有失效模式及控制。
 
 
 **代码与配置证据**：[cmd/scheduler/main.go#L33-L43](https://github.com/ascend-gha-runners/scheduler-plugins/blob/cc243f537e97ca4e34c6bd57030817a04ae204ec/cmd/scheduler/main.go#L33-L43)；[manifests/scheduler-plugins-new/deployment.yaml](https://github.com/opensourceways/ascend-ci-deployment/blob/3dd81ed95e0fe659d81b1cbf629fc62620bbfff8/manifests/scheduler-plugins-new/deployment.yaml)；[manifests/scheduler-plugins-new/configmap.yaml](https://github.com/opensourceways/ascend-ci-deployment/blob/3dd81ed95e0fe659d81b1cbf629fc62620bbfff8/manifests/scheduler-plugins-new/configmap.yaml)；[manifests/scheduler-plugins-new/serviceaccount.yaml](https://github.com/opensourceways/ascend-ci-deployment/blob/3dd81ed95e0fe659d81b1cbf629fc62620bbfff8/manifests/scheduler-plugins-new/serviceaccount.yaml)。
 
 ### 5.13 跨功能域性能、可靠性和验证边界
+
+**共性 DFX（统一口径）**：安全性：Pod 元数据不能直接等同于可信物理资源凭证；需结合 namespace 隔离和 ServiceAccount 权限理解信任边界。性能：Snapshot/Pod Lister 遍历、候选筛选和预约互斥访问构成主要成本；静态复杂度不等同于实测延迟。可服务性：现有日志及 Kubernetes Events 可辅助定位拒绝，但尚无已证明的 Runner→Workflow 唯一关联、预约健康度或 CR 缓存同步告警。FMEA 不编造发生概率、检出率、恢复时间、S/O/D、RPN 或 SLA 数值；各 SR 仅陈述其特有失效和验证方法。
 
 **复杂度模型（静态推导，不是压测结果）**：令 `N` 为 Snapshot 节点数，`P` 为已观察 Pod 数，`R` 为内存预约数，`Q` 为同 namespace 需要参与 FIFO 筛选的 Pod 数。一次 `PreFilter` 至少涉及 Node/Pod 遍历、预约遍历、候选池筛选与 FIFO 取列表后筛选，核心成本可近似描述为 `O(N + P + R + Q)` 加上具体选择器匹配和缓存操作开销；`Q <= P_lister`，不能直接用这一式子推算毫秒级性能。实际复杂度还受到多个阶段重复迭代、node selector/affinity 条件数量、informer 缓存延迟及锁持有范围影响。原文没有可靠的调度时延、吞吐量、锁等待观测值。
 
@@ -1648,11 +1656,11 @@ GitOps YAML；Runner Pod.spec.schedulerName；Pod labels。没有 ARCSync 自定
 |---|---|---|---|
 | IR-01 | SR-01 基于 Runner NPU 标签激活调度插件 | AR-01-01, AR-01-02, AR-01-03 | TC-01-01, TC-01-02, TC-01-03 |
 | IR-01 | SR-02 统计本地和虚拟节点 NPU 资源占用 | AR-02-01, AR-02-02, AR-02-03, AR-02-04 | TC-02-01, TC-02-02, TC-02-03 |
-| IR-01 | SR-03 执行 NPU 聚合容量准入 | AR-03-01, AR-03-02, AR-03-03 | TC-03-01, TC-03-02, TC-03-03, TC-03-04 |
+| IR-01 | SR-03 执行 NPU 聚合容量准入 | AR-03-01, AR-03-02, AR-03-03 | TC-03-01, TC-03-02, TC-03-03, TC-03-04, TC-03-05 |
 | IR-02 | SR-04 管理进程内 NPU 在途预留 | AR-04-01, AR-04-02, AR-04-03 | TC-04-01, TC-04-02, TC-04-03, TC-04-04 |
 | IR-02 | SR-05 使用 Workflow 命名关系交接资源计量 | AR-05-01, AR-05-02, AR-05-03 | TC-05-01, TC-05-02, TC-05-03 |
 | IR-03 | SR-06 识别并筛选 Liqo 虚拟节点 | AR-06-01, AR-06-02, AR-06-03, AR-06-04 | TC-06-01, TC-06-02, TC-06-03, TC-06-04 |
-| IR-03 | SR-07 本地与远端资源池的比较及择优 | AR-07-01, AR-07-02, AR-07-03 | TC-07-01, TC-07-02, TC-07-03, TC-07-04 |
+| IR-03 | SR-07 本地与远端资源池的比较及择优 | AR-07-01, AR-07-02, AR-07-03 | TC-07-01, TC-07-02, TC-07-03, TC-07-04, TC-07-05 |
 | IR-03 | SR-08 有条件读取 Volcano Queue 限额 | AR-08-01, AR-08-02, AR-08-03 | TC-08-01, TC-08-02, TC-08-03, TC-08-04 |
 | IR-03 | SR-09 候选节点 Filter 和空闲量 Score | AR-09-01, AR-09-02, AR-09-03 | TC-09-01, TC-09-02, TC-09-03, TC-09-04 |
 | IR-04 | SR-10 按命名空间和资源域执行严格 FIFO | AR-10-01, AR-10-02, AR-10-03 | TC-10-01, TC-10-02, TC-10-03, TC-10-04, TC-10-05 |
