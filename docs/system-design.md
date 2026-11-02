@@ -381,7 +381,7 @@ sequenceDiagram
 | 对象 | 必需字段 | 不变量 |
 |---|---|---|
 | ReservationKey | clusterID、namespace、Runner UID、可信 Job/attempt ID、DemandID | 重试身份稳定；不同任务尝试不可复用有效预约 |
-| AccountingDomain | domainID、physicalResourceIdentity、resourceName、nodeCapacityVector、reservationIndex、version、writerEpoch、policyVersion | 同一容量由唯一仲裁边界负责，Node/型号维度独立核算 |
+| AccountingDomain | domainID、physicalResourceIdentity、resourceName、nodeCapacityVector、reservationIndex、version、writerEpoch、PolicyEpoch、protectionVersion | 同一容量与公平保护共用原子仲裁边界；Node/型号维度独立核算 |
 | LogicalReservation | reservationID、DemandID、tenant、Queue、CandidatePlanID、nodeResourceVector、guaranteeLevel、state、generation、writerEpoch、leaseDeadline、owner、workflowRef、evidenceVersion | 同一 Demand/generation 至多一个有效预约；转移须检查代际及合法状态 |
 | HandoffEvidence | reservationID、Workflow namespace/UID、实际 Requests、Node/物理资源映射、分配事实版本 | 必须对应受保护资源域；Runner 已绑定、Workflow 名称相同均不足以证明实际占用 |
 | ReconcileDecision | reservationID、observedState、evidenceVersion、action、reasonCode | 幂等且可复核；不确定时保留容量，不直接释放 |
@@ -433,10 +433,14 @@ CommittedFree[d,n,r] =
   - ConfirmedAllocated[d,n,r]
   - EffectiveLogicalHold[d,n,r]
 
-Commit(D, P, v, epoch):
+Commit(D, P, v, epoch, fairnessPermit):
   REQUIRE Authorized(D) AND FeasibleCandidate(P)
   REQUIRE AccountingDomain.version == v
   REQUIRE AccountingDomain.writerEpoch == epoch
+  REQUIRE fairnessPermit.DemandID == D.DemandID
+  REQUIRE fairnessPermit.PolicyEpoch == AccountingDomain.PolicyEpoch
+  REQUIRE fairnessPermit.protectionVersion == AccountingDomain.protectionVersion
+  REQUIRE FairnessCommitmentPreserved(P, fairnessPermit)
   REQUIRE all required node/resource coordinates:
           CommittedFree[d,n,r] >= P.request[n,r]
   ATOMIC: record reservation + deduct nodeResourceVector
@@ -447,7 +451,7 @@ Commit(D, P, v, epoch):
 
 1. 读取 CandidatePlan、可信的分配事实版本与同一 AccountingDomain 账本版本。
 2. 按 DemandID/generation 查重。同一请求幂等返回相同 reservationID；身份相同但 tenant、规格或计划冲突时拒绝覆盖。
-3. 原子验证授权、策略版本、writerEpoch、每节点容量及完整计划；将节点向量和预约记录在同一个 CAS 中提交。
+3. 原子验证授权、PolicyEpoch、公平许可及其 protectionVersion、writerEpoch、每节点容量及完整计划；将节点向量和预约记录在同一个 CAS 中提交。
 4. CAS 冲突者刷新事实、重新评估可行性与公平许可；禁止重用旧的“容量足够”判断。
 5. 多节点计划整体成功或整体失败；跨不同独立资源域不能把多个局部成功冒充整体承诺。
 6. 后续转移按 reservationID、generation、writerEpoch、可信证据版本做幂等条件更新。旧实例不可覆盖新代际状态。
@@ -635,7 +639,7 @@ SafeBackfill(B, P, R, S, V) =
 
 **时间回填的严格边界：**
 
-- 任务预计耗时、历史 P90/P99、用户自行声明的未经执行时间**不构成安全运行上限**。只有平台可信并受实际运行端强制执行的最大时长，加上停止、资源释放、状态传播及重新绑定的安全余量，才能形成时间回填证据。
+- 任务预计耗时、历史 P90/P99、用户自行声明的未经执行时间**不构成安全运行上限**。只有平台可信、受实际执行端约束且覆盖**从借用受保护资源开始到完整释放为止**的端到端最大时长（包括 Runner/Workflow 准备、执行、清理、释放与状态传播），再加独立安全余量，才能形成时间回填证据。
 - 如果任务可能超过窗口且不允许抢占，那么在保护节点上的时间回填必须被拒绝；不得依赖未来临时驱逐或杀死正常运行任务来补救。
 - 若保护任务的就绪时刻取决于无上限的在运行 Job，不能凭估计值许诺确定开始时间；仅允许不破坏保护容量的空间回填。
 - 时间回填成功后，任务也需要通过 5.2 的域级预约 CAS；公平授权和预留承诺版本必须与容量版本一致，竞争失败后重新评价。
@@ -687,7 +691,7 @@ flowchart TD
 
 **INV-F04（安全回填）：** 借用保护资源的任务只有在可信且受执行端约束的时长与释放裕量满足保护窗口时才可获得许可，否则只能空间无冲突回填。
 
-**INV-F05（公平与容量一致）：** 公平准许与域级逻辑预约以相同版本提交；并发冲突后不复用失效的公平许可。
+**INV-F05（公平与容量一致）：** 公平准许必须包含 DemandID、PolicyEpoch、protectionVersion，并与域级逻辑预约在同一个 AccountingDomain 版本化条件更新中验证；并发冲突后不复用失效的公平许可。
 
 **INV-F06（条件性活性）：** 授权资源持续可用并最终释放、任务具有可行拓扑且有效竞争受公平规则约束时，已获得保护资格的旧任务不会因新请求不断到达而无限次失去机会；不承诺在硬件永远不足时给出有限完成时间。
 
