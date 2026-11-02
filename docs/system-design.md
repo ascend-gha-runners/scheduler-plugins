@@ -680,7 +680,7 @@ flowchart TD
 | CommitFairness | DemandID、CandidatePlan、domainVersion、protectionVersion、policyEpoch | 与 LogicalReservation 同一仲裁边界作最终 CAS，消除排队许可与资源预约竞态 |
 | ReevaluateFairness | 资源释放、保护变化、时间窗口、Queue/授权改变、运行结束 | 保持稳定到达顺序；只影响被变化资源域涉及的任务 |
 
-**Framework 边界**：QueueSort 一次只能采用一个插件，只定义该 Scheduler 内活跃队列的排序，不自行形成多实例跨租户的强公平事实。队列排队、统一 Fairness Policy 仲裁、PreFilter/Filter 的资源可行性检查及 Reserve 阶段的最终权威预约必须使用同一策略版本与同一 AccountingDomain。跨 Scheduler 的共享公平与资源保护若没有统一权威参与，就不能声称该保证成立（ADR-01/05/06/07）。T6 负责细化扩展点组合及事件语义。
+**Framework 边界**：QueueSort 一次只能采用一个插件，只定义该 Scheduler 内活跃队列的排序，不自行形成多实例跨租户的强公平事实。队列排队、统一 Fairness Policy 仲裁、PreFilter/Filter 的资源可行性检查及 Reserve 阶段的最终权威预约必须使用同一策略版本与同一 AccountingDomain。跨 Scheduler 的共享公平与资源保护若没有统一权威参与，就不能声称该保证成立（ADR-01/05/06/07）。扩展点组合和失败事件协议见 5.6。
 
 #### 5.4.6 公平性不变量与故障行为
 
@@ -734,7 +734,7 @@ flowchart TD
 
 **诊断契约：** 需求 ID、决策原因、候选执行域、数据和策略版本、预约状态、Workflow UID 应可跨组件关联。拒绝原因与资源不足、队首公平等待或数据不可用必须区分。
 
-### 5.6 跨组件接口与 Scheduler Framework 契约（T6）
+### 5.6 跨组件接口与 Scheduler Framework 契约
 
 本节将 IR-01～IR-05 的逻辑设计映射到真实的系统责任边界。所谓“接口”，是目标协议的输入、输出、状态权威及异常语义，不要求新增特定控制器或采用特定部署形态。**NPU Scheduler 只调度 Runner Pod；Workflow Pod 的绑定由其实际 schedulerName 指向的 Scheduler 执行**。外部系统不参与协议时，不能从本子系统的局部判断推导全链路资源保证。
 
@@ -771,7 +771,7 @@ flowchart TD
 
 | 扩展点 | 目标职责 | 不可承担的职责 |
 |---|---|---|
-| **QueueSort** | 仅在相应 Scheduler Profile 内提供一个合法的队列比较器，维持可比任务的稳定次序/外部公平许可的局部映射 | 不假定多个 Scheduler 的队列天然同序；不能同时启用多个 QueueSort 实现 |
+| **QueueSort** | 对同一 Scheduler 进程只配置一个合法队列比较器；多 Profile 必须采用一致的队列排序行为，局部映射稳定公平顺序 | 不假定独立 Scheduler 进程的队列天然同序；不能同时启用多个 QueueSort 实现 |
 | **PreEnqueue（可选）** | 根据可信且已可得的准入/策略结果阻止明显不可进入活动队列的 Runner | 不依赖它完成长期阻塞任务的唯一唤醒；不可把不可信旧缓存变成硬拒绝 |
 | **PreFilter** | 规范化 Runner 需求、准备 Workflow CandidatePlan、读取同版本授权与 Fairness 判定，输出本轮 CycleState | 不能在此直接修改持久预约，亦不应在 Runner CPU 节点上判断 Workflow NPU 是否被物理绑定 |
 | **Filter** | 过滤**Runner Pod 自己**不符合 Kubernetes 节点/Pod 约束的节点；校验本轮所选资源域的 Runner 可达/交互限制 | 不把将来 Workflow 的 NPU CandidatePlan 节点硬套成 Runner 的运行节点；不把 Filter 成功等于实际 NPU 分配 |
@@ -782,7 +782,7 @@ flowchart TD
 | **PreBind / Bind / PostBind** | 绑定前检查该 reservationID/generation 仍有效、所选 Runner Node 合法且受保护公平承诺未失效；由合法 Bind 路径绑定 Runner；绑定后关联通知与恢复对账 | 不要求成功 CAS 之后整个域版本永远不变；不把 PostBind 当作唯一可靠交接依据；成功 Bind Runner 不保证 Workflow Bind |
 | **EnqueueExtension / 重新入队** | 将本插件关注的 Pod/Node 变化映射为重试提示，并为外部状态变化定义有界、可靠的重评估触发链 | 不假设所有任意 CRD 更新都会自动触发 Framework 的队列提示；不得只依赖一次事件 |
 
-**原生阶段顺序**：调度周期与绑定周期可能重叠；对外状态变化后，CycleState 快照可能变旧，因此 Reserve 必须对当前域级版本执行原子比较，绑定前则检查**已成功取得的预约本身仍有效**，不能因别的任务合法提交导致域版本变更就无故丢弃有效预约。Pod 调度周期失败应映射为 Framework 可识别的不可调度/错误类别：永久非法规格和权限问题在相关授权/需求改变前不可恢复，临时容量与公平等待属于可重评估不可调度，内部读取/状态异常必须显式区别并限制重试风暴。**合法资源不足与系统内部错误不能混成同一个 Status**。不启用会对运行中的任务执行抢占的路径，PostFilter 的救济不得绕过非抢占原则。
+**原生阶段顺序**：同一 Scheduler 的调度周期串行执行，绑定周期可并发，因此不同调度上下文可能在绑定期间竞争；对外状态变化后，CycleState 快照可能变旧，因此 Reserve 必须对当前域级版本执行原子比较，绑定前则检查**已成功取得的预约本身仍有效**，不能因别的任务合法提交导致域版本变更就无故丢弃有效预约。Pod 调度周期失败应映射为 Framework 可识别的不可调度/错误类别：永久非法规格和权限问题在相关授权/需求改变前不可恢复，临时容量与公平等待属于可重评估不可调度，内部读取/状态异常必须显式区别并限制重试风暴。**合法资源不足与系统内部错误不能混成同一个 Status**。不启用会对运行中的任务执行抢占的路径，PostFilter 的救济不得绕过非抢占原则。
 
 **重要映射规则**：NPU CandidatePlan 是后续 Workflow 的放置计划；Runner Node 是 kube-scheduler 正在选择的节点。两者是**不同对象**。若产品需要二者同域或同节点，必须把这个关联作为显式运行时/数据访问约束写入 WorkflowShape，不能靠复用 Filter(NodeInfo) 的参数产生该保证。
 
@@ -813,7 +813,7 @@ sequenceDiagram
 
 **决策权**：本地 Scheduler + Liqo 只决定是否可以把工作负载提交到**已授权的远端资源域**；成员集群 Scheduler 才有权选择真实 NPU Node。Liqo virtual Node 的聚合容量，不自动等于成员集群中存在单台满足需求的物理机器。
 
-**一致性要求**：Offloading 授权与虚拟资源映射应使用同一有效策略版本；远端物理 Node 能否被实际分配必须由可信成员事实或参与的下游协议确认。远端集群失联、Offloading 撤销、映射冲突时将该域标记为不可验证并触发重评估，不从“虚拟节点仍存在”推断远端容量仍可用。若只拿到聚合可见性，输出 ESTIMATED 时也必须明确缺少物理可行性证明；不能把这种未知状态写成满足第 4.3 节的 Feasible。
+**一致性要求**：Offloading 授权与虚拟资源映射应使用同一有效策略版本；远端物理 Node 能否被实际分配必须由可信成员事实或参与的下游协议确认。远端集群失联、Offloading 撤销、映射冲突时将该域标记为不可验证并触发重评估，不从“虚拟节点仍存在”推断远端容量仍可用。若只拿到聚合可见性、无法证明满足完整 WorkflowShape，应返回 REMOTE_TOPOLOGY_UNKNOWN / DATA_UNAVAILABLE，并等待成员集群可信拓扑证据；**不得给出 ESTIMATED 准入，更不能给出 COORDINATED 保证**。ESTIMATED 也要求存在符合第 4.3 节的完整 CandidatePlan。
 
 #### 5.6.5 Volcano Queue 与 Workflow Scheduler 协同
 
@@ -828,7 +828,7 @@ sequenceDiagram
 | Workflow Pod/PodGroup | 由真正执行端判定 Gang、Node 选择和作业生命周期 | Runner 预约不等于 Volcano PodGroup 已满足组调度要求 |
 | 协调保证 | 下游必须接入同一 AccountingDomain 授权、提交、交接、撤销及版本协议 | 没有该协议只能 ESTIMATED；只读取 Queue CR 不能升级 COORDINATED |
 
-**策略冲突规则**：如果下游 Volcano Queue 会主动回收/抢占其他运行任务以兑现其策略，不能将其与本子系统的非抢占保护承诺视为一致；必须在边界上禁止该行为或把该资源域排除于“非抢占强保证”作用域。不得通过修改 Volcano 本身的实际调度决定来代替本子系统的公平和容量仲裁。
+**策略冲突规则**：该目标架构的受管理资源域**不得启用**会驱逐正在运行的 CI 任务的默认抢占、Volcano preempt 或 reclaim 路径；当下游无法按此约束关闭抢占/回收时，不能将其纳入非抢占调度承诺作用域。Volcano deserved 的共享资源可被 reclaim 的官方语义不能与“已运行任务绝不抢占”的目标同时无条件保证。不得通过修改 Volcano 本身的实际调度决定来代替本子系统的公平和容量仲裁。
 
 #### 5.6.6 统一错误、重试和重评估协议
 
@@ -1026,17 +1026,17 @@ sequenceDiagram
 | ReevaluationLatency | 已接收权威资源或策略变化后，相关可执行队首再次获得判定的时间 | 不计入外部尚未传达事件的时间 |
 | DecisionWork / CASConflictRate | 决策访问的 Node、Queue、预约索引数量及 CAS 冲突比率 | 衡量是否随全局 Pod/Queue 规模线性退化 |
 
-**统计窗口：固定连续 5 分钟。** 每个有效窗口使用 P50/P95/P99、吞吐与样本量，正常竞争和外部故障分开统计；没有样本不能认定达标。诊断使用低基数资源域/任务类型维度，DemandID、Runner UID 不作为高基数时序标签（T10 细化）。
+**统计窗口：固定连续 5 分钟。** 每个有效窗口使用 P50/P95/P99、吞吐与样本量，正常竞争和外部故障分开统计；没有样本不能认定达标。诊断使用低基数资源域/任务类型维度，DemandID、Runner UID 不作为高基数时序标签（见 6.4）。
 
 #### 6.2.2 规划容量包络和性能预算
 
-选择 **S1** 作为目标设计基准负载，不代表现网统计值：N（物理 Node）=256、P（相关 Pod）=20,000、R（有效预约）=2,000、Q（待决需求）=5,000、C（资源域）=32。为避免单对象无限膨胀，每个 AccountingDomain 规划不超过 **32 个节点及 256 个活动预约索引**；跨分区需求仍须满足 T4 原子性要求。
+选择 **S1** 作为目标设计基准负载，不代表现网统计值：N（物理 Node）=256、P（相关 Pod）=20,000、R（有效预约）=2,000、Q（待决需求）=5,000、C（资源域）=32。为避免单对象无限膨胀，每个 AccountingDomain 规划不超过 **32 个节点及 256 个活动预约索引**；跨分区需求仍须满足 5.2.1、5.2.4 的原子性约束。
 
 | 预算 | S1 正常依赖条件下的设计目标 | 边界 |
 |---|---|---|
 | PB-01 计算延迟 | PolicyDecisionLatency P95 ≤100 ms，P99 ≤250 ms | 含有界候选搜索；排除 Kubernetes API 时延 |
 | PB-02 预约写入 | 单次 ReservationCommitLatency P99 ≤500 ms | API 正常可用；429 与限流须另分类 |
-| PB-03 准入延迟 | AdmissionOverhead P99 ≤1 s；单次尝试最多**两次立即 CAS 提交** | 超出退回队列，不阻塞 Scheduler 无限重试 |
+| PB-03 准入延迟 | **首次无冲突** AdmissionOverhead P99 ≤1 s；单次调度尝试最多两次立即 CAS | CAS 冲突重试单独计量；不能由 PB-02 的两次各 500 ms 上限推导整体仍在 1 s 内；超预算返回队列 |
 | PB-04 决策吞吐 | ≥10 次准入决策/s/调度实例 | 输入供给与 API 服务能力匹配，非持续单域写热点 |
 | PB-05 重新评估 | ReevaluationLatency P99 ≤5 s | 资源/策略变化事件已经到达子系统、相关队首具备重评估条件 |
 | PB-06 复杂度 | 正常单次在线调度**零次全量 Pod List、零次全局等待队列扫描** | 初始化和故障恢复独立于在线热路径 |
@@ -1061,9 +1061,9 @@ sequenceDiagram
 
 单节点规划可直接判断有无有效 Node。多节点拓扑组合可能非多项式可解：**搜索超预算不是永久不可执行的证明**。无法得到肯定或否定证明时，返回 FEASIBILITY_BUDGET_EXCEEDED，保留等待和后续更充分评估机会，不返回 INFEASIBLE 或伪造可行 CandidatePlan。
 
-#### 6.2.4 有界资源域与并发扩展（对 T4 的补充约束）
+#### 6.2.4 有界资源域与并发扩展
 
-T4 所定义的单一 AccountingDomain CAS 是正确性的根基，但如果每个域包含无界活动预约，会导致对象大小、事件广播、CAS 竞争和 API 写延迟随着 R 增加。**必须同时限制单域规模与物理容量边界。**
+第 5.2 节定义的域级 AccountingDomain CAS 保证逻辑预约的一致性；如果每个域包含无界活动预约，会导致对象大小、事件广播、CAS 竞争和 API 写延迟随 R 增加。**必须同时限制单域规模与物理容量边界。**
 
 1. **物理不重叠分区**：按真实 NPU Node/资源身份及拓扑约束划分 AccountingDomain。一个物理设备不能被两个独立 CAS 域重复承诺；虚拟 Node 映射必须指向同一事实权威。
 2. **有界账本**：每个原子域容量按 S1 的 32 节点/256 活动预约上限约束；已关闭的历史记录独立保留审计事实，不进入热路径活动索引。必须保留足够的代际/去重信息以拒绝迟到重复 Commit，不因关闭归档导致同一旧任务再次取得承诺。
@@ -1115,7 +1115,7 @@ T4 所定义的单一 AccountingDomain CAS 是正确性的根基，但如果每�
 |---|---|---|
 | TC-P01 | S1，Node/Pod/Queue 持续变化 | PB-01：决策计算 P95/P99 ≤100/250 ms |
 | TC-P02 | S1，两实例对同域并发提交 | PB-02：一次 CAS P99 ≤500 ms；冲突者不重复承诺 |
-| TC-P03 | S1，正常 API 与非热点负载 | PB-03/04：准入 P99 ≤1 s、持续 ≥10 次决策/s/实例 |
+| TC-P03 | S1，正常 API、无 CAS 冲突与非热点负载 | PB-03/04：首次准入 P99 ≤1 s、持续 ≥10 次决策/s/实例；冲突路径另计 |
 | TC-P04 | 队首等待 NPU 释放，事件已到达 | PB-05：重评估 P99 ≤5 s |
 | TC-P05 | Pod 从 1,000 增至 20,000 | 不随 P 增加执行每次全量 Pod 计量 |
 | TC-P06 | Queue 从 100 增至 5,000 | 局部队首判定不按全局 Q 遍历 |
@@ -1395,6 +1395,13 @@ PB-01～PB-07 的决策耗时和 RA-01～RA-06 的可靠性事件以**5 分钟�
 **共 104 个目标架构场景**，并非声称代码测试通过。每个场景必须可追踪到输入条件、规则/状态、责任组件和预期结论；无法推导清楚的场景属于待整改的设计问题。
 
 ## 8 技术规范参考
+
+### 8.1 设计适用条件
+
+本设计只保证目标架构定义的需求校验、可执行性判定、资源域公平、逻辑预约和跨阶段交接**契约**。若下游未采用共同的资源仲裁、配额与撤销协议，则只能声明 ESTIMATED，不能宣称物理 NPU 强预留。多节点跨独立 AccountingDomain 的整体强预约需要额外原子协议，未定义之前不得以多个局部 HELD 代替整体成功。
+
+**非目标**：不设计 ARC Listener 接单机制、不代替成员集群的真实 NPU Node 调度、不定义运行时沙箱；不陈述代码完成度、部署计划、落地步骤或性能实测。章节中的性能与可靠性数值仅是目标设计预算，104 个 TC 为设计可判定场景，不代表执行测试已经通过。
+
 
 - [Kubernetes Scheduling Framework](https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/)：Scheduler 扩展点、调度/绑定周期、QueueSort、Reserve/Unreserve。
 - [Kubernetes Running Multiple Schedulers](https://kubernetes.io/docs/concepts/scheduling-eviction/running-multiple-schedulers/)：多调度器间的节点和资源竞争边界。
