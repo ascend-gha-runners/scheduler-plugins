@@ -1237,11 +1237,91 @@ D2 只适用于**下游尚不共享协议、但授权与可行性事实仍可独
 
 场景是**架构可推导的验收规则**；不描述真实故障注入或上线状态。与 SR-04/05/11/12、ADR-05/07/08/09/12 及 QA-04/05 追踪一致。
 
-### 6.4 可服务性
+### 6.4 可服务性与跨组件诊断（QA-07）
 
-最小诊断关联链：DemandID → DecisionID → CandidatePlan → FairnessReason → ReservationID → Runner UID → Workflow UID/Node。
+#### 6.4.1 事件与关联身份
 
-建议的指标族为：按原因分类的等待需求数、可行性拒绝数、预约冲突数、交接超时数、孤儿预约数、资源事实新鲜度、调度决策耗时、策略变更重评估时延和公平队首等待时间。指标只描述调度问题，不替代设备计算利用率监控。
+诊断要回答：Runner 为什么等待、由哪个组件决定、等待发生在哪个资源域、是否取得预约、后续 Workflow 是否真正获得 NPU。只归因本子系统及**直接依赖的可信事实**；缺少外部信号时明确标为 UNKNOWN。
+
+| 阶段 | 事实来源 | 必需事件与字段 |
+|---|---|---|
+| Demand 校验 | 可信 ARC 需求/Validator | DEMAND_RECEIVED、DEMAND_VALIDATED/REJECTED；DemandID、Runner UID、JobAttempt、policyVersion |
+| CandidatePlan | 资源视图/Feasibility | CANDIDATE_EVALUATED；domainID、snapshotVersion、reasonCode、guaranteeLevel |
+| 公平决策 | FairnessPolicy | FAIRNESS_WAIT/GRANTED；arrivalSequence、PolicyEpoch、protectionVersion |
+| 预约仲裁 | ReservationCoordinator | RESERVATION_HELD/REVOKING/UNCERTAIN/CLOSED；reservationID、generation、writerEpoch、evidenceVersion |
+| Runner 绑定 | Kubernetes Scheduler/Pod | RUNNER_BOUND；cluster/namespace/Runner UID、绑定版本 |
+| Workflow 分配 | 实际 Workflow Scheduler/Pod | WORKFLOW_SEEN、ALLOCATION_CONFIRMED；Workflow UID、Node、Requests、分配证据版本 |
+| 交接完成 | Reconciler | HANDOFF_COMPLETED；reservationID、已交接节点资源向量 |
+
+所有事件都应带 sourceComponent、schemaVersion、decisionID、eventTime、observedTime 和版本。状态收敛以权威版本与合法状态机为准，不仅以时间戳排序。可信链为 JobAttempt → DemandID → Runner UID → DecisionID → ReservationID → Workflow UID/Node；**名称相似或时间接近不是身份证明**。
+
+#### 6.4.2 等待及资源效能口径
+
+| 指标 | 定义 | 责任边界 |
+|---|---|---|
+| RunnerQueueWait | Runner 进入 NPU Scheduler 排队到绑定成功的时间 | 不含 ARC Listener 接单前时间 |
+| NPUAdmissionWait | 有效 Demand 进入准入等待至成功或终止 | 可拆为容量、公平、预约冲突、依赖异常 |
+| FairnessBlockedTime | FAIRNESS_WAIT 为主要原因的区间之和 | 与同一时刻的容量等待不能双重加总 |
+| CapacityBlockedTime | 物理容量/拓扑/Queue 不足的等待区间 | 永久 INFEASIBLE 不作为正常等待 |
+| HandoffPendingTime | Runner 绑定到实际 Workflow 分配确认或结束 | 外部无可信阶段信息则 UNKNOWN |
+| LogicalReservationCardHours | 有效未交接逻辑预约数量乘持续时间 | 不是实际设备进程运行卡时 |
+| AllocatedNPUCardHours | 由可信 Pod/设备分配事实核算的卡时 | 不是 AI Core 计算利用率 |
+| ProcessActiveNPUCardHours | NPU 上有进程运行的卡时，须由设备/进程监控直接提供 | 本调度器不从 Pod Requests 或预约推断 |
+
+每个等待时间区间有唯一的**主原因**。Runner/Workflow 阶段可按时间拆分，但交叠区间不得简单累加。外部 CI Provider 或 Workflow Scheduler 未提供阶段证据时，仅报告本系统可观察范围内的时间与覆盖率，不能推断 GitHub Job 端到端等待。
+
+#### 6.4.3 原因码与证据门槛
+
+| 原因族 | 示例码 | 诊断输出 |
+|---|---|---|
+| DEMAND/SECURITY | DEMAND_UNAVAILABLE、INVALID_DEMAND、UNAUTHORIZED、WORKFLOW_SPEC_MISMATCH | 需求来源与认证策略版本 |
+| CAPACITY | INFEASIBLE、INSUFFICIENT_CAPACITY、FEASIBILITY_BUDGET_EXCEEDED | 可行性结论、候选域、事实新鲜度 |
+| FAIRNESS | FAIRNESS_WAIT、FAIRNESS_STATE_UNAVAILABLE | PolicyEpoch、保护版本、可重评估条件 |
+| RESERVATION | RESERVATION_CONFLICT、RESERVATION_HANDOFF_MISMATCH、RESERVATION_RECOVERY_REQUIRED | reservationID、generation、状态与权威版本 |
+| DEPENDENCY | QUEUE_STATE_UNAVAILABLE、REMOTE_DOMAIN_UNAVAILABLE、DOWNSTREAM_UNCOORDINATED | 责任组件、是否具备直接证据 |
+| UNKNOWN | EVIDENCE_MISSING、EVENT_GAP、EXTERNAL_STAGE_UNKNOWN | 缺失的信号、覆盖率、下一步可核对来源 |
+
+**最低诊断输出**：阶段、原因码、责任组件、起止时间/持续时间、数据和策略版本、关联 ID、保证级别、能否重试和重评估触发；不可信或不存在的原因必须 UNKNOWN。跨租户诊断只显示自身作业必要信息，不显示其他租户的 UID、队列额度和预约细节。
+
+#### 6.4.4 指标、保留与失效
+
+PB-01～PB-07 的决策耗时和 RA-01～RA-06 的可靠性事件以**5 分钟固定统计窗口**给出 P50/P95/P99、样本量和依赖异常分类。公平队首年龄、等待原因族、CAS 冲突、UNCERTAIN、交接超时、事件覆盖率均需可观察。
+
+- 指标标签只使用低基数资源类别、域类别、状态和原因族；DemandID/JobAttempt/Pod UID 在受控日志和 Trace 关联，不进入高基数时序标签。
+- 授权、预约状态转换和释放证据属于可信审计事件，不因性能 Trace 的采样而丢失其**权威记录**。异步事件缺口须通过版本化对账恢复，并显式标示 EVENT_GAP。
+- Metrics/Trace 后端失效不阻断准入；但缺少证据时不得伪造完整性、声称下游已完成交接或把等待归责于某个外部组件。
+- 一项诊断覆盖率的分母是本系统接收到的相关 Demand；外部 Job 信息缺失时不纳入“已完整观察”计数。
+
+#### 6.4.5 不变量与设计场景
+
+**INV-O01**：每个等待/拒绝决策有唯一主原因和证据版本，区分永久不可能、资源不足、公平等待与依赖异常。
+
+**INV-O02**：跨阶段关联只使用可信 UID、DemandID、JobAttempt 和交接证据。
+
+**INV-O03**：逻辑预约卡时、实际分配卡时及进程活跃卡时分别计量，不相互替代。
+
+**INV-O04**：Provider 或下游独立 Scheduler 信号缺失时报告 UNKNOWN 及覆盖率，不臆测内部队列原因。
+
+**INV-O05**：普通租户只获得自己作业的必要诊断；高基数标识不进入时序标签。
+
+**INV-O06**：采样 Trace 与审计权威分离；事件缺口可通过版本化对账识别，不能用缺失事件推断资源已释放。
+
+| TC | 设计场景 | 可判定结论 |
+|---|---|---|
+| TC-O01 | Runner 被 Queue 配额阻止，物理 NPU 仍空闲 | 记录 QUEUE_QUOTA_EXCEEDED，不报资源不可执行 |
+| TC-O02 | 受保护队首阻止后继 Backfill | 记录 FAIRNESS_WAIT 与保护版本，不泄露别人身份 |
+| TC-O03 | Workflow 被独立 Scheduler 排队且无其内部信号 | 下游原因 UNKNOWN，不猜测 Volcano 内部状态 |
+| TC-O04 | Workflow 分配可见但交接事件缺失 | 以可信分配证据对账，保留 EVENT_GAP |
+| TC-O05 | 两 Namespace 有同名 Runner | 不合并不同 UID/DemandID |
+| TC-O06 | 逻辑预约 8 卡、设备真实分配 8 卡尚未完成交接 | 分开计量，不宣称实际消耗 16 卡 |
+| TC-O07 | Metrics 后端不可用 | 不改变授权/预约正确性，显式反映诊断缺口 |
+| TC-O08 | API 429 造成决策等待 | 记录 API 依赖原因，不误报 NPU 容量不足 |
+| TC-O09 | GitHub 接单时间不可获取 | 不虚构 Job 总排队时间，仍能计算 RunnerQueueWait |
+| TC-O10 | 大量 Workflow 缺少 UID 关联 | 关联覆盖率下降，不凭名称补全 |
+| TC-O11 | PR/Nightly 分时窗口发生切换 | 诊断关联 PolicyEpoch 与等待原因 |
+| TC-O12 | 预约超时但分配事实未知 | 状态为 UNCERTAIN，不能输出已释放的结论 |
+
+上述均为目标设计判据，不是运行监控报表或测试执行记录。
 
 ### 6.5 关键失效模式与架构响应
 
