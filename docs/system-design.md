@@ -920,12 +920,96 @@ sequenceDiagram
 
 ## 6 DFX 架构设计
 
-### 6.1 正确性与安全性
+### 6.1 正确性、安全性与租户隔离（QA-01、QA-06）
 
-- 所有可行性决策以第 4 章的 CandidatePlan、不变量和资源权威为基础。
-- 未授权的需求、Queue 或远端资源不得进入候选集；不可信 Pod 元数据不得自动升级资源授权。
-- 跨租户的公平和资源可用性必须由稳定租户身份划分，而不是允许用户修改标签影响他人的资源池。
-- 候选和预约状态出现矛盾时选择可追踪的等待与恢复，不能依靠一次 Score 成功隐藏异常。
+**威胁目标**：本子系统允许来自不同开源项目及 PR 的不可信作业竞争共享 NPU，但不允许它们自行决定租户身份、Queue 权限、作业优先级或可用远端资源范围。安全性仅覆盖**调度控制面与资源授权**：不以本设计承诺工作负载运行时的进程、文件系统或设备隔离，也不展开沙箱方案。所有强保证要求被分配端遵守相同的授权与预约协议。
+
+#### 6.1.1 信任边界与攻击面
+
+| 边界 | 不可信输入 | 可信责任方 | 设计约束 |
+|---|---|---|---|
+| GitHub Job/PR → ARC | PR 内容、workflow 参数、任意用户传入标签/环境变量 | 平台已配置的 ARC Runner 模板和作业来源策略 | 不从 PR 自声明中直接授予高优先级或更多 NPU |
+| ARC → Runner Pod | labels、annotations、nodeSelector、schedulerName、NPU 需求字段 | 具备认证身份的 ARC 控制器及 Kubernetes Admission Policy | 关键字段必须校验来源和授权；普通 Namespace 用户不能篡改已认证需求 |
+| Runner → Workflow Pod | 实际 Requests、拓扑、Queue、PodGroup、Workflow UID | 可信 hooks/工作负载适配器和最终调度器 | 消费者实际规格不得超出关联 Demand 的授权与保留范围 |
+| Liqo virtual Node / Offloading | 远端映射、Node 名称、聚合容量、namespace 选择器 | Liqo 权威策略 + 成员集群的物理资源事实 | 虚拟容量只是一种视图，不代表租户被授权或拥有设备 |
+| Volcano Queue | Queue annotation/名称、资源额度与使用量 | 平台 Queue 归属策略 + Volcano Queue 权威 | 不能通过更改 annotation 冒用别人的 Queue |
+| Scheduler → 预约权威 | reservationID、writerEpoch、generation、domainID、节点向量 | 具备最小写权限的 Coordinator/有效调度实例 | 所有写入经授权、CAS 与代际保护；不能由普通租户创建硬承诺 |
+| 诊断与可观测性 | 错误文本、业务 ID、候选域/其他租户信息 | 受控事件与指标出口 | 租户只能看到自身作业的必要原因；不暴露他人的 Pod 名称、卡量与身份 |
+
+**身份策略**：tenantID、jobClass、Queue 身份、allowedDomains 和资源规格上限必须来自经认证的配置/策略事实。Pod label/annotation 可作为传输载体，但不是授权事实本身。任务来源、Runner UID、Workflow UID、Namespace 与真实资源请求相互核对；未认证或不匹配时返回 UNAUTHORIZED / WORKFLOW_SPEC_MISMATCH，禁止默认放行。
+
+#### 6.1.2 权限模型和最小 RBAC 能力
+
+| 组件主体 | 允许的资源动作（架构最小集合） | 禁止与隔离要求 |
+|---|---|---|
+| 需求校验/候选规划 | 读取授权范围内必要的 Pods、Nodes、Liqo Offloading、Queue、预约视图 | 不修改租户 Pod Spec、Secret；不获得用于绕过授权的 Queue 写权限 |
+| Scheduler Framework 主体 | 按 Kubernetes Scheduler 需要读取 Pods/Nodes 并执行合法 Pod Binding/必要状态记录 | 不以 cluster-admin 为常态；跨 namespace 读取仅用于被授予的调度视图 |
+| 预约 Coordinator | 对限定域的 AccountingDomain/Reservation 对象执行必要的 get/list/watch/create/update/patch；执行受版本检查的变更 | 普通 Runner、Workflow ServiceAccount 无权直接写账本或修改 writerEpoch |
+| Fairness Policy | 读取 Queue/租户策略，写入受域版本保护的 arrivalSequence、PolicyEpoch 和保护状态 | 不允许用户通过 CR 字段直接抬高自己的历史顺序、租户权重或优先级 |
+| Workflow 关联适配器 | 写入经过授权的自身关联引用与交接证明 | 无权更改别人的 DemandID、reservationID、物理容量或保护版本 |
+| 诊断与监控 | 发布必要的聚合指标和按授权分发的 Job 事件 | 不读取/输出 Token、Secret、完整原始 Job 环境变量或跨租户敏感数据 |
+
+**RBAC 边界**：Kubernetes 原生 Scheduler 需哪些权限由其自身 Profile/绑定机制决定；这里规定额外插件与预约状态访问的最小权限，不以“所有组件均可全局读写”作为简化前提。由于标准 RBAC 不能单靠 ResourceName 对所有 create/list 场景实现细粒度域隔离，跨域写入还必须由**准入校验、租户身份与域权威逻辑**强制约束；不能以 RBAC 已配置就推断业务级授权闭环。
+
+#### 6.1.3 防篡改、重放和混淆身份
+
+1. **不可变可信关联**：初始受信任需求与任务/Runner identity 一起生成；任何后续规格变更须产生明确新版本与再准入。允许用户变更的普通标签不会覆盖权威需求字段。
+2. **请求级检查**：在 Demand Validation、域级 Commit、Workflow ConfirmHandoff 三处重新验证身份及必要授权；只在入口查一次不够，尤其要防止权限撤销、过期 PolicyEpoch 后旧预约继续新增强承诺。
+3. **防重放**：对 DemandID+JobAttempt+generation 做幂等；writerEpoch、evidenceVersion 防止旧实例或旧 Workflow 证据覆盖新决定；过期消息不能创建新的逻辑容量。
+4. **节点与型号防混淆**：物理资源身份由可信 Node/设备事实提供；tenant 自定义 Node 标签、Liqo 镜像名和自由文本型号不能形成独立容量。
+5. **Queue/优先级防提升**：nightly/PR 分类、Queue 权重和资源域授权仅由可信调度策略映射产生。来源不可靠时按授权规则拒绝或进入有证据的等待状态，不默认授予高优先级。
+6. **秘密管理**：控制面调用 Kubernetes API 使用运行主体可撤销的身份/凭据；不在共享 Pod label/annotation、公开事件或指标里携带 bearer token、云平台访问凭据。令牌轮换和失效不能允许旧主体继续变更预约状态。
+
+#### 6.1.4 跨租户的公平与容量安全
+
+- **租户作用域**：按受信任的 tenantID、Queue、Namespace 和 clusterID 关联公平统计、配额及预约。不同 Namespace 同名 Job 不得重用别人的 reservationID。
+- **资源共享条件**：多租户任务可以共享同一个物理 AccountingDomain；域账本保证所有合法预约受相同容量约束，但租户可见的诊断结果按授权过滤。
+- **资源配额**：硬额度的适用范围可能跨多个 AccountingDomain，必须由可共享的权威扣减；同域卡数充足不意味着该租户 Queue 仍有额度。
+- **权限撤销**：Queue、Offloading 或租户授权变化后，未提交的新请求立即按新策略阻止；已有 HELD/ALLOCATED 的撤销遵循 5.2 的可信交接与释放证据，不能以安全事件为借口提前重新承诺卡数。
+- **抗拒绝服务**：单租户大量非法需求在执行昂贵候选求解前接受身份校验与速率限制；处理预算按域、租户保持有界，避免高频 PR 请求饿死其他合法租户。
+
+#### 6.1.5 安全失败语义
+
+| 威胁/异常 | 目标响应 | 禁止的行为 |
+|---|---|---|
+| 伪造 NPU count/Queue/jobClass | UNAUTHORIZED 或 INVALID_DEMAND；不进入公平候选 | 信任任意 Pod annotations |
+| 未经授权修改调度策略 | 保持最后可信的有效策略版本；对相关域暂停新强授权 | 由修改者自行抬高优先级或延长 Reserve Node 保护 |
+| 伪造 Workflow UID/交接凭据 | RESERVATION_HANDOFF_MISMATCH；进入受控对账 | 用名称相似/标签相同直接释放预约 |
+| 访问别人的 reservationID | 鉴权拒绝；诊断不披露对方容量和身份 | 返回跨租户详细资源记录 |
+| 过期 writerEpoch / 重放 generation | FENCED_OUT 或 RESERVATION_IDENTITY_CONFLICT | 允许旧主体撤销新实例合法承诺 |
+| 授权/Queue 权威暂时不可读取 | D3 DATA_UNAVAILABLE/QUEUE_STATE_UNAVAILABLE | fail-open 或以缓存推断新资源授权 |
+| 远端只提供不可验证聚合资源 | REMOTE_TOPOLOGY_UNKNOWN；无法建立强保证 | 把远端聚合卡数当作本域真实物理卡数 |
+
+#### 6.1.6 安全不变量与设计场景
+
+**INV-S01**：租户/Queue/JobClass 的有效授权只能来自受信任策略；自填 label/annotation 不得提高额度或优先级。
+
+**INV-S02**：Demand、Runner、Workflow 和预约的身份关系必须包含明确的 Cluster/Namespace/UID/JobAttempt 与代际；跨租户或重放事件不能占用、修改或释放其他人的承诺。
+
+**INV-S03**：预约权威和 Fairness 状态只能由受控的组件主体在授权范围内写入；RBAC、准入规则和业务授权同时生效。
+
+**INV-S04**：未验证的 Liqo 映射、Queue 额度或设备型号不能代替物理资源事实；在授权和配额关键事实失效时拒绝新增强承诺。
+
+**INV-S05**：普通租户诊断内容不披露别人的 UID、需求、Queue 用量、资源域详情或凭据；高基数业务关联只流经权限控制的追踪通道。
+
+**INV-S06**：来源不可信的任务可在授权范围内参与调度，但不能通过密集重试或自声明时间/优先级突破资源和公平保护；本章不承诺工作负载内核/设备隔离。
+
+| TC | 设计攻击/故障场景 | 应满足的架构约束 |
+|---|---|---|
+| TC-S01 | 非可信 PR 修改 Pod annotations 要求 16 卡、PR 最高优先级 | 规格超授权/类别不可信时拒绝，不改变其它租户的容量 |
+| TC-S02 | 普通租户修改 Pod 的 Queue annotation 指向高额度 Queue | Queue 权限按可信身份独立核验，拒绝冒用 |
+| TC-S03 | 两个 Namespace 复用相同 Pod 名称和 GitHub Job 名称 | 预约/Workflow 交接不跨 Namespace 混淆 |
+| TC-S04 | 旧 Job attempt 重放有效 reservationID | generation/JobAttempt 检查拒绝更新新预约 |
+| TC-S05 | 不可信 Workflow 伪造已分配 Node 和对应物理卡数 | 仅信任实际调度与 Kubernetes 分配证据，不解除原预约 |
+| TC-S06 | Liqo 远端虚拟节点重复映射本地卡 | 基于物理资源身份去重，禁止重复容量 |
+| TC-S07 | 普通 Runner SA 请求直接创建/更新 AccountingDomain | RBAC 与授权拒绝，不得写入承诺 |
+| TC-S08 | 用户合法但持续提交上千条无法执行的多节点请求 | 身份/额度预检查、限制规划预算，不拖垮其它租户 |
+| TC-S09 | 用户要求读取另一租户的等待原因与节点型号分布 | 只返回自身关联的必要结果，不泄漏全域明细 |
+| TC-S10 | 认证策略撤销 Queue 使用权限，旧 HELD 尚未完成 Workflow 交接 | 新授权停止；旧资源安全撤销，不提前重新承诺 |
+| TC-S11 | Workflow 交接凭据超过有效期或 writerEpoch 已切换 | 拒绝旧证据，不提升 COORDINATED |
+| TC-S12 | 控制面日志和指标包含 OAuth Token/Secret | 设计禁止敏感值入事件/指标，控制面只记录可关联标识 |
+
+这些是安全性**设计验收场景**，不涉及对实际不可信代码的执行或沙箱方案。
 
 ### 6.2 性能与容量（QA-03）
 
@@ -1177,18 +1261,18 @@ D2 只适用于**下游尚不共享协议、但授权与可行性事实仍可独
 
 | 需求 | 主要设计章节 | 架构决策 | 质量属性 | 验收判据 |
 |---|---|---|---|---|
-| SR-01 需求校验 | 4.1、5.1 | ADR-02、ADR-10 | QA-01、QA-06 | 非法/越权需求不进入候选 |
+| SR-01 需求校验 | 4.1、5.1、6.1 | ADR-02、ADR-10 | QA-01、QA-06 | INV-S01～S04；TC-S01～S04、S07～S08：身份、规格、Queue 及权限不受用户标签篡改 |
 | SR-02 资源计量 | 4.2、5.1 | ADR-04、ADR-05 | QA-01、QA-04 | 资源型号和映射去重，预约不重复核算 |
 | SR-03 可执行性 | 4.3～4.8、5.1、6.2.3、6.2.8 | ADR-03、ADR-07、ADR-12 | QA-01、QA-03 | 单节点 4+4/8 和跨域 8+10/12 不误放行；TC-P09 超预算不误报永久不可执行 |
 | SR-04 预约 | 3.4、5.2.1～5.2.4、5.2.6～5.2.8、6.2.4、6.3 | ADR-05、ADR-09、ADR-12 | QA-01、QA-03、QA-04、QA-05 | INV-R01～R06、INV-A01～A06；TC-R01～R12、TC-A01～A14 |
 | SR-05 交接 | 3.4、5.2.2～5.2.3、5.2.5～5.2.8 | ADR-05、ADR-07 | QA-01、QA-04、QA-07 | 可信 UID/分配证据交接及保守计量；TC-R06～R07、R10～R11 |
 | SR-06 Liqo 授权 | 4.2、4.5、5.3、5.6.4、5.6.8 | ADR-02、ADR-04 | QA-01、QA-06 | INV-I03；TC-I06～I07：无授权/真实物理拓扑不可验证时不得强准入 |
 | SR-07 池选择 | 4.3～4.7、5.3、5.6.1、5.6.4 | ADR-03、ADR-04、ADR-07 | QA-01 | INV-I02～I03；Runner 位置不替代成员集群 Workflow 物理放置 |
-| SR-08 Queue 约束 | 4.5、5.3、5.6.5～5.6.8 | ADR-04、ADR-10 | QA-01、QA-06 | INV-I04；TC-I08～I09、I14：配额作用域、策略插件及非抢占契约清晰 |
+| SR-08 Queue 约束 | 4.5、5.3、5.6.5～5.6.8、6.1 | ADR-04、ADR-10 | QA-01、QA-06 | INV-I04、INV-S01～S04；TC-I08～I09、I14、TC-S02、S10：租户 Queue 不可被冒用 |
 | SR-09 Filter/Score | 4.4、5.3、5.6.2～5.6.3、5.6.8 | ADR-01、ADR-03 | QA-01、QA-03 | INV-I01～I02；TC-I01～I05：Runner Node 与 Workflow NPU 计划分别约束 |
 | SR-10 公平 | 5.4.1～5.4.7、3.4、6.2.3～6.2.8 | ADR-06、ADR-05、ADR-12 | QA-02、QA-03、QA-04、QA-07 | INV-F01～F06、INV-P01～P06；TC-F01～F14、TC-P01～P14 |
 | SR-11 事件 | 5.5、5.6.6、5.6.8、6.2.5、6.2.8、6.3 | ADR-08、ADR-11、ADR-12 | QA-03、QA-04、QA-05 | INV-A06；TC-I13、TC-P04、TC-P11、TC-A07、TC-A11：事件丢失/重复仍能对账重评估 |
-| SR-12 运行支撑 | 5.5、5.6.1～5.6.8、6.3～6.4 | ADR-07～12 | QA-04～07 | RA-01～RA-06；INV-A01～A06；TC-A01～A14：隔离、切换、降级与恢复状态可追踪 |
+| SR-12 运行支撑 | 5.5、5.6.1～5.6.8、6.1、6.3～6.4 | ADR-07～12 | QA-04～07 | RA-01～RA-06；INV-A01～A06、INV-S01～S06；TC-A01～A14、TC-S01～S12 |
 
 ## 8 技术规范参考
 
