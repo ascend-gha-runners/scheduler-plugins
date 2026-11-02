@@ -778,10 +778,10 @@ flowchart TD
 | **Reserve** | 对已获公平许可及有效 Workflow CandidatePlan 执行 AccountingDomain 的域级 CAS，生成 HELD 逻辑预约；附域版本、策略与保护版本 | Framework 的本轮 Reserve 不是对另一个 Scheduler 的物理设备保留 |
 | **Unreserve** | 为当前调度轮的失败请求发出幂等撤销意图；由权威账本/对账确认最终释放 | 不以回调发生就推定 Workflow 已终止；不依赖回调必达或进程不崩溃 |
 | **Permit（按需）** | 对存在明确下游协议的 Runner 可声明有界等待/允许策略；仅在 Framework 支持的语义内使用 | 不通过 Permit 假装别的 Scheduler 已占有 NPU，也不无限阻塞绑定周期 |
-| **PreBind / Bind / PostBind** | 绑定前确认有效预约及公平版本；由合法 Bind 路径绑定 Runner；绑定后关联通知与恢复对账 | PostBind 不承载唯一可靠交接依据；成功 Bind Runner 不保证 Workflow Pod Bind |
+| **PreBind / Bind / PostBind** | 绑定前检查该 reservationID/generation 仍有效、所选 Runner Node 合法且受保护公平承诺未失效；由合法 Bind 路径绑定 Runner；绑定后关联通知与恢复对账 | 不要求成功 CAS 之后整个域版本永远不变；不把 PostBind 当作唯一可靠交接依据；成功 Bind Runner 不保证 Workflow Bind |
 | **EnqueueExtension / 重新入队** | 将本插件关注的 Pod/Node 变化映射为重试提示，并为外部状态变化定义有界、可靠的重评估触发链 | 不假设所有任意 CRD 更新都会自动触发 Framework 的队列提示；不得只依赖一次事件 |
 
-**原生阶段顺序**：调度周期与绑定周期可能重叠；对外状态变化后，CycleState 快照可能变旧，因此 Reserve 和绑定前检查必须使用可核验的域级版本。Pod 调度周期失败返回 Framework 可识别的不可调度/错误类别，保留重试条件；**合法资源不足与系统内部错误不能混成同一个 Status**。不启用会对运行中的任务执行抢占的路径，PostFilter 的救济不得绕过非抢占原则。
+**原生阶段顺序**：调度周期与绑定周期可能重叠；对外状态变化后，CycleState 快照可能变旧，因此 Reserve 必须对当前域级版本执行原子比较，绑定前则检查**已成功取得的预约本身仍有效**，不能因别的任务合法提交导致域版本变更就无故丢弃有效预约。Pod 调度周期失败应映射为 Framework 可识别的不可调度/错误类别：永久非法规格和权限问题在相关授权/需求改变前不可恢复，临时容量与公平等待属于可重评估不可调度，内部读取/状态异常必须显式区别并限制重试风暴。**合法资源不足与系统内部错误不能混成同一个 Status**。不启用会对运行中的任务执行抢占的路径，PostFilter 的救济不得绕过非抢占原则。
 
 **重要映射规则**：NPU CandidatePlan 是后续 Workflow 的放置计划；Runner Node 是 kube-scheduler 正在选择的节点。两者是**不同对象**。若产品需要二者同域或同节点，必须把这个关联作为显式运行时/数据访问约束写入 WorkflowShape，不能靠复用 Filter(NodeInfo) 的参数产生该保证。
 
@@ -803,8 +803,9 @@ sequenceDiagram
   else 仅聚合容量或映射不可信
     NS-->>API: 不能声明具体物理可执行或强保证
   end
-  NS->>VR: 表达获选远端执行域（不指定物理卡）
-  VR->>MC: Offloading后的实际Workflow Pod
+  NS->>API: 表达已授权的远端候选域约束（非物理卡绑定）
+  API->>VR: VirtualNode对应Offloading选择
+  VR->>MC: Offloading后的Workflow Pod由远端调度
   MC->>MC: 按物理Node、拓扑、设备进行最终放置
   MC-->>API: 真实分配证据供交接
 ~~~
@@ -907,7 +908,7 @@ sequenceDiagram
 | TC-I06 | Liqo virtual Node 显示 16 卡，但真实远端仅有两台 8 卡物理节点，单节点 Workflow 要 12 卡 | 不以虚拟聚合量宣称 12 卡单节点可执行 |
 | TC-I07 | Liqo Offloading 撤销而 Pod/Node 缓存尚未刷新 | 停止受影响域的新承诺并重核授权；不继续沿用旧候选 |
 | TC-I08 | Volcano Queue capability 仅余 2 卡而资源域物理还剩 8 卡，任务需 4 卡 | 因 Queue 额度不足等待，不借用未授权的 Queue 份额 |
-| TC-I09 | Volcano Queue 有 desired/deserved 与 guarantee，但其策略插件不一致或版本未知 | QUEUE_STATE_UNAVAILABLE；不能把多个语义都视为硬上限或设备锁 |
+| TC-I09 | Volcano Queue 有 deserved 与 guarantee，但其策略插件不一致或版本未知 | QUEUE_STATE_UNAVAILABLE；不能把不同份额语义都视为硬上限或设备锁 |
 | TC-I10 | 公平保护在 Reserve 与 PreBind 之间发生变化 | 绑定前复核保护/预约版本；协议不再有效时受控撤销并重排 |
 | TC-I11 | 账本故障，但 Node 空闲且 Score 值很高 | 停止 COORDINATED，不能由 Score 绕过权威预约 |
 | TC-I12 | Workflow Scheduler 拒绝或不支持接入协议 | 不升级为 COORDINATED；如路径允许预测性放行须明确残余风险 |
@@ -982,5 +983,6 @@ sequenceDiagram
 
 - [Kubernetes Scheduling Framework](https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/)：Scheduler 扩展点、调度/绑定周期、QueueSort、Reserve/Unreserve。
 - [Kubernetes Running Multiple Schedulers](https://kubernetes.io/docs/concepts/scheduling-eviction/running-multiple-schedulers/)：多调度器间的节点和资源竞争边界。
-- [Liqo 官方项目](https://github.com/liqotech/liqo)：虚拟节点与 Namespace Offloading 相关协议。
-- [Volcano 官方文档](https://volcano.sh/docs/)：Queue、配额与工作负载调度语义。
+- [GitHub ARC Runner Scale Sets](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets)：ARC Kubernetes Container Mode 与 runner-container-hooks 创建作业 Pod 的责任边界。
+- [Liqo Offloading](https://docs.liqo.io/en/latest/features/offloading.html)：Namespace Offloading、远端虚拟节点及 Pod 选择策略。
+- [Volcano Queue Resource Management](https://volcano.sh/docs/keyfeatures/queueresourcemanagement/)：capability、deserved、guarantee 的不同资源份额语义及 Queue 调度责任。
