@@ -101,166 +101,153 @@ flowchart LR
 - [x] 建立 BG → IR → SR 与 QA 基线；尚未选型的实现机制留待 T2～T10，不伪装为既定技术决策。
 - [ ] T2～T12：替换第 3～7 章旧 AS-IS 口径，完成目标机制、DFX、追踪及独立验收。
 
-## 3 功能域总体方案（实际架构）
+## 3 功能域总体方案（目标架构）
 
-### 3.1 总体设计原则、设计模式及约束（由源码反推）
+本章定义目标架构的组件职责、数据权威和关键技术决策；第 4～5 章的算法、接口与生命周期细化须服从本章。**这里的“应”表示目标设计义务，不表示历史代码已经实现。**
 
-1. **复用 Scheduler Framework**：使用 `app.NewSchedulerCommand(app.WithPlugin(arcsync.Name, arcsync.New))` 注册插件；主配置启用 PreFilter/Filter/Score/Reserve，没有独立队列或独立 Scheduler 核心重写。
-2. **标签表达未来需求**：Runner 真实容器可不声明 NPU Request；通过 `required-npu-count`、资源域、型号三个标签参与准入。没有校验其与未来 Workflow 申请的一致性。
-3. **Node/Pod 快照估算**：本地物理占用按照容器 Requests 与 `npu-count` 标签最大值统计；虚拟节点按带标签的 Runner 数量估算；结果依赖 Scheduler 缓存时效。
-4. **进程内软预约**：使用受 Mutex 保护的 `map[string]reservation`，只保证当前调度器进程内部的观测与核算；没有 API 持久化及跨多个 Scheduler 实例的共享状态。
-5. **有条件访问外围 CRD**：通过 Kubernetes dynamic informer 获取 Liqo 和 Volcano；缺 CRD / 读取失败可能使附加规则缺席。没有单独的外部服务调用层。
-6. **严格 FIFO**：以 Pod `CreationTimestamp`、UID 为排序依据，通过 `PreFilter` 拒绝较新的 Pod；没有实现 QueueSort 自定义堆排序，也没有回填。
-7. **最低限度放置约束**：插件自定义检查 cordon、NoSchedule/NoExecute taints、`nodeSelector`、required nodeAffinity；其它 Kubernetes 默认 Filter 继续参与最终调度。
+### 3.1 架构原则与设计约束
 
-### 3.2 技术方案说明和选型的事实边界
+| 原则 | 设计约束 | 对应质量属性 |
+|---|---|---|
+| **AP-01 单一职责、复用基础设施** | 扩展 Kubernetes Scheduling Framework，不复制 kube-scheduler 的通用排队、节点绑定和设备资源分配；Liqo、Volcano 分别负责各自的远端资源暴露和 Queue 管理。 | QA-03、QA-04 |
+| **AP-02 可行性先于评分** | 需求只有在**同一个被授权的最终执行域**满足型号、数量、节点/多机拓扑及放置约束时，才可判为可执行；不同域不能任意累加。评分不得扩大可行候选集。 | QA-01 |
+| **AP-03 事实与预测分离** | Runner 的未来 NPU 需求、Scheduler Snapshot、逻辑预约和 Workflow 实际分配属于不同事实域；任何事实域都不可单独推导跨 Scheduler 的物理资源保证。 | QA-01、QA-04 |
+| **AP-04 信任边界前置** | 由可信 ARC 配置和 Kubernetes 准入策略约束需求声明；普通 Pod 标签、Queue annotation、Liqo 选择器不能凭自身产生资源授权。 | QA-06 |
+| **AP-05 状态有唯一权威与恢复路径** | 准入记录和逻辑预约使用具备持久化、并发版本检查与对账能力的唯一权威账本；Scheduler CycleState/本地缓存只作派生状态。 | QA-01、QA-04、QA-05 |
+| **AP-06 公平与吞吐协同** | 定义同一比较域的公平顺序、PR/Nightly 分时优先级、Reserve Node 与安全 Backfill；**不抢占**运行中的 CI 工作负载，Backfill 不能破坏已发出的资源预留承诺。 | QA-02、QA-03 |
+| **AP-07 故障语义明确** | 授权信息或核心一致性状态不可信时不得放行；非关键观测失败不应阻断调度。每种依赖异常都须给出等待、重试、降级或拒绝语义。 | QA-04、QA-05、QA-06 |
+| **AP-08 可解释、可追踪** | 任一拒绝/等待/候选选择都能关联需求 ID、策略版本、资源域、决定组件及原因；指标与原因码可跨 Runner/Workflow 生命周期关联。 | QA-07 |
 
-| 设计关注点 | 当前实际采用 | 未采用或无法证实的替代方案 | 取证位置 |
-|---|---|---|---|
-| Scheduler 接入 | kube-scheduler Scheduling Framework + 插件扩展点 | 完全独立调度器、Webhook | `cmd/scheduler/main.go` |
-| 需求传入 | Pod labels | 自定义 Demand CRD、外部 REST | `arcsync.go` 常量与 PreFilter |
-| NPU 准入 | 集群总剩余 NPU 求和 | 单节点/单完整 Workflow 可行性检查 | `arcsync.go:419-446` |
-| 资源计量 | Scheduler Snapshot + 进程内预约 | 实时设备 API、持久化配额账本 | `arcsync.go:278-377` |
-| 远端管理 | Liqo virtual Node + NamespaceOffloading informer | 远端成员集群直连调度 | `liqo.go`、`applyLiqoComparison` |
-| Queue 能力 | Volcano Queue CRD 的 `spec.capability` 读取 | 自实现跨租户 Queue Controller | `volcano.go` |
-| 公平性 | `PreFilter` 内同池严格 FIFO 检查 | Backfill、DRF、权重调度、队列抢占 | `isOldestPendingRunner` |
-| 高可用 | 单副本、关闭选主 | 多副本 Leader Election、跨实例预约账本 | D-BASE deployment/configmap |
+**非目标和边界**：不以本子系统的逻辑预约代替 Kubernetes 设备资源分配；不把 ARC Listener 接单状态当作调度器可控制的状态；不靠扫描所有 Pod 的无状态 FIFO 检查声称“无饥饿”。当无法实现完整跨 Scheduler 协同，应在接口中明确降低保证级别，而非隐式宣称已有资源锁。
 
-未提供历史架构评审材料来证明**为何**选定上述路线，因此本节只陈述实际技术实现及其取舍结果，不虚构选型会议结论。
-
-### 3.3 系统元素与周边系统关系
+### 3.2 目标逻辑架构与组件关系
 
 ```mermaid
 flowchart TB
-  GH[GitHub Actions] --> ARC[ARC Listener / Runner Scale Set]
-  ARC --> POD[Runner Pod: npu-scheduler]
-  WP[Workflow Pod: 可能为 volcano 等 scheduler] --> API[(Kubernetes API Server)]
-  POD --> API
-  NPU[Device Plugin / Node Allocatable] --> API
-  LIQO[Liqo: Virtual Node + NamespaceOffloading] --> API
-  VQ[Volcano: Queue 对象] --> API
-  subgraph SCH[npu-scheduler 进程]
-    F[Scheduling Framework]
-    PF[ARCSync PreFilter]
-    FL[ARCSync Filter]
-    SC[ARCSync Score]
-    RS[ARCSync Reserve / Unreserve]
-    PB[ARCSync PostBind 函数：部署调用需确认]
-    INF[Pod Lister + Dynamic Informer]
-    MEM[(inFlightReservations map)]
-    F --> PF --> FL --> SC --> RS
-    PF <--> INF
-    PF <--> MEM
-    RS <--> MEM
-    PB -.-> MEM
+  subgraph EXT["外部系统与权威事实"]
+    ARC["ARC Listener / Controller\n创建 Runner，不受调度器接单控制"]
+    KAPI[("Kubernetes API\nPod/Node/Policy/预约账本")]
+    DEVICE["Device Plugin / Node 状态\n资源型号、Allocatable"]
+    LIQO["Liqo\n远端可见性及 Offloading 授权"]
+    VOLC["Volcano Queue\n配额与 Workflow 调度"]
+    WF["Workflow Scheduler\n最终放置和设备分配"]
   end
-  API <--> F
-  API --> INF
-  ARGO[Argo CD / GitOps] --> SCH
-```
-
-**实现职责边界**：`cmd/scheduler/main.go` 负责插件注册；`pkg/arcsync/arcsync.go` 负责主调度、FIFO、预约；`pkg/arcsync/liqo.go` 负责资源域、虚拟节点选择解析；`pkg/arcsync/volcano.go` 负责 Queue 额度读取；D-BASE 的 manifests 负责 Deployment、ConfigMap、ServiceAccount/RBAC。
-
-#### 3.3.1 两项目标在 ARC Container Mode 中的生效位置
-
-```mermaid
-sequenceDiagram
-  participant GH as GitHub Actions
-  participant ARC as ARC Listener/Controller
-  participant API as Kubernetes API
-  participant SCH as npu-scheduler/ARCSync
-  participant RUN as Runner
-  participant WF as Workflow Pod Scheduler
-  GH->>ARC: 可供接收的 CI Job（本插件不负责接单）
-  ARC->>API: 创建带 NPU 需求标签的 Runner Pod
-  API->>SCH: 请求调度 Runner
-  SCH->>SCH: BG-01: PreFilter 估算未来 NPU 容量
-  alt NPU 余量估算不足
-    SCH-->>API: Unschedulable，Runner Pending
-  else NPU 容量预检通过
-    SCH->>SCH: BG-02: FIFO 检查更早的可比较 Runner
-    alt 存在更早的可比较 Runner
-      SCH-->>API: FIFO hold，Runner Pending
-    else 通过本插件和后续 Framework 调度检查
-      SCH->>SCH: Reserve 记录进程内软预约
-      SCH->>API: Bind Runner Pod
-      RUN->>WF: Container Mode 创建 Workflow Pod
-      Note over WF: Workflow 可能由其他 Scheduler 处理且仍会 Pending
-    end
+  subgraph SCH["NPU Scheduler 子系统（逻辑模块）"]
+    FW["Scheduler Framework\nPod 队列、调度周期、绑定"]
+    DMD["需求适配与授权校验\nDemand Validation"]
+    VIEW["资源事实视图\nResource Snapshot"]
+    FEAS["资源域可行性判定\nFeasibility & Candidate"]
+    FAIR["公平策略仲裁\nPriority / FIFO / Backfill"]
+    RSV["预约与交接协调\nReservation & Reconciliation"]
+    OBS["诊断与事件适配\nReason / Event / Metrics"]
   end
+  ARC -->|Runner Pod / 可信需求声明| KAPI
+  DEVICE --> KAPI
+  LIQO --> KAPI
+  VOLC --> KAPI
+  KAPI <--> FW
+  FW --> DMD --> FEAS
+  KAPI --> VIEW --> FEAS
+  FEAS --> FAIR --> RSV
+  RSV <-->|版本化预约状态| KAPI
+  RSV -.->|承诺/交接协议：需双方支持| WF
+  WF -->|实际 Workflow/Pod 状态| KAPI
+  DMD --> OBS
+  FEAS --> OBS
+  FAIR --> OBS
+  RSV --> OBS
+  OBS --> KAPI
 ```
 
-**控制边界**：ARCSync 在 **Runner Pod 调度阶段**执行，不会阻止 ARC Listener 领取 Job；插件通过的聚合 NPU 估算不是 Workflow 单节点可行性或硬件资源预留承诺。FIFO 在容量预检通过后执行，只降低同一比较范围内的插队风险；不能承诺全局公平、无饥饿或 GitHub UI 必然显示 Queued。
+**控制路径**：Pod 被 Scheduler Framework 选中 → 验证可信需求 → 构造与最终执行语义一致的候选资源域 → 公平策略决定是否轮到该需求 → 获取有版本约束的逻辑预约 → Framework 完成 Runner 绑定 → 与 Workflow 的真实占用交接/对账。任一步失败均返回可区分的原因与可重试语义。图中模块是**逻辑职责**，并不强制一模块对应一个进程或 CRD；T3～T6 确定具体职责如何落在 Framework 扩展点。
 
-### 3.4 领域对象模型与关系
+跨调度器的两类结果应严格区分：
 
-```mermaid
-classDiagram
-  class RunnerPod {
-    +UID
-    +Namespace
-    +CreationTimestamp
-    +Labels
-    +NodeSelector
-    +Spec.NodeName
-  }
-  class WorkflowPod {
-    +Name
-    +Namespace
-    +Containers[].Requests
-    +Labels
-  }
-  class NPURequirement {
-    +RequiredNPUCount int
-    +ResourceDomain string
-    +ResourceModel string
-  }
-  class NodeInfo {
-    +Node.Allocatable
-    +Node.Taints
-    +Node.Unschedulable
-    +Pods[]
-  }
-  class PreFilterState {
-    +requiredCount int64
-    +resourceName ResourceName
-    +nodeFreeNPU map
-  }
-  class Reservation {
-    +nodeName string
-    +count int64
-    +timestamp Time
-    +baseName string
-    +namespace string
-  }
-  class NamespaceOffloading {
-    +spec.clusterSelector NodeSelector
-  }
-  class VolcanoQueue {
-    +spec.capability ResourceList
-  }
-  RunnerPod --> NPURequirement
-  RunnerPod --> PreFilterState
-  PreFilterState --> NodeInfo
-  RunnerPod --> Reservation
-  WorkflowPod ..> Reservation: 通过 baseName 间接影响计数
-  NamespaceOffloading --> NodeInfo: 限制虚拟节点候选
-  VolcanoQueue --> PreFilterState: 约束本地资源
-```
+- **可执行性预测（ESTIMATED）**：有可靠资源事实可供准入判断，但另一 Scheduler 未确认会遵守逻辑预约；可放行符合策略的 Runner，**不得宣称 NPU 已被物理保留，也不得承诺 Workflow 必定立即启动**。
+- **受协同保障的准入（COORDINATED）**：仅当 Workflow 调度器/分配端支持同一资源域的预约校验、资源占用交接及撤销契约，才可声明该级别；不满足任何一个条件则退回 ESTIMATED 或 WAIT，不能自行升级。
 
-| 数据对象 | 实际存储与生命周期 | 来源与更新者 | 删除/销毁行为（现状） | 注意事项 |
-|---|---|---|---|---|
-| Runner Pod / Workflow Pod | Kubernetes Pod API 对象 | ARC / Workflow 创建；K8s API 保存 | Pod 自身遵循 Kubernetes 删除/GC，非插件销毁 | 插件只读取快照和元数据 |
-| Node / NodeInfo | Kubernetes API + Framework Snapshot | 集群控制平面、Scheduler 缓存 | 随 Node 对象及缓存生命周期 | NPU `Allocatable` 依赖外部设备资源上报 |
-| `preFilterState` | 单次调度 `CycleState` | `PreFilter` 写入 | 调度周期结束随状态结束 | `Clone` 返回同一指针，代码未实现深拷贝 |
-| `reservation` | 进程内 `inFlightReservations` map | `Reserve`/`Unreserve`/`PostBind` | 反向调用删除；UID 不在快照且超过 10s 删除；进程退出丢失 | **不是持久化记录**，不保存 Token |
-| `NamespaceOffloading` | 外部 CRD + informer 缓存 | Liqo | 按外部控制器与 API GC 管理 | 选择条件解析为 NodeSelectorTerms |
-| Volcano `Queue` | 外部 CRD + informer 缓存 | Volcano | 外部管理；插件无删除操作 | Queue 名称来自 **Pod annotation** |
-| 日志 | 容器 stdout / 集群日志后端（如配置） | klog | 插件未定义日志留存和销毁策略 | 记录 Pod、Node 名称，不在本进程保存凭据 |
+**技术依据**：[Kubernetes Scheduling Framework](https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/) 规定调度周期、绑定周期和 Reserve/Unreserve 语义；[运行多个 Scheduler](https://kubernetes.io/docs/concepts/scheduling-eviction/running-multiple-schedulers/) 明确独立 Scheduler 实例可能产生冲突，不能把进程内状态当作共享资源仲裁。
 
-本功能域**没有自行实现数据分级销毁操作或日志保留周期策略**，因此数据销毁规格限于现有 Kubernetes API GC、进程生命周期及外部日志系统；不得写成已实现的敏感数据销毁能力。
+### 3.3 组件职责、接口与权威边界
 
-### 3.5 源码模块和函数定位
+| 组件 | 负责的决定/输出 | 权威状态及来源 | 明确不负责 |
+|---|---|---|---|
+| **ARC Controller/Runner Scale Set（外部）** | 创建 Runner Pod、携带可信配置导出的资源声明 | ARC 的 Job/Runner 配置与 Kubernetes Pod | 本子系统的公平裁决、NPU 物理占用 |
+| **可信准入策略（Kubernetes 准入控制）** | 约束谁可写/修改需求标签、Queue 归属和目标 Scheduler；校验来源身份 | Namespace、ServiceAccount、授权策略 | 把用户自填标签视为合法授权 |
+| **Demand Validation（子系统）** | 生成规范化需求、验证数量/型号/身份/策略版本，输出错误原因 | Pod UID + 所属 Namespace/租户 + Job/attempt 标识（若提供）与受信任的模板/策略 | 修改 GitHub Job，推断未声明的未来资源需求 |
+| **Resource Snapshot（子系统）** | 汇集 Node/Pod 资源事实、约束与缓存版本/新鲜度 | Kubernetes API/调度快照；NPU Allocatable 来自设备插件 | 宣称观测到的 Requests 等于实时 AI Core 使用率 |
+| **Liqo（外部）** | 公开远端资源与 Offloading 授权、映射虚拟节点 | Liqo CR 与虚拟 Node 的授权状态；成员集群提供真实可用性 | 直接保证未来 Workflow 在远端一定获得物理设备 |
+| **Volcano（外部）** | 管理 Queue 配额与其自身 Scheduler 的实际工作负载调度 | Volcano Queue 及其实际占用/分配状态 | 让本插件仅靠读取 Queue CR 就自动获得强配额能力 |
+| **Feasibility & Candidate（子系统）** | 按资源域、型号、拓扑及授权条件求可执行候选；输出确定的准入原因 | 只读资源视图、可信需求、外部授权/配额版本 | 使用跨域的空闲数量之和替代完整可执行性 |
+| **Fairness Policy（子系统）** | 对同一比较域做优先级/FIFO/Reserve Node/Backfill 决定 | 稳定任务顺序、队列状态、策略版本与预留承诺 | 调整或抢占已运行 CI Job；改变 ARC Listener 的领取顺序 |
+| **Reservation & Reconciliation（子系统）** | 原子条件式申请/释放逻辑预约、恢复并对账 Runner/Workflow 关系 | Kubernetes API 中持久化、版本化的逻辑预约账本；本地缓存不是权威 | 在其他 Scheduler 不协同时承诺跨调度器的硬资源锁 |
+| **Scheduler Framework（外部平台）** | 执行 Queue/Filter/Reserve/Bind、常规 Node 约束与重试 | Kubernetes Scheduler 缓存及调度周期状态 | 代替本子系统决定未来 Workflow 的需求真伪 |
+| **Workflow Scheduler（外部）** | 负责实际 Workflow Pod 的放置与绑定；如接入协调协议则核验预约 | 最终 Pod.spec.nodeName、Requests 和设备分配事实 | 被 Runner 绑定成功所隐含保证 |
+| **Observability Adapter（子系统）** | 发布结构化拒绝原因、调度事件、关联 ID、指标 | 各决策模块的状态变更与 Kubernetes Event/metrics | 创建第二套资源权威账本 |
+
+**职责分界的不变量**：
+
+1. Runner 身份应使用 Pod UID（含 cluster/namespace 与关联的 Job attempt），不只使用名称去后缀；同名不同 namespace 不得互相抵消预约。
+2. 同一个最终执行资源域的候选应由**同一份授权和可行性规则**生成并供准入、Filter 和 Score 复用；允许评分不同，不允许评分扩大候选。
+3. 物理容量、可观测占用、逻辑预约和协调承诺必须分开表示；节点硬件状态只能由其实际负责的设备/调度系统给出。
+4. 预约写入必须支持版本冲突重试、幂等与失败回滚；进程重启或主从切换后不得仅凭“本地 map 为空”推断资源空闲。
+5. 外部 CR 不存在或失效时，不能悄悄绕过本应强制的授权/配额；应输出可诊断的等待/拒绝/降级结果。
+
+### 3.4 规范化数据与决策链
+
+| 逻辑数据 | 最小字段/语义 | 唯一权威 | 消费组件 |
+|---|---|---|---|
+| **NPU Demand** | cluster、namespace、Runner UID、Job/attempt 关联（可用时）、资源域/型号、数量、拓扑/放置要求、策略版本、身份来源 | 可信 Pod 声明与准入策略；当前调度周期生成不可变需求快照 | Demand、Feasibility、Fairness |
+| **ResourceDomain / Candidate** | 资源域标识、授权集合、资源型号、可放置节点或 Gang 拓扑、余量、快照版本、新鲜度 | Kubernetes Node/Pod 事实 + Liqo 授权及外部可行性反馈 | Feasibility、Fairness |
+| **QueuePolicy / FairnessOrder** | 作用域、租户、PR/Nightly 类别、分时策略版本、稳定排序键、预留边界 | 平台可信调度策略；可接入 Volcano Queue 但不复制其配额控制器 | Fairness |
+| **LogicalReservation** | 需求唯一 ID、资源域/型号/数量、owner、租约/代际、状态、版本、交接目标和有效期 | Kubernetes API 持久化预约账本；通过条件更新仲裁 | Reservation、Feasibility |
+| **WorkflowAllocation** | Workflow UID/namespace、实际 NPU Requests、最终 Node/拓扑、绑定/终态事件 | Workflow Scheduler + Kubernetes 真实 Pod 状态 | Reconciliation、Observability |
+| **DecisionEvidence** | 决策 ID、原因码、决策时的事实和策略版本、保证级别、关联资源域 | 子系统各模块写出；仅供诊断而非容量权威 | Observability |
+
+**统一决策顺序**：身份授权 → 需求合法性 → 资源事实有效性 → 最终执行域可行性 → 公平和优先级 → 逻辑预约写入 → Runner 绑定 → Workflow 实际分配交接。拒绝原因应分别表达“无授权”“不可执行”“资源不足”“公平等待”“状态不可用”和“下游未协调”，不能使用同一个“无节点”文案覆盖全部原因。
+
+**反例约束**：单节点申请 8 卡、两台机器各空闲 4 卡时，除非需求明确为可跨节点协同且下游支持该拓扑，否则应返回不可执行；本地 8 卡与远端 10 卡都不能满足单节点 12 卡时，也不得因为跨资源域求和为 18 卡而通过可执行性验证。无授权的 Liqo 远端节点不能成为默认回退候选。T3 将形式化这些条件与池选择算法。
+
+### 3.5 架构决策记录（ADR，目标方案）
+
+下列 ADR 是**本次目标设计提出的决策**，并非历史实现事实或已签署的选型会议结论。各条有明确选择、排除方案、取舍及后续细化任务；如后续任务证实不满足目标，须修改相应 ADR，而非静默引入替代机制。
+
+| ADR | 决策及理由 | 不选择的方案及权衡 | 详细设计 / QA |
+|---|---|---|---|
+| **ADR-01 复用 Scheduling Framework** | 用 Framework 插件实现 Runner 准入和调度约束，复用调度队列、节点约束和绑定机制。 | 不另造独立 Scheduler 内核；插件仍受扩展点顺序与 Scheduler Profile 配置约束。 | T6 / QA-03、QA-04 |
+| **ADR-02 需求必须经过可信校验** | 保留 Runner Pod 的声明入口，但数量、型号、来源、Queue 归属须按可信模板/授权策略验证，形成不可变需求快照。 | 不直接信任任意标签；引入准入校验及策略管理成本。 | T3、T9 / QA-01、QA-06 |
+| **ADR-03 以最终可行资源域准入** | 先筛选授权、拓扑和放置约束，再在域内评价可行性；需同一节点的请求不可跨节点相加。 | 不用“全部本地空闲 + 全部远端空闲”的纯聚合门禁；更保守但避免假阳性。 | T3 / QA-01 |
+| **ADR-04 资源事实各归其主** | 设备插件/Node、Workflow Scheduler、Liqo、Volcano 各提供其负责的事实；插件只做规范化组合与一致性检查。 | 不从虚拟节点标签推断成员集群强保证；接受缓存新鲜度和对账开销。 | T3、T6 / QA-01、QA-04 |
+| **ADR-05 预约采用持久化一致性账本** | 目标使用 Kubernetes API 持久化、版本化逻辑预约，支持资源域竞争时的条件更新及恢复对账；本地 CycleState 只作临时状态。 | 不以进程内 mutex/map 作全局权威；额外 API 读写、竞争和对象规模需 T4/T7 设计。具体 CRD/分片方案留给 T4。 | T4 / QA-01、QA-04、QA-05 |
+| **ADR-06 公平策略统一仲裁且不抢占** | 对同池排序、PR/Nightly 分时优先级、Reserve Node、保护性 Backfill 由 Fairness Policy 统一判定。 | 不把 PreFilter 中的“扫描旧 Pod”当作完整 FIFO；不因单一全局 QueueSort 假设获得跨池严格公平。预留可能降低短期吞吐。 | T5 / QA-02、QA-03 |
+| **ADR-07 跨 Scheduler 保证须有协议** | 逻辑预约先用于 Runner 预测性准入；只有 Workflow 调度端接受并执行相同预约/交接契约，才可提升为 COORDINATED 保证。 | 不把 Framework Reserve 或 Pod 绑定当作跨进程硬锁；未接入的 Volcano/其他调度器只能 ESTIMATED，须显式揭示剩余风险。 | T4、T6 / QA-01、QA-04 |
+| **ADR-08 关键依赖故障按安全性分级** | 授权、配额与预约权威不可验证时拒绝提升资源承诺并等待重试；非关键指标/日志失败不阻塞；远端不可用时仅按明确授权选择本地候选。 | 不无条件 fail-open，也不把日志故障升级成全系统停摆；需定义每种依赖的故障矩阵。 | T6、T8、T9 / QA-04～07 |
+| **ADR-09 单一有效写入者与高可用切换** | 实例允许故障转移，但同一资源域的预约更新必须受版本/代际保护，防止旧实例与新实例同时生效；新实例从权威账本恢复。 | 不使用多个无协调的独立调度实例竞争同一逻辑容量；选主与恢复引入控制面依赖。 | T4、T8 / QA-04、QA-05 |
+| **ADR-10 最小权限、租户隔离** | 用限定资源与必要动作的 RBAC 管理调度器；授权由可信策略强制，跨租户状态只可按策略访问。 | 不用 cluster-admin 作为常态权限；需要逐项梳理 Scheduler 与 CRD 的必需 verbs。 | T9 / QA-06 |
+| **ADR-11 以决策链作为可服务性契约** | 每次拒绝、预留、交接、回收带统一关联 ID、原因码及策略版本，支持 Runner→Workflow 跨系统诊断。 | 不依赖非结构化日志拼接或 Pod 名称猜测；增加指标/事件基数与保留策略设计。 | T10 / QA-07 |
+
+**需要遵循的现有机制约束**：
+
+- Kubernetes [Scheduling Framework](https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/)：`QueueSort` 在一个 Scheduler 内只允许一个有效实现；`Reserve` 为调度中的预留通知，`Unreserve` 必须幂等；独立的 Scheduler 并不共享内存账本。T5/T6 不得把这些扩展点虚构成分布式事务。
+- [Kubernetes 多 Scheduler 运行约束](https://kubernetes.io/docs/concepts/scheduling-eviction/running-multiple-schedulers/)：独立实例可能做出冲突的调度决定；对共享 NPU 资源使用不同 Scheduler，须有共同仲裁协议或明确仅为预测性准入。
+- [Liqo Namespace Offloading](https://github.com/liqotech/liqo/blob/master/docs/usage/namespace-offloading.md)：虚拟节点/Offloading 是可见性和策略入口，不能把 NamespaceOffloading 的存在直接推断为远端真实可执行。
+- [Volcano Queue Resource Management](https://volcano.sh/docs/keyfeatures/queueresourcemanagement/)：Queue 的 capability、deserved、guarantee 与真实调度控制须按 Volcano 的语义解释；读取 CR 不能代替其控制器执行配额。
+
+### 3.6 既有 DFX 分析（设计输入，待 T7～T11 更新）
+
+本节保留此前通过源码分析得到的风险样例与复杂度线索，供目标 DFX 设计复用。**不应把“尚无某能力的源码证据”作为目标架构排除该能力的理由。**具体目标性能阈值、故障域、恢复策略、告警与 FMEA 响应在 T7～T11 完整定稿。
+
+**共性 DFX（统一口径）**：安全性：Pod 元数据不能直接等同于可信物理资源凭证；需结合 namespace 隔离和 ServiceAccount 权限理解信任边界。性能：Snapshot/Pod Lister 遍历、候选筛选和预约互斥访问构成主要成本；静态复杂度不等同于实测延迟。可服务性：现有日志及 Kubernetes Events 可辅助定位拒绝，但尚无已证明的 Runner→Workflow 唯一关联、预约健康度或 CR 缓存同步告警。FMEA 不编造发生概率、检出率、恢复时间、S/O/D、RPN 或 SLA 数值；各 SR 仅陈述其特有失效和验证方法。
+
+**复杂度模型（静态推导，不是压测结果）**：令 `N` 为 Snapshot 节点数，`P` 为已观察 Pod 数，`R` 为内存预约数，`Q` 为同 namespace 需要参与 FIFO 筛选的 Pod 数。一次 `PreFilter` 至少涉及 Node/Pod 遍历、预约遍历、候选池筛选与 FIFO 取列表后筛选，核心成本可近似描述为 `O(N + P + R + Q)` 加上具体选择器匹配和缓存操作开销；`Q <= P_lister`，不能直接用这一式子推算毫秒级性能。实际复杂度还受到多个阶段重复迭代、node selector/affinity 条件数量、informer 缓存延迟及锁持有范围影响。原文没有可靠的调度时延、吞吐量、锁等待观测值。
+
+**可靠性边界（失败传播）**：Snapshot 读取失败会影响准入；外围 CRD/Queue 缺失或读取异常在部分路径上允许降级继续；进程退出丢失预约；Pod/Node 事件不代表 CR 变更立即触发重新排队。所有这些都是代码/配置层面的条件行为，而非生产故障率结论。
+
+**建议的独立设计验证矩阵**：资源正确性（4+4/8、CPU Runner 与 NPU Workflow）、并发一致性（同实例并发、重启/多实例）、公平性（旧大新小、selector 非对称）、外部约束（Liqo 空 selector/Queue 失效）、性能伸缩（逐级提高 `N/P/R` 记录 P50/P95、调度吞吐、锁等待）、故障可观测性（返回 Status 与 Events 可区分性）。本节只是说明验证设计，不代表已执行测试或新增实现。
+
+#### 3.6.1 历史源码定位索引（非目标模块分解依据）
+
+此索引用于 T3～T6 复用已有实现与测试入口，不作为限制未来组件和状态设计的证据。
 
 | 模块 | 主要符号 | 输入 | 输出/副作用 |
 |---|---|---|---|
@@ -272,6 +259,15 @@ classDiagram
 | 调度放置 | `Filter()`、`Score()` | CycleState、NodeInfo | `Status`、0～100 Score |
 | 预约 | `Reserve()`、`Unreserve()`、`PostBind()` | Pod、CycleState | 内存 map 增删 |
 | 事件 | `EventsToRegister()` | Framework | Pod / Node 事件声明 |
+
+### 3.7 T2 目标设计验收
+
+- [x] AP-01～AP-08 给出准入、公平、恢复与安全的约束及 QA 关联。
+- [x] 用逻辑架构图和职责表区分 ARC、Kubernetes、Liqo、Volcano、Workflow Scheduler 与本子系统模块。
+- [x] 确立 Node/Pod 资源、逻辑预约、Workflow 最终分配的权威归属，并区分 ESTIMATED 与 COORDINATED。
+- [x] ADR-01～ADR-11 记录选择、替代方案代价、下游设计任务及质量属性关联。
+- [x] 修正“3.6”被错放在 4.7 后的章节结构；保留历史 FMEA/复杂度分析及源码索引供后续任务引用。
+- [ ] T3～T6：给出可执行性算法、持久化预约格式、Backfill 安全算法及跨调度器接口的完整不变量与失败路径。
 
 ## 4 功能域规格变更与设计（本轮只描述现有规格）
 
@@ -429,16 +425,6 @@ TotalFree = \sum_{n\in EligibleLocal} (Allocatable_n - ObservedOccupied_n - InFl
 | `EventsToRegister` | Framework 事件订阅 | Pod Add/Update/Delete、Node Add/Update | 当前没有显式 Queue/NamespaceOffloading 变更入队事件；不能保证 CRD 修改立即重排 |
 
 **跨扩展点依赖**：`PreFilter` 的 `CycleState` 仅在通过自定义准入后写入；下游扩展点存在 state 缺失时的成功返回路径。因此不能将“扩展点返回 Success”等同于“资源已经被核验/预留”。该表描述已有 Go/Kubernetes 契约，REST/OpenAPI 不适用。
-
-### 3.6 跨功能域 DFX、性能、可靠性及验证边界
-
-**共性 DFX（统一口径）**：安全性：Pod 元数据不能直接等同于可信物理资源凭证；需结合 namespace 隔离和 ServiceAccount 权限理解信任边界。性能：Snapshot/Pod Lister 遍历、候选筛选和预约互斥访问构成主要成本；静态复杂度不等同于实测延迟。可服务性：现有日志及 Kubernetes Events 可辅助定位拒绝，但尚无已证明的 Runner→Workflow 唯一关联、预约健康度或 CR 缓存同步告警。FMEA 不编造发生概率、检出率、恢复时间、S/O/D、RPN 或 SLA 数值；各 SR 仅陈述其特有失效和验证方法。
-
-**复杂度模型（静态推导，不是压测结果）**：令 `N` 为 Snapshot 节点数，`P` 为已观察 Pod 数，`R` 为内存预约数，`Q` 为同 namespace 需要参与 FIFO 筛选的 Pod 数。一次 `PreFilter` 至少涉及 Node/Pod 遍历、预约遍历、候选池筛选与 FIFO 取列表后筛选，核心成本可近似描述为 `O(N + P + R + Q)` 加上具体选择器匹配和缓存操作开销；`Q <= P_lister`，不能直接用这一式子推算毫秒级性能。实际复杂度还受到多个阶段重复迭代、node selector/affinity 条件数量、informer 缓存延迟及锁持有范围影响。原文没有可靠的调度时延、吞吐量、锁等待观测值。
-
-**可靠性边界（失败传播）**：Snapshot 读取失败会影响准入；外围 CRD/Queue 缺失或读取异常在部分路径上允许降级继续；进程退出丢失预约；Pod/Node 事件不代表 CR 变更立即触发重新排队。所有这些都是代码/配置层面的条件行为，而非生产故障率结论。
-
-**建议的独立设计验证矩阵**：资源正确性（4+4/8、CPU Runner 与 NPU Workflow）、并发一致性（同实例并发、重启/多实例）、公平性（旧大新小、selector 非对称）、外部约束（Liqo 空 selector/Queue 失效）、性能伸缩（逐级提高 `N/P/R` 记录 P50/P95、调度吞吐、锁等待）、故障可观测性（返回 Status 与 Events 可区分性）。本节只是说明验证设计，不代表已执行测试或新增实现。
 
 ## 5 功能实现设计（以 IR 为功能单元，SR 为用例，AR 为原子实现）
 
