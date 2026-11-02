@@ -136,8 +136,9 @@ flowchart TB
 | CapacityView | allocatable、committed、eligibleFree、snapshotVersion、freshness | 可供准入的调度容量，不等同实时设备利用率 |
 | CandidatePlan | demandID、domainID、节点/拓扑绑定集合、可行性证据及版本 | 完整的未来 Workflow 放置方案 |
 | FairnessOrder | poolID、tenant、jobClass、arrivalOrder、priorityEpoch、reserveCommitment | 明确比较范围与分时策略 |
-| LogicalReservation | demandID、domainID、resources、owner、version、state、expiry、handoffID | 逻辑承诺与生命周期权威 |
-| AllocationEvidence | Workflow UID、实际 Requests、Node/拓扑、phase、关联 DemandID | 与预约核算的最终占用事实 |
+| LogicalReservation | reservationID、DemandID、domainID、nodeResourceVector、owner、generation、writerEpoch、state、leaseDeadline、workflowRef、evidenceVersion | 预约生命周期权威及跨阶段交接；见 5.2 |
+| AccountingDomain | domainID、physicalResourceIdentity、nodeCapacityVector、reservationIndex、version、writerEpoch | 同一物理容量的节点向量及预约原子仲裁域；见 5.2 | 
+| AllocationEvidence | Workflow UID、实际 Requests、Node/拓扑、分配确认版本、关联 DemandID | 用于预约交接的可信分配证据 |
 | DecisionEvidence | decisionID、reasonCode、policyVersion、snapshotVersion、guaranteeLevel | 解释准入、等待和拒绝原因 |
 
 ### 3.5 关键架构决策
@@ -179,7 +180,7 @@ flowchart TB
 
 1. **物理容量**：Node 对指定资源名公布的 Allocatable。它是 Kubernetes 的可调度资源上限，不是实时 AI Core 使用率。
 2. **已分配量**：按照 Kubernetes 资源请求与对应调度器已认可的分配事实计量。必须遵循 Kubernetes 对普通容器、InitContainer 等有效 Requests 的语义。
-3. **未兑现预约**：尚未被真实 Workflow 分配计量接管的逻辑承诺，按相同资源域扣减；已交接部分不得重复扣减。
+3. **未兑现预约**：尚未被可信 Workflow 分配证据确认交接的逻辑承诺，按相同资源域扣减；确认前若真实分配也可见可暂时保守双计，确认后必须归并。
 4. **可用量**：物理容量减已分配量和有效的未交接预约，并按 Node/Zone/Queue/授权/拓扑等约束收缩，负余量按不可用处理，不借其他节点正余量掩盖。
 
 按节点和资源型号定义：
@@ -311,7 +312,7 @@ ScoreDomain       ⊆ FilterCandidate
 
 **INV-C02：** 同一决策依据的资源事实和预约状态具有可核验版本；并发冲突不能沿用已失效的可行性结果。
 
-**INV-C03：** 计数不会因为相同 Pod 的物理占用、逻辑预约以及 Liqo 镜像视图而重复扣减，也不能因 Workflow 尚不可见而无依据地提前释放。
+**INV-C03：** 同一物理容量不得因 Liqo 重复映射而重复计入。Workflow 分配确认前不得提前解除逻辑承诺；未确认交接时允许暂时保守双计，确认后必须归并，禁止持续双计或少计（见 5.2.3、INV-R03）。
 
 **INV-C04：** 未授权或未知状态不能被“容量足够”“评分较高”或“远端可见”等非授权信号覆盖。
 
@@ -355,13 +356,202 @@ sequenceDiagram
 
 **接口契约：** 输入的资源数量和 WorkflowShape 不允许靠默认值掩盖格式错误；输出包含原因码、计划证据及版本，不暴露跨租户敏感资源详情。
 
-### 5.2 IR-02：逻辑预约与资源交接
+### 5.2 IR-02：逻辑预约与 Runner/Workflow 资源交接
 
-**SR-04 预约。** 预约以 DemandID 唯一标识，包含资源域、数量、有效期、所有者、版本和状态。申请、续约、撤销须幂等且具有竞争仲裁；绑定失败和资源释放不得使预约无限留存。实例切换应从权威状态恢复，不因本地缓存为空而重复放行。
+本功能单元覆盖 **SR-04 逻辑预约与回收**、**SR-05 Runner/Workflow 关联及计量交接**。目标是防止对同一资源重复作出逻辑承诺，并使预约在调度竞争、Runner 绑定失败、Workflow 迟到和 Scheduler 切换时可恢复。**逻辑预约不是设备锁**；只有参与相同仲裁和交接协议的下游 Scheduler 才受其约束（ADR-05、ADR-07、ADR-09）。
 
-**SR-05 交接。** Runner 与 Workflow 必须通过带 namespace、UID、Job attempt 的显式关联进行匹配。Workflow 实际分配被确认后，逻辑预约对应的额度由“未交接”转成“已分配”；确认前不得仅凭名称或定时推测完成交接。取消、Workflow 终止和孤儿预约应由对账机制处理。
+#### 5.2.1 预约权威与一致性范围
 
-**接口边界：** 预约权威只负责逻辑承诺；真实设备占用由实际 Workflow Scheduler 和 Kubernetes 分配事实决定。状态迁移、租约期限、版本冲突、双重分配与恢复的精细契约在本功能单元中必须满足 AP-05 与 INV-C02/C03。
+**单一权威：** 按不重叠的物理资源竞争域和资源型号建立 AccountingDomain；每个域具有持久化权威账本、可比较版本和有效写入者代际（writerEpoch）。同一域的账本包含全部受保护节点的可用资源向量及有效预约。不同虚拟节点若映射同一物理资源，必须受同一个权威仲裁，不得各自独立承诺该容量。
+
+**容量余量与预约记录必须在一次原子竞争检查中共同更新。** 仅为每个 DemandID 创建一条带版本的记录，不能阻止两个需求分别读到相同余量而双重承诺。目标选择**域级条件更新（CAS）**：在同一个版本化 AccountingDomain 对象内，检查整个 CandidatePlan 所涉及的节点向量，再整体扣减并记录预约，或整体失败。单一域内的多节点计划不可部分提交。跨域 Gang 若无法置于同一仲裁域，须定义跨域原子协议；在此之前不声称支持跨域原子预约。
+
+| 权威事实 | 责任组件 | 约束 |
+|---|---|---|
+| 物理 NPU 资源与实际 Workflow 分配 | Kubernetes Node/Pod、最终 Workflow Scheduler 和设备插件 | 来源于真实分配，不能由本地预约表伪造 |
+| AccountingDomain 及逻辑预约 | Reservation Coordinator 管理的持久化 Kubernetes API 状态 | 受保护资源的所有承诺者竞争相同域版本；同域只允许有效代际写入 |
+| Runner/Workflow 身份关联 | 可信 ARC 需求身份及 Workflow 唯一 UID | 禁止从 Pod 名称相似性推断同一任务 |
+| Scheduler CycleState / Informer | 前述状态的派生视图 | 不承担跨实例权威；缓存失效时不得用旧余量继续强预约 |
+
+**边界：** 域级 CAS 可约束参与协议的逻辑承诺，不能自行阻止**未参与协议**的 Volcano/其他 Scheduler 或设备分配者使用同一物理资源。这类路径只能维持 ESTIMATED，不得宣称 COORDINATED。
+
+#### 5.2.2 领域数据模型
+
+| 对象 | 必需字段 | 不变量 |
+|---|---|---|
+| ReservationKey | clusterID、namespace、Runner UID、可信 Job/attempt ID、DemandID | 重试身份稳定；不同任务尝试不可复用有效预约 |
+| AccountingDomain | domainID、physicalResourceIdentity、resourceName、nodeCapacityVector、reservationIndex、version、writerEpoch、policyVersion | 同一容量由唯一仲裁边界负责，Node/型号维度独立核算 |
+| LogicalReservation | reservationID、DemandID、tenant、Queue、CandidatePlanID、nodeResourceVector、guaranteeLevel、state、generation、writerEpoch、leaseDeadline、owner、workflowRef、evidenceVersion | 同一 Demand/generation 至多一个有效预约；转移须检查代际及合法状态 |
+| HandoffEvidence | reservationID、Workflow namespace/UID、实际 Requests、Node/物理资源映射、分配事实版本 | 必须对应受保护资源域；Runner 已绑定、Workflow 名称相同均不足以证明实际占用 |
+| ReconcileDecision | reservationID、observedState、evidenceVersion、action、reasonCode | 幂等且可复核；不确定时保留容量，不直接释放 |
+
+预约使用每节点每型号向量 h(d,n,r)，而非只有域内总卡数；这样多节点形态不会被一个聚合数掩盖。单个 Demand 不得同时在本地和远端维护两个有效承诺；跨域迁移须先按可信证据撤销旧承诺，再申请新域，除非另有原子的迁移协议。
+
+#### 5.2.3 预约状态机
+
+| 状态 | 进入条件 | 计量原则 | 允许的后续状态 |
+|---|---|---|---|
+| **PLANNED** | 可行计划已生成，尚未取得有效预约 | 不扣减 | HELD / WAIT / REJECT |
+| **HELD** | 域级原子仲裁成功 | 全额计入未交接预约 | HANDOFF_PENDING / REVOKING |
+| **HANDOFF_PENDING** | Runner 绑定或交接意图可见，实际 Workflow 分配尚未可信确认 | 保留预约 | ALLOCATED / REVOKING / UNCERTAIN |
+| **ALLOCATED** | 已核对 Workflow UID、Node、请求和真实分配版本 | 相应逻辑扣减转交真实占用计量 | REVOKING / UNCERTAIN / CLOSED |
+| **REVOKING** | 取消、绑定失败、租约到期或要求撤销 | 未证实释放的部分继续保留 | CLOSED / UNCERTAIN |
+| **UNCERTAIN** | 分配证据冲突、远端失联或恢复时状态未知 | 对应容量保守隔离 | HANDOFF_PENDING / ALLOCATED / REVOKING / CLOSED（均需新证据） |
+| **CLOSED** | 已确认未分配，或最终释放得到可信证明 | 不再计入逻辑预约 | 终态；再次申请须新 generation |
+
+PLANNED、WAIT、REJECT 可是调度决策状态，不要求进入持久账本。其他状态是权威逻辑状态。**租约超时不等于资源已释放**：到期触发 REVOKING 与下游核验，证据不完整时进入 UNCERTAIN。
+
+~~~mermaid
+stateDiagram-v2
+  [*] --> PLANNED
+  PLANNED --> HELD: 域级CAS成功
+  PLANNED --> [*]: WAIT / REJECT
+  HELD --> HANDOFF_PENDING: Runner绑定 / 交接开始
+  HELD --> REVOKING: 绑定失败 / 取消 / 到期
+  HANDOFF_PENDING --> ALLOCATED: 确认Workflow实际分配
+  HANDOFF_PENDING --> REVOKING: 明确撤销
+  HANDOFF_PENDING --> UNCERTAIN: 状态或证据不明
+  ALLOCATED --> REVOKING: Workflow退出
+  ALLOCATED --> UNCERTAIN: 分配状态不可信
+  REVOKING --> CLOSED: 确认释放
+  REVOKING --> UNCERTAIN: 释放无法确认
+  UNCERTAIN --> HANDOFF_PENDING: 恢复交接证据
+  UNCERTAIN --> ALLOCATED: 恢复分配证据
+  UNCERTAIN --> REVOKING: 恢复撤销证据
+  UNCERTAIN --> CLOSED: 证明无占用
+  CLOSED --> [*]
+~~~
+
+**跨阶段计量：** 相同资源只能归属于可承诺余量、未交接逻辑预约或已确认的真实分配。交接证据未完成核对，但真实 Pod 分配已出现在资源视图时，**允许临时保守双计**；不得为消除双计而先删除预约。完成验证后，在一致状态变更中解除对应逻辑扣减，同时保留真实分配计量。部分多节点 Workflow 的未交接资源向量仍须保留。
+
+#### 5.2.4 并发仲裁与正确性不变量
+
+~~~text
+CommittedFree[d,n,r] =
+    Allocatable[d,n,r]
+  - ConfirmedAllocated[d,n,r]
+  - EffectiveLogicalHold[d,n,r]
+
+Commit(D, P, v, epoch):
+  REQUIRE Authorized(D) AND FeasibleCandidate(P)
+  REQUIRE AccountingDomain.version == v
+  REQUIRE AccountingDomain.writerEpoch == epoch
+  REQUIRE all required node/resource coordinates:
+          CommittedFree[d,n,r] >= P.request[n,r]
+  ATOMIC: record reservation + deduct nodeResourceVector
+  OTHERWISE: reject conflict and recompute from fresh facts
+~~~
+
+提交契约：
+
+1. 读取 CandidatePlan、可信的分配事实版本与同一 AccountingDomain 账本版本。
+2. 按 DemandID/generation 查重。同一请求幂等返回相同 reservationID；身份相同但 tenant、规格或计划冲突时拒绝覆盖。
+3. 原子验证授权、策略版本、writerEpoch、每节点容量及完整计划；将节点向量和预约记录在同一个 CAS 中提交。
+4. CAS 冲突者刷新事实、重新评估可行性与公平许可；禁止重用旧的“容量足够”判断。
+5. 多节点计划整体成功或整体失败；跨不同独立资源域不能把多个局部成功冒充整体承诺。
+6. 后续转移按 reservationID、generation、writerEpoch、可信证据版本做幂等条件更新。旧实例不可覆盖新代际状态。
+
+**INV-R01 唯一性：** 相同物理容量只存在一个有效逻辑仲裁域；同一 Demand/generation 不存在两个有效预约。
+
+**INV-R02 容量安全：** 所有相关分配参与者均遵循共享仲裁协议时，每个 Node/资源型号的未交接逻辑承诺与已确认实际分配总量不得超过可承诺容量；未知分配不得当作零。
+
+**INV-R03 无交接空窗：** 实际分配确认之前不得提前解除逻辑扣减；允许临时保守双计，禁止少计。
+
+**INV-R04 幂等与隔离：** 重复/乱序事件不得重复扣减、提前释放或影响其他 Namespace、租户、Job attempt、generation。
+
+**INV-R05 代际保护：** 新 writerEpoch 生效后，旧实例不允许写入或撤销新代际承诺；进程内缓存不产生强承诺。
+
+**INV-R06 安全回收：** 只有可信未分配、撤销或资源释放证据才能使承诺进入 CLOSED。失联和超时只触发核对、隔离及恢复。
+
+以上保证均受参与者范围约束；下游独立 Scheduler 不使用共享预约时，只能承诺预测性准入，不得由 INV-R02 推导跨 Scheduler 的物理排他性。
+
+#### 5.2.5 Runner 到 Workflow 的交接时序
+
+~~~mermaid
+sequenceDiagram
+  participant A as ARC / Runner
+  participant S as NPU Scheduler
+  participant L as AccountingDomain权威
+  participant K as Kubernetes API
+  participant W as Workflow Scheduler
+  participant R as Reconciler
+  S->>L: Commit(DemandID, CandidatePlan, version, epoch)
+  alt 原子预约成功
+    L-->>S: reservationID / HELD
+    S->>K: Runner绑定
+    alt 绑定失败
+      S->>L: Revoke(reservationID,generation)
+      L-->>S: REVOKING（确认无下游分配后CLOSED）
+    else 绑定成功
+      S->>L: RunnerBound(reservationID)
+      L-->>S: HANDOFF_PENDING
+      A->>K: Workflow UID / DemandID关联
+      W->>L: 校验预约域与有效代际
+      W->>K: Workflow实际放置
+      W-->>R: 分配事实及版本
+      R->>K: 核对UID、Node、Requests
+      R->>L: ConfirmHandoff(可信证据)
+      L-->>R: ALLOCATED / 计量归并
+    end
+  else 容量或版本冲突
+    L-->>S: WAIT / RESERVATION_CONFLICT
+  end
+  Note over W,L: 未参与共享协议时仅有ESTIMATED保证
+~~~
+
+交接必须以显式 DemandID、Runner UID、Workflow UID、namespace 与实际 Node/资源证明身份和范围，不允许通过名称去后缀猜测关联。下游不配合预约核验和撤销协议时，Runner 可以获得 ESTIMATED 结论，但不能升级 COORDINATED；Workflow 的实际分配仍可能等待。
+
+对于 Gang 任务，只有个别成员 Pod 出现不代表整个多节点承诺已经交接完成。必须按照每节点向量分别确认，未确认部分继续占用逻辑额度，并遵循整体任务的失败/撤销策略。
+
+#### 5.2.6 故障、租约与恢复
+
+| 事件 | 状态与恢复行为 | 容量语义 |
+|---|---|---|
+| Runner 绑定失败 | HELD → REVOKING，核对下游未启动 | 证明无分配后 CLOSED |
+| Runner 已绑定，Workflow 迟迟未创建 | 核查 Job attempt、Runner 存续和最大持有期限 | 期限只触发撤销，不能单凭过期释放 |
+| Workflow 终止/取消/删除 | 通过 UID 与真实分配释放证据核对 | 确认回收后 CLOSED |
+| Scheduler 故障或主备切换 | 提升 writerEpoch，恢复账本并与 Workflow/Pod 对账 | 权威未确认之前暂停该域新的 COORDINATED 承诺 |
+| 重复、乱序或迟到事件 | 依据 generation、epoch 和 evidenceVersion 校验 | 不得覆盖较新的有效承诺 |
+| Liqo 远端失联或资源映射变化 | 标记受影响预约 UNCERTAIN，隔离未知容量 | 其他独立可信域可继续 |
+| Node Allocatable 下降 | 重算容量及现有有效承诺，暴露冲突 | 不因容量变化自动删除已有预约 |
+| 同名但不同 Namespace 的 Workflow | 禁止以名称匹配作交接 | 身份不明时保持预约 |
+| 下游分配端拒绝/丢失确认 | 保留逻辑预约，进入 HANDOFF_PENDING/UNCERTAIN | 不把未确认视为已释放 |
+
+**可用性取舍：** 未知资源保守隔离可能降低短时吞吐，但必须依靠补偿式对账使 UNCERTAIN 最终收敛；不能依靠无条件 TTL 删除消除容量泄漏。恢复时限、故障域和告警阈值由 QA-04/05 后续统一约束。
+
+#### 5.2.7 原因码和诊断证据
+
+| 原因码 | 含义 | 调用方行为 |
+|---|---|---|
+| RESERVATION_CONFLICT | 域版本或容量竞争冲突 | 刷新资源事实、计划和公平许可后重试 |
+| RESERVATION_IDENTITY_CONFLICT | 同一 Demand/generation 的规格、租户或身份不符 | 拒绝覆盖并报告身份异常 |
+| RESERVATION_STATE_UNAVAILABLE | 权威账本或代际不可确认 | 等待恢复，不升级保证 |
+| RESERVATION_HANDOFF_PENDING | Workflow 实际占用尚未核对 | 继续保留逻辑预约 |
+| RESERVATION_HANDOFF_MISMATCH | Workflow 证据与预约资源域、UID 或规格不一致 | 隔离并重新对账 |
+| RESERVATION_REVOKE_PENDING | 已要求撤销但释放尚未确认 | 保留不确定容量 |
+| RESERVATION_RECOVERY_REQUIRED | 切换/远端失联时发现不可确认预约 | 标记 UNCERTAIN 并停止相关强承诺 |
+| RESERVATION_CLOSED | 可信证据证明承诺已释放 | 重新评估同域等待队列 |
+
+最小诊断字段：domainID、reservationID、DemandID、Runner UID、Workflow UID（如已知）、节点资源向量、state、generation、writerEpoch、资源事实版本和原因码。跨租户可见事件不得泄漏他人的预约详情。
+
+#### 5.2.8 DFX 设计验收场景
+
+| TC | 场景 | 可验证的目标结论 |
+|---|---|---|
+| TC-R01 | 空闲 8 卡节点，两项 6 卡需求并发读取旧余量 | 至多一个域级 CAS 成功，另一个刷新后等待 |
+| TC-R02 | 两节点各需 4 卡，但其中一节点不足 | 整个计划提交失败，不产生半份有效预约 |
+| TC-R03 | 同一请求重复 Commit、撤销或绑定通知 | 状态及 reservationID 幂等；不重复扣减或释放 |
+| TC-R04 | Runner 绑定失败，撤销先于下游状态可见 | 确认无分配后 CLOSED，否则保守保留 |
+| TC-R05 | Runner 已绑定，Workflow 未创建且租约到期 | 进入受控撤销核查，不能直接释放容量 |
+| TC-R06 | 实际分配可见但交接证据尚未处理 | 可以暂时保守双计，不能存在计量空窗；确认后归并 |
+| TC-R07 | 两个 Namespace 有相同名称的 Runner/Workflow | 只有可信 DemandID/UID 对应者能够交接 |
+| TC-R08 | 旧 Scheduler 写入迟到，新实例已提高 writerEpoch | 旧代际的写入被拒绝 |
+| TC-R09 | 远端失联且状态不可确认 | 相关域不能新增 COORDINATED 承诺，未知容量保留 |
+| TC-R10 | Workflow 终止先于 Node 资源释放视图刷新 | 只在可信释放证据具备时释放逻辑承诺 |
+| TC-R11 | Workflow Scheduler 不参与预约协议 | 只能声明 ESTIMATED，不能声称跨调度器物理排他 |
+| TC-R12 | 同一物理节点映射为两个虚拟资源域 | 不允许双重仲裁承诺；映射冲突时禁止强承诺 |
+
+上述 TC 是**设计可判定场景**，不是测试执行记录；须与 INV-R01～R06、ADR-05/07/09 和 QA-01/04/05/07 保持追踪一致。
 
 ### 5.3 IR-03：资源域、配额和候选节点
 
@@ -441,8 +631,8 @@ Reserve Node 为满足较大需求保留未来可用资源的条件。Backfill �
 | SR-01 需求校验 | 4.1、5.1 | ADR-02、ADR-10 | QA-01、QA-06 | 非法/越权需求不进入候选 |
 | SR-02 资源计量 | 4.2、5.1 | ADR-04、ADR-05 | QA-01、QA-04 | 资源型号和映射去重，预约不重复核算 |
 | SR-03 可执行性 | 4.3～4.8、5.1 | ADR-03、ADR-07 | QA-01 | 单节点 4+4/8 和跨域 8+10/12 反例均不能误放行 |
-| SR-04 预约 | 3.4、5.2 | ADR-05、ADR-09 | QA-01、QA-04 | 并发冲突不导致同一逻辑容量双重承诺 |
-| SR-05 交接 | 3.4、5.2 | ADR-05、ADR-07 | QA-04、QA-07 | 同名跨 namespace 不会错误抵消预约 |
+| SR-04 预约 | 3.4、5.2.1～5.2.4、5.2.6～5.2.8 | ADR-05、ADR-09 | QA-01、QA-04、QA-05 | 域级 CAS、状态机和对账符合 INV-R01～R06；TC-R01～R05、R08～R09、R12 |
+| SR-05 交接 | 3.4、5.2.2～5.2.3、5.2.5～5.2.8 | ADR-05、ADR-07 | QA-01、QA-04、QA-07 | 可信 UID/分配证据交接及保守计量；TC-R06～R07、R10～R11 |
 | SR-06 Liqo 授权 | 4.2、4.5、5.3 | ADR-02、ADR-04 | QA-01、QA-06 | 无远端授权不可能选远端 |
 | SR-07 池选择 | 4.3～4.7、5.3 | ADR-03、ADR-04 | QA-01 | 本地/远端使用同一可行性语义 |
 | SR-08 Queue 约束 | 4.5、5.3 | ADR-04、ADR-10 | QA-01、QA-06 | 外部配额不能因缺失或错误默认无限 |
