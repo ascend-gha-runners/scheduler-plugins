@@ -1,93 +1,105 @@
-# ARC NPU 调度功能域详细设计说明（现有代码基线版）
+# ARC NPU 调度子系统详细设计说明（目标架构）
 
-> **文档性质**：已实现系统的设计逆向与规格化说明（AS-IS），不是待开发方案、变更申请或代码提交。**本次交付不修改任何业务代码。**
+> **文档定位**：本文定义昇腾 CI 的 ARC NPU 调度子系统目标架构（TO-BE），用于评审子系统功能机制、组件职责、接口、数据状态和 DFX 质量属性。只讨论目标状态，不以代码是否实现、GitOps 是否部署或实测是否完成来裁剪架构需求；不包含实施、迁移、PoC 或上线计划。
 >
-> **源码基线**：[`ascend-gha-runners/scheduler-plugins` 的 `liqo-lb` 分支，commit `cc243f537e97ca4e34c6bd57030817a04ae204ec`](https://github.com/ascend-gha-runners/scheduler-plugins/tree/cc243f537e97ca4e34c6bd57030817a04ae204ec)（简称 **S-BASE**）。
+> **分阶段修订说明**：本次为整改任务 T1，仅替换第 1～2 章的目标与需求基线。第 3～7 章暂保留历史 AS-IS 设计分析作为后续 T2～T12 的修改输入，其中“当前代码”“尚未实现”“GAP”“AR 已实现”等表述**不是目标架构的要求或验收结论**。T12 将消除全部过渡文本和追踪矛盾。
 >
-> **部署配置基线**：[`opensourceways/ascend-ci-deployment`，commit `3dd81ed95e0fe659d81b1cbf629fc62620bbfff8`](https://github.com/opensourceways/ascend-ci-deployment/tree/3dd81ed95e0fe659d81b1cbf629fc62620bbfff8)（简称 **D-BASE**）。
+> **技术参考，不构成目标边界**：[scheduler-plugins 历史源码基线](https://github.com/ascend-gha-runners/scheduler-plugins/tree/cc243f537e97ca4e34c6bd57030817a04ae204ec)、[ascend-ci-deployment 历史部署基线](https://github.com/opensourceways/ascend-ci-deployment/tree/3dd81ed95e0fe659d81b1cbf629fc62620bbfff8)。
 >
-> **证据强度**：`源码已实现` = S-BASE 中有对应代码；`GitOps 已配置` = D-BASE 的 YAML 声明；`测试已覆盖` = 存在相应 Go 测试用例，但本轮未执行；`待运行确认` = 需要访问集群 / 镜像 digest / GitHub 真实 Job 才能证明。实际在线状态不从 GitOps 推断。
->
-> **追踪规则**：`业务目标 BG → 功能 IR → 用户故事/用例 SR → 原子实现 AR → 验证案例 TC 和代码证据`。第 5 章按 **IR 分节**，每个 SR 给出独立用例时序及多个 AR。AR 表示已存在、可定位验证的最小实现活动与迭代追踪粒度，**不宣称每项 AR 曾作为独立 PR 合入**；未实现的能力只列在第 6 章。
+> **追踪路径**：业务目标 BG → 功能要求 IR → 可验证场景 SR → 目标机制/架构决策 ADR → 质量属性 QA → 验收场景 TC。后续章节须写明设计机制及权衡，而不是仅记录风险。
 
-## 1 文档说明和业务目标
+## 1 文档说明与架构目标
 
 ### 1.1 业务目标
 
-**BG-01：Runner Pod 调度前的 NPU 感知与容量准入。** ARC Container Mode 的 Runner 容器可以不申请 NPU，后续 Workflow Pod 才申请 NPU。ARCSync 通过 Runner 的需求标签及 Node/Pod 快照，提前判断未来 NPU 需求，在资源估算不足时让 Runner Pod 保持 Pending，减少 Runner 已启动、Workflow Pod 却长时间等待 NPU 的情况。这有利于将资源等待反映在 Runner 就绪之前；**它不控制 ARC Listener 接单，也不能保证 GitHub UI 特定的 Queued 状态或后续 Workflow 一定可调度**。
+**BG-01：在 Runner 绑定前识别和控制 Workflow 的 NPU 资源等待。** ARC Container Mode 下 Runner Pod 可能不直接申请 NPU，而后续 Workflow Pod 才声明 NPU Request。调度子系统应依据未来 Workflow 的资源型号、数量、放置及拓扑约束判断准入条件：不满足时让 Runner 保持待调度；满足时按明确的跨组件契约推进。**聚合余量不等于可执行性，也不等于跨调度器的资源保证**。本子系统不控制 ARC Listener 领取 Job，亦不承诺 GitHub UI 的特定排队状态。
 
-**BG-02：有限范围 FIFO 公平调度，降低大任务因反复插队而饿死的风险。** 对同一可比较调度范围内的待调度 Runner，按创建时间和 UID 检查更早任务，避免新 Pod 因老 Pod 调度重试退避而持续插队。BG-02 与 BG-01 并列。当前只实现有范围的严格 FIFO，不包含 Backfill、跨 namespace/跨租户公平或等待上限；队首阻塞仍可能发生。
+**BG-02：在竞争负载下实现可解释的公平等待与安全资源利用。** 对同一可比较资源范围内的任务定义稳定的先后关系和公平规则；防止大任务被持续插队；在不破坏已有预留承诺的前提下允许安全 Backfill。支持延迟敏感 PR 与吞吐敏感 Nightly 的分时优先级，明确优先级切换和防饥饿条件。公平、吞吐和等待时间的取舍须有架构决策，不把“严格 FIFO”本身当成目标。
 
-### 1.2 适用范围与非目标
+### 1.2 设计范围与外部边界
 
-- **适用**：`schedulerName: npu-scheduler`、Pod 带 `ascend-ci.com/required-npu-count` 标签、且使用 D-BASE 主部署配置的工作负载。Kubernetes Framework 的其它默认插件仍影响最后放置。
-- **非本模块实现**：Github Actions 作业分发、ARC Runner 扩缩容、实际 Workflow Pod 构造与调度、Ascend 设备检测、Liqo 跨集群网络、Volcano Queue 控制器；本模块读取这些系统经 Kubernetes API 表达的数据。
-- **本次不主张**：单节点 NPU 可行性保证、硬件卡锁定、跨调度器原子预约、重启后预约恢复、Queue 全局强制配额、EASY 回填、GitHub Queue Time 改善已被实测证明。这些均没有在所选源码与部署配置中得到充分支持。
-
-### 1.3 本文设计对象与状态标识
-
-| 标记 | 含义 | 实例 |
+| 范围 | 本子系统应承担的责任 | 外部系统及责任边界 |
 |---|---|---|
-| `CODE` | S-BASE 存在真实逻辑 | `ARCSync.PreFilter` 聚合容量并做 FIFO 校验 |
-| `CONFIG` | D-BASE 配置实际启用 | 主配置启用 `PreFilter/Filter/Score/Reserve` |
-| `COND` | 依赖 Pod 标签/额外 CRD/外部系统 | Liqo `NamespaceOffloading`、Volcano `Queue` |
-| `GAP` | 对业务目标尚不完备；**非现有功能** | 独立 NPU Target 单节点判定、持久化预约 |
-| `RUNTIME-UNKNOWN` | 静态源码/配置不足以确认 | 实际镜像 digest、所有集群 Rollout、PostBind 实际回调 |
+| NPU 需求表达 | 读取并验证 Runner 所代表的未来 Workflow 资源需求；判定要求是否可信、有效 | ARC 创建 Runner；Workflow 定义最终实际 Requests |
+| 准入与候选选择 | 建立授权且满足资源型号、容量、拓扑及放置约束的候选域；给出准入及拒绝原因 | Kubernetes Node/Pod、设备插件提供资源事实；Liqo 负责跨集群资源暴露 |
+| 公平调度 | 定义本子系统能够执行的排序、优先级、资源预留与 Backfill；说明与外部调度的责任分界 | ARC Listener 负责领取 Job；其他调度器负责其接管的 Pod |
+| 资源生命周期 | 管理逻辑预约、状态交接、释放及异常恢复；明确不可保证的物理资源语义 | Workflow 实际分配、绑定和执行由对应 Scheduler/Kubernetes 完成 |
+| 运行支撑 | 定义事件订阅、数据一致性、故障处理、权限和可观测接口 | Kubernetes API、Liqo、Volcano 与平台观测系统提供外部能力 |
 
-### 1.4 版本与配置口径
+**明确非目标**：不设计 GitHub Actions/ARC 的 Job 分发策略；不替代 NPU 设备插件；不直接实现 Liqo 网络与跨集群控制面；不重写 Volcano 队列控制器；不承诺仅凭 Runner 的成功调度便能保证另一个 Scheduler 中的 Workflow 运行。与这些系统之间必须有可核对的数据、事件、授权与失败语义。
 
-| 路径 | Scheduler 名称 | 镜像版本 | Framework 中显式启用的 ARCSync 阶段 | 结论 |
-|---|---|---|---|---|
-| [`manifests/scheduler-plugins-new`](https://github.com/opensourceways/ascend-ci-deployment/blob/3dd81ed95e0fe659d81b1cbf629fc62620bbfff8/manifests/scheduler-plugins-new/deployment.yaml) | `npu-scheduler` | `cc243f537e97ca4e34c6bd57030817a04ae204ec` | PreFilter、Filter、Score、Reserve | **本文主要说明对象** |
-| [`manifests/scheduler-plugins-test`](https://github.com/opensourceways/ascend-ci-deployment/blob/3dd81ed95e0fe659d81b1cbf629fc62620bbfff8/manifests/scheduler-plugins-test/configmap.yaml) | `npu-scheduler` | `799f435a914669947e4c73a7ca34f37892dc4fe9` | PreFilter | 仅作为部署差异说明；不可套用主版行为 |
-| [`manifests/scheduler-plugins`](https://github.com/opensourceways/ascend-ci-deployment/blob/3dd81ed95e0fe659d81b1cbf629fc62620bbfff8/manifests/scheduler-plugins/configmap.yaml) | `runner-pod-npu-scheduler` | `v1.0.2` | `runnerScheduler` 的 Filter | 旧实现；本文不对镜像源码作结论 |
+### 1.3 设计约束与不变量（T2～T6 细化机制）
 
-主 Deployment 声明 `replicas: 1`、`leaderElect: false`、`nodeSelector: kubernetes.io/arch=arm64`、`hostNetwork: true`；ServiceAccount 绑定 `cluster-admin`。`PostBind` 函数虽在源码中存在，但**主配置没有显式列为启用插件阶段**，不得以函数存在作为已执行的证明。D-BASE 的 Argo CD Application 以 `targetRevision: HEAD` 引用部署清单，并有一个集群明确覆盖同一个镜像标签；生产实际拉起版本仍需 `kubectl` 验证。
+1. **正确性先于资源利用率**：只允许使用有权限、资源类型匹配且符合最终工作负载可行性约束的容量参与准入；若只能进行机会性估算，必须明确其非保证语义及处理方式。
+2. **跨阶段一致性**：Runner 准入、逻辑预约、Workflow 真正占用及释放不得长期重复计量或无依据地释放；并发、重启和观测延迟须有一致性边界。
+3. **公平不等于单一排序**：定义队列比较范围、优先级变化、预留保护和 Backfill 安全条件；资源不可满足时避免永久阻塞可执行工作。
+4. **失效必须可解释**：依赖缓存缺失、数据过期、API 不可用、调度器切换等情形必须定义接受/拒绝/降级/重试规则及可观测原因。
+5. **租户隔离与最小权限**：不可信开源 PR 的 Pod 元数据不可自动视为资源授权，调度控制面不可依赖过大权限作为默认设计。
 
-## 2 功能域概述（IR：系统级现有要求）
+### 1.4 设计状态与后续章节的解释
+
+本文以目标架构为唯一规范性口径。历史代码、Manifest、测试函数可用于发现边界条件与反例，但不能用于判定应否设计某项能力。第 3～7 章在 T1 后仍含反向工程表述；后续任务按照整改 DAG 逐项替换为目标决策、机制、DFX 与验收约束。
+
+## 2 功能域概述与需求基线
 
 ### 2.1 功能域概述
 
-本功能域有两个并列的业务目标：**BG-01 NPU 感知准入**和**BG-02 FIFO 公平调度**。Liqo、Volcano、软预约与事件机制支撑上述目标，不另设业务目的。本功能域由 `kube-scheduler` 可执行程序与自定义 `ARCSync` 插件组成。输入包括：带 NPU 需求标签的 Pod、Kubernetes Node/Pod Snapshot、Pod 级调度约束、可选的 Liqo `NamespaceOffloading` 与 Volcano `Queue` 对象。输出包括：`framework.Status`（放行/不可调度/错误）、`nodeFreeNPU` 候选节点集合及 Score、内存预约记录与日志。没有自定义 REST API、Web UI 或独立 CRD。
+本功能域以 Kubernetes Scheduler Framework 扩展能力为基础，提供 Runner 未来 NPU 需求准入、公平调度决策以及必要的逻辑预约与跨组件状态契约。输入包括 Runner NPU 需求、Kubernetes 资源事实、资源授权/拓扑信息及调度状态；输出包括准入结果、候选范围、排序/资源预留决策、结构化原因及诊断信号。是否引入新的持久化状态或外部协调能力由 T2～T6 的架构决策确定，不预设“只能使用现有内存 map”。
 
-### 2.2 IR → SR 需求矩阵
+### 2.2 IR → SR 功能需求矩阵
 
-| IR（系统层） | 需求含义（对现状的行为描述） | BG | 用户/系统受益方 | SR（可独立验证） |
-|---|---|---|---|---|
-| **IR-01 未来 NPU 需求准入** | 根据 Pod 标签触发 ARCSync，并利用 Node/Pod 信息核算 NPU 资源，按聚合余量判定能否继续调度 | BG-01 | ARC 维护者、CI 开发者 | SR-01、SR-02、SR-03 |
-| **IR-02 资源使用生命周期** | 使用进程内预约避免调度瞬间重复放行，并以 Workflow 命名关联决定何时停止重复计费 | BG-01 | NPU 资源管理员 | SR-04、SR-05 |
-| **IR-03 本地/远端池选择** | 根据 Liqo 配置和 Node 约束选择本地或虚拟节点；条件性读取 Volcano Queue 额度；完成 Filter 与 Score | BG-01（配额部分也涉及 BG-02） | 多集群运维、资源管理员 | SR-06、SR-07、SR-08、SR-09 |
-| **IR-04 同池 FIFO 公平性** | 对同一比较范围内的未绑定 Runner 按创建时间阻止插队 | BG-02 | CI 作业提交者 | SR-10 |
-| **IR-05 事件与部署可运维性** | 由 Framework 调用扩展点，读取可选 CRD 缓存并重新触发 Pod 调度；通过 Argo CD 部署专用调度器 | BG-01、BG-02 的质量约束 | SRE、平台运维 | SR-11、SR-12 |
+| IR | 目标要求（应满足的行为） | 关联 BG | SR 场景与验收关注点 |
+|---|---|---|---|
+| **IR-01 NPU 需求与准入** | 识别可信且有效的未来需求，依据最终工作负载可行性和授权候选域判断可否准入 | BG-01 | **SR-01** 需求表达与校验；**SR-02** 物理/虚拟资源事实与占用计算；**SR-03** 容量、拓扑、放置约束一致的准入决策 |
+| **IR-02 资源预约与交接** | 对通过准入的 NPU 需求建立有边界的预约；在失败、取消、重启和 Workflow 接管时保证可恢复的计量语义 | BG-01 | **SR-04** 预约状态、并发与回收；**SR-05** Runner/Workflow 唯一关联、实际占用交接及异常对账 |
+| **IR-03 多池候选与放置** | 依据资源可见性、授权、真实可行性和配额得到一致的本地/远端候选，并与最终放置规则对齐 | BG-01 / BG-02 | **SR-06** Liqo 授权候选；**SR-07** 本地/远端同口径选择；**SR-08** Queue/配额约束及失效语义；**SR-09** Framework Filter/Score 的候选一致性 |
+| **IR-04 公平调度** | 在定义的比较范围内保护等待顺序；支持 PR/Nightly 分时优先级、资源预留与安全 Backfill，避免无界插队 | BG-02 | **SR-10** 公平作用域、排序、优先级变化、预留保护及 Backfill 的组合场景 |
+| **IR-05 运行与诊断支撑** | 调度事件和外部数据变化能够重新触发决策；服务具备必要的可用性、安全性、诊断和恢复机制 | BG-01 / BG-02 | **SR-11** 事件与缓存一致性；**SR-12** Scheduler 部署拓扑、权限、故障转移及诊断契约 |
 
-**口径说明**：此处 IR 是对现行功能域系统行为的重新组织，不是将已有差距包装成“当前系统已经满足”的新需求承诺。每个 SR 的独立验证是验证**源码规则是否如实执行**，并非证明整体业务目标完全实现。
+上述 SR 是**目标行为要求**，不是对已实现函数的描述。T3～T6 将给出具体算法、职责及状态机；T11 更新完整追踪和验收用例。
 
-### 2.3 外部角色与现有用例关系
+### 2.3 主要系统关系与用例链
 
 ```mermaid
 flowchart LR
-  GH[GitHub Actions] --> ARC[ARC Runner Pod]
-  ARC --> IR1[IR-01 NPU 需求准入]
-  ARC --> IR4[IR-04 FIFO]
-  K8S[(Node / Pod API)] --> IR1
-  IR1 --> IR2[IR-02 内存预约和交接]
-  LIQO[Liqo NamespaceOffloading] --> IR3[IR-03 本地/远端选择]
-  QUEUE[Volcano Queue] --> IR3
-  IR3 --> IR1
-  SRE[平台运维] --> IR5[IR-05 事件与部署]
-  IR5 --> IR1
-  IR5 --> IR2
-  IR5 --> IR3
-  IR5 --> IR4
+  GH["GitHub Actions Job"] --> ARC["ARC Listener / Controller"]
+  ARC --> RP["Runner Pod / NPU 需求"]
+  RP --> AD["SR-01~03 需求校验与可行性准入"]
+  API[("Kubernetes Node/Pod 事实")] --> AD
+  LIQO["Liqo 远端资源/授权信息"] --> POOL["SR-06~09 候选与放置"]
+  VQ["Volcano Queue/外部配额"] --> POOL
+  POOL --> AD
+  AD --> FAIR["SR-10 公平/优先级/Backfill"]
+  FAIR --> RSV["SR-04~05 预约及交接"]
+  RSV --> WP["Workflow Pod / 外部 Scheduler"]
+  EVT["SR-11~12 事件、恢复与诊断"] -.-> AD
+  EVT -.-> FAIR
+  EVT -.-> RSV
 ```
 
-### 2.4 IR 系统边界与验收口径
+**关键约束**：Runner 提前准入只减少不可执行情况下的过早启动；跨调度器的“资源已保证”必须以额外一致性契约证明，不能由上述流程图的箭头推断。各模块的最终职责与权威来源在 T2 确定。
 
-- IR-01：可用标签和快照重现当前准入状态码。**不**把剩余容量总和推导为单节点可承载。
-- IR-02：可观察进程内 `inFlightReservations` 的新增/删除与跳过计数；无 API 级持久化对象。
-- IR-03：仅对存在有效可观察 CRD/资源字段的路径认定能力；不把 Queue 读取等同于 Volcano 控制器完整配额保障。
-- IR-04：FIFO 比较规则以 `isOldestPendingRunner` 实际筛选谓词为准，不扩大到跨 namespace。
-- IR-05：区分源码里的回调方法和在 GitOps 中真正启用的扩展点；区分期望部署与已运行实例。
+### 2.4 DFX 质量属性要求基线
+
+| QA | 质量属性 | 可评审目标场景（后续任务补充机制、参数和验证） | 设计任务 |
+|---|---|---|---|
+| **QA-01** | 正确性/一致性 | 资源碎片、节点约束、本地/远端选择或并发预约下不得把不可执行组合误判为已保证；重启与交接不得造成无依据的资源重复准入 | T3、T4、T6 |
+| **QA-02** | 公平性/活性 | 大小任务竞争及 PR/Nightly 优先级切换时，Backfill 不破坏预留承诺，满足可用性条件的旧任务不会因持续插队而永久等待 | T5 |
+| **QA-03** | 性能/容量 | 随节点数、Pod 数、队列深度及并发增长，定义调度关键路径开销、吞吐容量、退化阈值及预算 | T7 |
+| **QA-04** | 可靠性 | API/Informer 数据不一致、重复事件、Workflow 异常、实例重启时有明确的一致性、降级及对账规则 | T4、T8 |
+| **QA-05** | 可用性 | 实例故障或切换、Liqo/Volcano 失效时明确故障域、调度恢复和隔离措施 | T8 |
+| **QA-06** | 安全性 | 不可信租户和开源 PR 不能通过伪造标签、Queue 或 Node 选择约束获取未授权 NPU；组件采用最小权限 | T9 |
+| **QA-07** | 可服务性 | 能将 Runner Pending、资源不满足、公平等待、预约状态及 Workflow Pending 的原因跨组件关联，并输出可行动的诊断信号 | T10 |
+
+**质量目标口径**：本章定义必须覆盖的场景，不编造未经确定的 P95、吞吐率、故障恢复时间等数值。T7～T10 需明确量化目标、统计窗口或可判定阈值及设计依据，T11 将其与验收案例绑定。
+
+### 2.5 T1 验收基线
+
+- [x] 文档规范性定位改为 TO-BE；源码和部署只作为历史参考。
+- [x] 将 BG-01（提前 NPU 准入）和 BG-02（公平等待与安全资源利用）定义为并列目标。
+- [x] 明确 ARC Listener、Workflow Scheduler、Liqo、Volcano、NPU 设备插件的系统边界。
+- [x] 建立 BG → IR → SR 与 QA 基线；尚未选型的实现机制留待 T2～T10，不伪装为既定技术决策。
+- [ ] T2～T12：替换第 3～7 章旧 AS-IS 口径，完成目标机制、DFX、追踪及独立验收。
 
 ## 3 功能域总体方案（实际架构）
 
