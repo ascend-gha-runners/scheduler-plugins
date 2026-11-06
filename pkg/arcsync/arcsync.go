@@ -28,7 +28,11 @@ const (
 	ResourceDomain    = "ascend-ci.com/npu-resource-domain"
 	ResourceModel     = "ascend-ci.com/npu-resource-model"
 	AllocatedNPUCount = "ascend-ci.com/npu-count"
-	stateKey          = Name + "/state"
+	// SchedulerQueueAnnotation on a Namespace puts that namespace's runner pods into a
+	// shared FIFO queue; namespaces carrying the same value queue together. Unset =>
+	// the namespace forms its own queue (original per-namespace behavior).
+	SchedulerQueueAnnotation = "ascend-ci.com/scheduler-queue"
+	stateKey                 = Name + "/state"
 )
 
 type reservation struct {
@@ -43,6 +47,7 @@ type reservation struct {
 type ARCSync struct {
 	handle               framework.Handle
 	podLister            corev1listers.PodLister
+	nsLister             corev1listers.NamespaceLister
 	inFlightReservations map[string]reservation
 	mu                   sync.Mutex
 	nsOffloadingLister   nsOffloadingLister
@@ -71,6 +76,7 @@ func New(ctx context.Context, _ runtime.Object, h framework.Handle) (framework.P
 	pl := &ARCSync{
 		handle:               h,
 		podLister:            h.SharedInformerFactory().Core().V1().Pods().Lister(),
+		nsLister:             h.SharedInformerFactory().Core().V1().Namespaces().Lister(),
 		inFlightReservations: make(map[string]reservation),
 	}
 
@@ -180,15 +186,18 @@ func getBaseName(name string) string {
 }
 
 // isOldestPendingRunner returns true if no older unbound runner pod (same NPU type,
-// same namespace, same scheduling pool) exists.
+// same FIFO queue, same scheduling pool) exists. The FIFO queue is the namespace's
+// scheduler-queue annotation (or the namespace name when unset), so several
+// namespaces can be merged into one queue — see schedulerQueue.
 // This enforces strict FIFO within a scheduling pool: a runner pod only proceeds
 // when it is the oldest waiting one in its pool. Using CreationTimestamp avoids the
 // backoff side-effect where older (more-retried) pods accumulate longer backoff
 // delays and get jumped by newer pods.
 //
 // Only unbound pods (Spec.NodeName == "") are compared — pods already assigned to
-// a node are past the scheduling decision and must not block new pods. Namespace
-// isolation prevents cross-namespace blocking. Pool-based grouping (via
+// a node are past the scheduling decision and must not block new pods. Queue
+// scoping (shared scheduler-queue annotation) controls which namespaces block each
+// other; by default each namespace is its own queue. Pool-based grouping (via
 // npuFIFOPool when NamespaceOffloading is active, or nodeSelector comparison
 // otherwise) ensures that runners targeting different scheduling pools do not
 // block each other.
@@ -206,6 +215,19 @@ func (pl *ARCSync) isOldestPendingRunner(pod *v1.Pod, nsHasOffloading bool) bool
 	}
 
 	myPool := npuFIFOPool(pod)
+
+	// FIFO queue scoping: namespaces sharing the same scheduler-queue annotation form
+	// one queue (cross-namespace ordering); unannotated namespaces keep their own.
+	queueCache := make(map[string]string)
+	qOf := func(ns string) string {
+		if q, ok := queueCache[ns]; ok {
+			return q
+		}
+		q := pl.schedulerQueue(ns)
+		queueCache[ns] = q
+		return q
+	}
+	myQueue := qOf(pod.Namespace)
 
 	// Build gang -> earliest (leader) creation time. Every member of a LeaderWorkerSet
 	// group shares this single timestamp as its FIFO position; otherwise a late-created
@@ -245,7 +267,8 @@ func (pl *ARCSync) isOldestPendingRunner(pod *v1.Pod, nsHasOffloading bool) bool
 		if p.Spec.NodeName != "" {
 			continue
 		}
-		if p.Namespace != pod.Namespace {
+		// Same FIFO queue (not necessarily same namespace) — see schedulerQueue.
+		if qOf(p.Namespace) != myQueue {
 			continue
 		}
 		if p.Labels[RequiredNPUCount] == "" {
@@ -286,6 +309,22 @@ func npuFIFOPool(pod *v1.Pod) string {
 		return v
 	}
 	return "local"
+}
+
+// schedulerQueue returns the FIFO queue a namespace belongs to: the value of the
+// SchedulerQueueAnnotation on the Namespace, or the namespace name itself when unset.
+// Namespaces sharing the same queue value have their runner pods ordered in one FIFO
+// queue (an older pod in ns-A can block a newer pod in ns-B); unannotated namespaces
+// keep an independent queue, preserving the original per-namespace behavior.
+func (pl *ARCSync) schedulerQueue(namespace string) string {
+	if pl.nsLister != nil {
+		if ns, err := pl.nsLister.Get(namespace); err == nil {
+			if q, ok := ns.Annotations[SchedulerQueueAnnotation]; ok && q != "" {
+				return q
+			}
+		}
+	}
+	return namespace
 }
 
 // --- LeaderWorkerSet (LWS) gang scheduling ---
