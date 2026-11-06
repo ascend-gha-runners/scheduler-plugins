@@ -37,6 +37,7 @@ type reservation struct {
 	timestamp time.Time
 	baseName  string
 	namespace string
+	groupKey  string
 }
 
 type ARCSync struct {
@@ -62,6 +63,7 @@ var _ framework.PreFilterPlugin = &ARCSync{}
 var _ framework.FilterPlugin = &ARCSync{}
 var _ framework.ScorePlugin = &ARCSync{}
 var _ framework.ReservePlugin = &ARCSync{}
+var _ framework.PermitPlugin = &ARCSync{}
 var _ framework.PostBindPlugin = &ARCSync{}
 var _ framework.EnqueueExtensions = &ARCSync{}
 
@@ -149,7 +151,7 @@ func podToleratesNodeTaints(pod *v1.Pod, node *v1.Node) bool {
 	return !isUntolerated
 }
 
-// nodeMatchesPodSelection 判断节点是否同时满足 pod 的两类放置约束： 
+// nodeMatchesPodSelection 判断节点是否同时满足 pod 的两类放置约束：
 // spec.nodeSelector（label 精确相等）与
 // spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution
 // （terms 之间 OR，term 内条件 AND，复用 liqo.go 的 nodeSelectorTermsMatch）。
@@ -196,7 +198,6 @@ func (pl *ARCSync) isOldestPendingRunner(pod *v1.Pod, nsHasOffloading bool) bool
 	}
 	resDomain := pod.Labels[ResourceDomain]
 	resModel := pod.Labels[ResourceModel]
-	myTime := pod.CreationTimestamp.Time
 
 	allPods, err := pl.podLister.List(labels.Everything())
 	if err != nil {
@@ -206,8 +207,36 @@ func (pl *ARCSync) isOldestPendingRunner(pod *v1.Pod, nsHasOffloading bool) bool
 
 	myPool := npuFIFOPool(pod)
 
+	// Build gang -> earliest (leader) creation time. Every member of a LeaderWorkerSet
+	// group shares this single timestamp as its FIFO position; otherwise a late-created
+	// worker would sort AFTER a PR that arrived between leader and worker creation,
+	// letting the PR wedge into the middle of the gang.
+	gangEarliest := make(map[string]time.Time)
+	for _, p := range allPods {
+		if k, ok := gangKey(p); ok {
+			t := p.CreationTimestamp.Time
+			if cur, seen := gangEarliest[k]; !seen || t.Before(cur) {
+				gangEarliest[k] = t
+			}
+		}
+	}
+	effTime := func(p *v1.Pod) time.Time {
+		if k, ok := gangKey(p); ok {
+			if t, seen := gangEarliest[k]; seen {
+				return t
+			}
+		}
+		return p.CreationTimestamp.Time
+	}
+
+	myTime := effTime(pod)
+
 	for _, p := range allPods {
 		if p.UID == pod.UID {
+			continue
+		}
+		// Members of the same gang never block each other — the group advances as a unit.
+		if sameGang(pod, p) {
 			continue
 		}
 		if p.Status.Phase == v1.PodSucceeded || p.Status.Phase == v1.PodFailed {
@@ -241,7 +270,7 @@ func (pl *ARCSync) isOldestPendingRunner(pod *v1.Pod, nsHasOffloading bool) bool
 				continue
 			}
 		}
-		pTime := p.CreationTimestamp.Time
+		pTime := effTime(p)
 		if pTime.Before(myTime) || (pTime.Equal(myTime) && string(p.UID) < string(pod.UID)) {
 			klog.V(4).InfoS("ARCSync: FIFO block — older runner exists",
 				"pod", pod.Name, "olderPod", p.Name,
@@ -259,6 +288,45 @@ func npuFIFOPool(pod *v1.Pod) string {
 	return "local"
 }
 
+// --- LeaderWorkerSet (LWS) gang scheduling ---
+//
+// A multi-node test is a LeaderWorkerSet group: 1 leader + (size-1) workers, each
+// pod requesting a whole NPU node. The group must be scheduled all-or-nothing and
+// must occupy a single FIFO position (its leader's creation time) so a later PR pod
+// cannot wedge between leader and worker creation.
+// NOTE: confirm these label/annotation keys against your LWS version.
+const (
+	LWSGroupKeyLabel  = "leaderworkerset.sigs.k8s.io/group-key"
+	LWSSizeAnnotation = "leaderworkerset.sigs.k8s.io/size"
+	gangPermitTimeout = 10 * time.Minute
+)
+
+// gangKey returns the LWS group key of pod, if it belongs to a group.
+func gangKey(pod *v1.Pod) (string, bool) {
+	v, ok := pod.Labels[LWSGroupKeyLabel]
+	if !ok || v == "" {
+		return "", false
+	}
+	return v, true
+}
+
+// gangSize returns the LWS group size (gang minMember). Defaults to 1 (solo pod).
+func gangSize(pod *v1.Pod) int {
+	if v, ok := pod.Annotations[LWSSizeAnnotation]; ok {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 1
+}
+
+// sameGang reports whether a and b belong to the same LWS group.
+func sameGang(a, b *v1.Pod) bool {
+	ka, oka := gangKey(a)
+	kb, okb := gangKey(b)
+	return oka && okb && ka == kb
+}
+
 func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, pod *v1.Pod) (*framework.PreFilterResult, *framework.Status) {
 	reqCountStr, ok := pod.Labels[RequiredNPUCount]
 	if !ok {
@@ -269,6 +337,12 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 	resDomain := pod.Labels[ResourceDomain]
 	resModel := pod.Labels[ResourceModel]
 	fullResourceName := v1.ResourceName(resDomain + "/" + resModel)
+
+	// Gang (LeaderWorkerSet) awareness: myGangKey identifies this pod's group;
+	// groupReserved accumulates NPU already reserved by this same group so the
+	// group's own in-flight reservations are not counted against its admission.
+	myGangKey, isGang := gangKey(pod)
+	var groupReserved int64
 
 	nodeInfos, err := pl.handle.SnapshotSharedLister().NodeInfos().List()
 	if err != nil {
@@ -355,6 +429,9 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 			continue
 		}
 		nodeTotalOccupied[res.nodeName] += res.count
+		if isGang && res.groupKey == myGangKey {
+			groupReserved += res.count
+		}
 		if res.namespace == pod.Namespace {
 			nsLocalReservated[res.nodeName] += res.count
 		}
@@ -438,12 +515,21 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 		allocatable := node.Status.Allocatable[fullResourceName]
 		totalNPUFree += allocatable.Value() - nodeTotalOccupied[node.Name]
 	}
-	hasCandidate := totalNPUFree >= int64(reqCount)
+	// For a gang (LeaderWorkerSet group) member, admit only if the WHOLE group can
+	// fit: cluster-wide free NPU, with this group's own in-flight reservations added
+	// back, must cover size × per-pod. This stops member-1 from grabbing (and holding)
+	// a whole node when the group as a whole can never be placed.
+	need := int64(reqCount)
+	if isGang {
+		need = int64(reqCount) * int64(gangSize(pod))
+	}
+	hasCandidate := totalNPUFree+groupReserved >= need
 
 	if !hasCandidate {
-		klog.InfoS("ARCSync: PreFilter rejected pod (no node has enough NPU)",
-			"pod", pod.Name, "required", reqCount)
-		return nil, framework.NewStatus(framework.Unschedulable, "No node has enough available NPU slots")
+		klog.InfoS("ARCSync: PreFilter rejected pod (whole gang cannot fit)",
+			"pod", pod.Name, "perPod", reqCount, "need", need,
+			"free", totalNPUFree, "groupReserved", groupReserved, "isGang", isGang)
+		return nil, framework.NewStatus(framework.Unschedulable, "Not enough NPU to place the whole gang")
 	}
 
 	if !pl.isOldestPendingRunner(pod, nsHasOffloading) {
@@ -653,6 +739,7 @@ func (pl *ARCSync) Reserve(ctx context.Context, state *framework.CycleState, pod
 		podKey = pod.Namespace + "/" + pod.Name
 	}
 
+	gKey, _ := gangKey(pod)
 	pl.mu.Lock()
 	defer pl.mu.Unlock()
 	pl.inFlightReservations[podKey] = reservation{
@@ -661,6 +748,7 @@ func (pl *ARCSync) Reserve(ctx context.Context, state *framework.CycleState, pod
 		timestamp: time.Now(),
 		baseName:  getBaseName(pod.Name),
 		namespace: pod.Namespace,
+		groupKey:  gKey,
 	}
 	klog.InfoS("ARCSync: Reserved NPU slots", "pod", pod.Name, "node", nodeName, "count", data.requiredCount)
 	return framework.NewStatus(framework.Success, "")
@@ -701,4 +789,54 @@ func (pl *ARCSync) PostBind(ctx context.Context, state *framework.CycleState, po
 		}
 	}
 	klog.V(4).InfoS("ARCSync: PostBind keeping reservation (runner pod)", "pod", pod.Name, "node", nodeName)
+}
+
+// Permit implements gang (all-or-nothing) admission for LeaderWorkerSet groups.
+//
+// Each managed gang member, after Reserve, waits here until `size` members of the
+// same group-key are simultaneously waiting; the member that completes the group
+// releases all of them together. If the group fails to assemble within the timeout,
+// the framework rejects the waiting members, which triggers Unreserve and frees the
+// NPU their Reserve was holding — so a group that can never complete does not
+// deadlock the pool. While waiting, each member's Reserve keeps holding its node, so
+// freed NPU accumulates for the group instead of being backfilled by PR pods.
+func (pl *ARCSync) Permit(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeName string) (*framework.Status, time.Duration) {
+	// Only govern pods we actually schedule (those carrying required-npu-count).
+	if _, managed := pod.Labels[RequiredNPUCount]; !managed {
+		return framework.NewStatus(framework.Success, ""), 0
+	}
+	key, ok := gangKey(pod)
+	if !ok {
+		return framework.NewStatus(framework.Success, ""), 0
+	}
+	size := gangSize(pod)
+	if size <= 1 {
+		return framework.NewStatus(framework.Success, ""), 0
+	}
+
+	// Count peers of the same gang already waiting in Permit, plus this pod itself.
+	waiting := 1
+	pl.handle.IterateOverWaitingPods(func(wp framework.WaitingPod) {
+		p := wp.GetPod()
+		if p.UID == pod.UID {
+			return
+		}
+		if k, okk := gangKey(p); okk && k == key {
+			waiting++
+		}
+	})
+
+	if waiting >= size {
+		// This pod completes the gang: release every waiting member of the group.
+		pl.handle.IterateOverWaitingPods(func(wp framework.WaitingPod) {
+			if k, okk := gangKey(wp.GetPod()); okk && k == key {
+				wp.Allow(Name)
+			}
+		})
+		klog.InfoS("ARCSync: gang complete — admitting all members", "gangKey", key, "size", size)
+		return framework.NewStatus(framework.Success, ""), 0
+	}
+
+	klog.InfoS("ARCSync: gang member waiting for peers", "pod", pod.Name, "gangKey", key, "have", waiting, "need", size)
+	return framework.NewStatus(framework.Wait, "waiting for gang peers to be reserved"), gangPermitTimeout
 }
