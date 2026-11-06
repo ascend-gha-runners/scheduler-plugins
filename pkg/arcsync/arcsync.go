@@ -338,11 +338,18 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 	resModel := pod.Labels[ResourceModel]
 	fullResourceName := v1.ResourceName(resDomain + "/" + resModel)
 
-	// Gang (LeaderWorkerSet) awareness: myGangKey identifies this pod's group;
-	// groupReserved accumulates NPU already reserved by this same group so the
-	// group's own in-flight reservations are not counted against its admission.
+	// Gang (LeaderWorkerSet) awareness. The group's own current footprint must be
+	// added back when checking whether the whole group fits, so a member is not
+	// blocked by its own earlier members. That footprint has two sources depending
+	// on pod type:
+	//   - groupSnapshotUsage: same-group pods already assumed/bound (counted via their
+	//     container NPU request in the snapshot) — this is the LWS case.
+	//   - groupReserved: same-group placeholder runner pods (no container request),
+	//     tracked only via inFlightReservations.
+	// A pod is counted in exactly one of these (see Reserve), so there is no overlap.
 	myGangKey, isGang := gangKey(pod)
 	var groupReserved int64
+	var groupSnapshotUsage int64
 
 	nodeInfos, err := pl.handle.SnapshotSharedLister().NodeInfos().List()
 	if err != nil {
@@ -397,6 +404,9 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 				}
 			}
 			physUsage += podUsage
+			if isGang && sameGang(pod, p) {
+				groupSnapshotUsage += podUsage
+			}
 			if p.Namespace == pod.Namespace {
 				nsUsage += podUsage
 			}
@@ -523,12 +533,15 @@ func (pl *ARCSync) PreFilter(ctx context.Context, state *framework.CycleState, p
 	if isGang {
 		need = int64(reqCount) * int64(gangSize(pod))
 	}
-	hasCandidate := totalNPUFree+groupReserved >= need
+	// Add back the group's own footprint (assumed/bound members in the snapshot plus
+	// any runner-placeholder reservations) so a member is not blocked by its own peers.
+	groupOwn := groupReserved + groupSnapshotUsage
+	hasCandidate := totalNPUFree+groupOwn >= need
 
 	if !hasCandidate {
 		klog.InfoS("ARCSync: PreFilter rejected pod (whole gang cannot fit)",
-			"pod", pod.Name, "perPod", reqCount, "need", need,
-			"free", totalNPUFree, "groupReserved", groupReserved, "isGang", isGang)
+			"pod", pod.Name, "perPod", reqCount, "need", need, "free", totalNPUFree,
+			"groupOwn", groupOwn, "isGang", isGang)
 		return nil, framework.NewStatus(framework.Unschedulable, "Not enough NPU to place the whole gang")
 	}
 
@@ -737,6 +750,15 @@ func (pl *ARCSync) Reserve(ctx context.Context, state *framework.CycleState, pod
 	podKey := string(pod.UID)
 	if podKey == "" {
 		podKey = pod.Namespace + "/" + pod.Name
+	}
+
+	// Pods that request NPU directly (e.g. LWS leader/worker) are already accounted
+	// for by the scheduler's assume() in the snapshot once reserved; recording an
+	// extra in-flight reservation would double-count them for the whole
+	// assume→PostBind window — which, for a gang member, is the entire Permit wait.
+	// Only placeholder runner pods (no container NPU request) need the reservation.
+	if podRequestsNPU(pod, data.resourceName) {
+		return framework.NewStatus(framework.Success, "")
 	}
 
 	gKey, _ := gangKey(pod)
