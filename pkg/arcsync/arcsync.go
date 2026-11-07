@@ -251,7 +251,22 @@ func (pl *ARCSync) isOldestPendingRunner(pod *v1.Pod, nsHasOffloading bool) bool
 		return p.CreationTimestamp.Time
 	}
 
+	// fifoTiebreak returns a stable identity used to break ties when two pods
+	// share the same effective FIFO time. For gang members it uses the group-key,
+	// so every member of a gang presents one consistent ordering relative to other
+	// gangs — preventing circular blocks between gangs created in the same second
+	// (where per-member UIDs would let gang-A's worker block gang-B's leader while
+	// gang-B's worker blocks gang-A's leader). For non-gang pods it falls back to
+	// the pod UID (original behavior).
+	fifoTiebreak := func(p *v1.Pod) string {
+		if k, ok := gangKey(p); ok {
+			return "gang:" + k
+		}
+		return "pod:" + string(p.UID)
+	}
+
 	myTime := effTime(pod)
+	myTiebreak := fifoTiebreak(pod)
 
 	for _, p := range allPods {
 		if p.UID == pod.UID {
@@ -294,7 +309,7 @@ func (pl *ARCSync) isOldestPendingRunner(pod *v1.Pod, nsHasOffloading bool) bool
 			}
 		}
 		pTime := effTime(p)
-		if pTime.Before(myTime) || (pTime.Equal(myTime) && string(p.UID) < string(pod.UID)) {
+		if pTime.Before(myTime) || (pTime.Equal(myTime) && fifoTiebreak(p) < myTiebreak) {
 			klog.V(4).InfoS("ARCSync: FIFO block — older runner exists",
 				"pod", pod.Name, "olderPod", p.Name,
 				"podCreated", myTime, "olderCreated", pTime)
