@@ -12,14 +12,16 @@
 
 两个目标并列。准入负责判定“是否有可执行资源”，公平策略负责判定“谁先获得可用资源”。两者不得通过一个聚合容量判断或一个 FIFO 谓词相互替代。
 
+**目标可验证边界。** BG-01 分为“前瞻需求可验证、降低错误提前启动”的基础能力，以及“下游参与共同预约协议、减少准入后再次排队”的协调能力。前者不保证 Workflow 立即运行，后者仅在明确的参与者、资源域、有效期和回收契约内成立。BG-02 的 Runner 公平准入与下游 Workflow Pod 的执行优先级分别负责各自阶段；不能用前者替代后者。
+
 ### 1.2 子系统职责与外部边界
 
 | 范围 | 子系统职责 | 外部系统职责 |
 |---|---|---|
-| NPU 需求 | 解释、校验 Runner 所代表的 Workflow 资源规格；标记需求来源和授权范围 | ARC 提供 Runner 与 Job 的关联；可信平台配置提供可声明的规格 |
-| 候选资源 | 依据资源事实、授权和最终执行约束构造可行候选域 | Kubernetes 提供 Node/Pod 资源事实；Liqo 暴露远端资源和 Offloading 约束 |
-| 公平调度 | 对可比较任务执行排序、优先级、保护性预留和 Backfill 裁决 | GitHub Actions/ARC Listener 负责 Job 分发，不由本子系统控制 |
-| 逻辑预约 | 记录准入承诺、处理竞争和交接；表达资源保证级别 | Workflow Scheduler 执行真正的 Pod 放置和绑定；设备插件管理设备资源 |
+| NPU 需求 | 在 Runner 调度前验证 JobAttempt 与最终 NPU 消费者的完整需求关联，缺失时明确等待/拒绝 | CI 接入侧/可信需求生产者在 Runner 可调度之前提供经授权的需求契约；ARC 提供 Runner/Job 生命周期关联 |
+| 候选资源 | 依据资源事实、授权和最终执行约束构造可行候选域，验证远端可行性证据 | Kubernetes 提供 Node/Pod 资源事实；Liqo 提供远端可见性/Offloading；远端可信可行性提供者证明成员集群放置约束 |
+| 公平调度 | 对可比较 Runner 需求执行 FIFO、租户公平、Reserve Node 和安全 Backfill 裁决；不复制下游 Pod 优先级调度 | CI Provider/ARC Listener 负责 Job 分发；Workflow Scheduler 使用可信 PriorityClass 执行 PR/Nightly 优先级，不由本子系统抢占运行任务 |
+| 逻辑预约 | 记录 Runner 准入侧的资源承诺、处理竞争和交接；只在共同协议下提供强协调保证 | Workflow Scheduler 负责真实 Pod 放置、优先级与绑定；设备插件管理设备资源；独立分配端不受本地逻辑预约约束 |
 | 配额与隔离 | 将资源域和租户授权约束纳入决策，拒绝未经授权的候选 | Volcano 负责其 Queue 管理与实际工作负载调度 |
 | 运维质量 | 定义一致性、故障恢复、诊断事件和质量属性契约 | Kubernetes 控制面与平台观测设施提供基础运行能力 |
 | 共享 FIFO 队列 | 按可信的 Queue 身份与真实资源竞争关系组织跨 Namespace 等待顺序；组级需求只占一个公平位置 | 平台策略管理 Namespace 到 Queue 的授权映射；Kubernetes 提供 Namespace 元数据 |
@@ -44,10 +46,10 @@
 
 | IR | 需要解决的问题 | 设计目标 | 对应 SR | BG |
 |---|---|---|---|---|
-| IR-01 | 需求声明与最终执行规格脱节，聚合容量无法证明执行可行性 | 校验可信单 Pod/组级需求及授权，形成满足型号、容量、拓扑、成员数量和放置约束的可行执行计划 | SR-01 需求校验；SR-02 资源核算；SR-03 可行性判断 | BG-01 |
-| IR-02 | 并发准入可能重复承诺容量，预约与真实分配之间存在交接空窗 | 建立版本化、可恢复的逻辑预约及一致的分配交接与对账 | SR-04 预约和回收；SR-05 跨阶段关联与对账 | BG-01 |
-| IR-03 | 跨资源域可见性、授权、Queue 配额和节点放置约束可能不一致 | 构建授权且可验证的候选资源域，在同一约束口径下选择、过滤和评分 | SR-06 Liqo 候选；SR-07 资源域选择；SR-08 Queue 约束；SR-09 Filter/Score 一致性 | BG-01 |
-| IR-04 | 队列重试、跨 Namespace 竞争、组成员异步创建与任务规模差异造成持续插队，严格 FIFO 又可能阻塞无冲突资源 | 以可信 Queue 身份及任务组身份建立稳定 FIFO，并统一分时优先级、Reserve Node 及安全 Backfill | SR-10 竞争任务调度 | BG-02 |
+| IR-01 | Runner 启动前无法自然获知后续 Workflow 的真实 NPU 规格，聚合容量也无法证明执行可行性 | 要求 CI 接入侧在 Runner 可调度前提供与 JobAttempt 绑定的可信需求契约，并验证单 Pod/组级型号、容量和拓扑 | SR-01 需求校验；SR-02 资源核算；SR-03 可行性判断 | BG-01 |
+| IR-02 | 并发准入可能重复承诺容量，预测性判断又不能阻止独立 Workflow Scheduler 抢先分配 | 明确 ESTIMATED/COORDINATED 的能力边界，建立可恢复的逻辑预约及真实分配交接和对账 | SR-04 预约和回收；SR-05 跨阶段关联与对账 | BG-01 |
+| IR-03 | Liqo 聚合 VirtualNode 不能证明远端物理拓扑与可调度性，跨资源域授权和 Queue 口径也可能不一致 | 引入可信远端可行性证据，按授权、型号、拓扑、配额与证据时效构建候选域 | SR-06 Liqo 候选；SR-07 资源域选择；SR-08 Queue 约束；SR-09 Filter/Score 一致性 | BG-01 |
+| IR-04 | 跨 Namespace/组成员的到达顺序失真、大任务饥饿、严格 FIFO 阻塞无冲突容量，且 Runner 与 Workflow 优先级可能重复仲裁 | 用可信 Queue/WorkloadGroup 建立稳定 FIFO、Reserve Node 和空间安全 Backfill；PR/Nightly Pod 优先级交由执行端按可信 PriorityClass 处理 | SR-10 竞争任务调度 | BG-02 |
 | IR-05 | 外部状态变化和组件故障可能导致过期决策、难以恢复或无法定位等待原因 | 提供可追踪的重评估、数据一致性、故障恢复与诊断契约 | SR-11 状态变化与重评估；SR-12 运行支撑 | BG-01 / BG-02 |
 
 ### 2.2 DFX 质量属性
@@ -139,10 +141,14 @@ flowchart TB
 |---|---|---|
 | Demand | DemandID、Runner UID、namespace、租户、resourceName、count、WorkflowShape、policyVersion | DemandID 唯一标识一项未来 NPU 需求 |
 | WorkflowShape | 单节点或多节点形态、每节点卡数、节点/拓扑约束、集群可达性 | 决定资源是否可被组合，而非只记录总卡数 |
+
+| TrustedDemandContract | JobAttempt、可信消费者类型、工作负载规格/版本、资源型号和数量、WorkflowShape/WorkloadGroup、tenant/queue/allowedDomains、生产者身份、有效期 | 在 Runner 可调度之前生成且与 Runner UID 可信绑定；缺失不能推断零 NPU |
 | WorkloadGroup | groupID（含集群、Namespace、工作负载 UID、组实例/代际）、groupSize、成员规格、成员集合/版本、groupPolicy | 将 LWS/PodGroup 的一个明确组实例作为一个准入及公平比较单位；仅在可信来源确定时有效 |
 | ResourceDomain | domainID、clusterID、model、授权范围、物理节点集合或可靠映射、数据版本 | 只在此域具备可信视图时参与候选 |
+
+| RemoteFeasibilityEvidence | remoteClusterID、DemandID、WorkflowShape 摘要、授权/Queue/拓扑版本、结果、有效期、签发主体、可核验物理放置证明 | 可由远端权威在不公开具体 Node 信息的情况下证明完整 WorkflowShape 的可行性；不是占用承诺 |
 | CapacityView | allocatable、committed、eligibleFree、snapshotVersion、freshness | 可供准入的调度容量，不等同实时设备利用率 |
-| CandidatePlan | demandID、domainID、节点/拓扑绑定集合、可行性证据及版本 | 完整的未来 Workflow 放置方案 |
+| CandidatePlan | demandID、domainID、已验证的节点/拓扑绑定集合或远端可核验的完整放置证明、可行性证据与版本 | 单节点及多节点完整 Workflow 计划；远端不要求泄露物理节点明细，但必须证明全部硬约束 |
 | FairnessOrder | fairnessPoolID、tenantID、jobClass、arrivalSequence、PolicyEpoch、deficit、protectionVersion | 同域竞争排序及跨租户服务份额；详见 5.4.1～5.4.2 |
 | FairnessQueue | queueID、tenant/Namespace 授权映射、policyVersion、scope、failureState | 规定可跨 Namespace 比较的身份及作用域；同名字符串不替代资源域与租户授权，见 5.4.1 |
 | ReserveCommitment | protectedDemandID、fairnessPoolID、candidatePlanID、受保护节点向量、protectionVersion、PolicyEpoch、有效性/释放边界 | 队首软保护，非物理锁或已占用卡数；详见 5.4.3～5.4.4 |
@@ -169,6 +175,10 @@ flowchart TB
 | ADR-12 有界容量仲裁与增量索引 | 物理不重叠的有界 AccountingDomain、增量资源/队列索引、预算化拓扑搜索和有界 CAS 重试 | 跨分区 Gang/全局 Queue 配额需要额外强协议；缺失时不能宣称强保证（6.2.4） |
 | ADR-13 组级执行责任归属 | Runner 侧只判断整个 WorkloadGroup 的需求与候选可行性；LWS/PodGroup 与 Workflow Scheduler 负责实际 Gang、成员放置及回滚 | 不在 ARCSync 和下游同时维护独立的 Gang Permit；仅下游明确提供共同协议时才能宣称组级协调保证 |
 | ADR-14 可信共享 FIFO Queue | 用受控配置将 Namespace 映射到队列，和物理 FairnessPool 交叉确定竞争关系；队列及版本不可被任务自声明改变 | Queue 身份无法验证时不得回退为独立 Namespace 队列放行，牺牲局部可用性以保公平和隔离 |
+
+| ADR-15 前瞻需求契约 | CI 接入侧须在 Runner 调度前提供 JobAttempt 绑定的可信完整 NPU 需求；与真实 Workflow 不符时撤销旧承诺并重评估 | 单靠 ARC Runner Pod 的 CPU Requests 无法实现 BG-01；无可信契约的作业不进入受管理的 NPU 预测性准入 |
+| ADR-16 远端可行性证明 | Liqo 负责可见性与 Offloading 授权；远端可信调度/资源事实服务提供完整 WorkflowShape 可行性证明 | 虚拟 Node 聚合卡数不构成可行性；证据缺失时等待，证明可行但无共享预约时最多 ESTIMATED |
+| ADR-17 优先级与 Backfill 责任 | Runner 准入侧管 FIFO/公平保护；PR/Nightly 的实际 Workflow 执行优先级由可信 PriorityClass 和下游 Scheduler 负责，空间 Backfill 为默认安全路径 | 不维护第二套独立的执行优先级/抢占机制；时间 Backfill 仅在可强制执行全生命周期上限且不破坏保护时可选 |
 
 ## 4 NPU 需求与容量准入设计（IR-01、IR-03）
 
