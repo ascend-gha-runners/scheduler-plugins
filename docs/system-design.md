@@ -8,7 +8,7 @@
 
 **典型场景。** 在 ARC Container Mode 中，Runner Pod 自身可能仅申请 CPU，已启动的 Runner 随后创建真正消耗 NPU 的 Workflow Pod。例如，本地剩余 8 卡、远端剩余 10 卡，而 Workflow 需要单节点 12 卡。虽然空闲量合计为 18 卡，但不存在满足要求的单节点；如果只依据 Runner 自身资源或跨域总量放行，就会出现 Runner 已启动、Workflow 却持续等待 NPU 的情况。设计目标是在 Runner Pod 调度前利用可信的执行规格作出可行性判断。
 
-**BG-02 公平等待与资源效能。** 解决资源竞争时到达顺序失真、大任务持续被插队以及严格 FIFO 队首阻塞影响吞吐的问题。目标是在明确的竞争范围内实行稳定 FIFO、PR/Nightly 分时优先级、Reserve Node 保护及安全 Backfill，使公平性与资源利用率兼顾，不通过抢占终止运行中的任务。
+**BG-02 公平等待与资源效能。** 解决资源竞争时到达顺序失真、大任务持续被插队以及严格 FIFO 队首阻塞影响吞吐的问题。目标是在明确竞争范围内实现稳定 FIFO、Reserve Node 保护与安全 Backfill；PR/Nightly 的真实 Workflow 执行优先级由受控 PriorityClass 在下游调度阶段执行，不以抢占正在运行的任务换取吞吐。
 
 两个目标并列。准入负责判定“是否有可执行资源”，公平策略负责判定“谁先获得可用资源”。两者不得通过一个聚合容量判断或一个 FIFO 谓词相互替代。
 
@@ -77,7 +77,7 @@
 | AP-03 事实与预测分离 | 区分资源事实、预测性准入、逻辑预约和真实 Workflow 分配 | QA-01/04 |
 | AP-04 授权先于候选 | 资源类型、租户、Queue、Offloading 和需求来源须经可信规则校验 | QA-06 |
 | AP-05 单一状态权威 | 预约应有持久、版本化、可对账的权威数据；本地缓存仅是派生视图 | QA-01/04/05 |
-| AP-06 公平与利用率兼顾 | FIFO、分时优先级和安全 Backfill 统一仲裁，不抢占运行任务 | QA-02/03 |
+| AP-06 公平与利用率兼顾 | Runner 前置 FIFO/Reserve Node/安全 Backfill 和执行端可信 PriorityClass 分工，禁止两套相互矛盾的执行优先级或抢占策略 | QA-02/03 |
 | AP-07 明确失效语义 | 依赖异常按授权、安全性和一致性影响选择等待、拒绝或有限降级 | QA-04/05/06 |
 | AP-08 可诊断的决策 | 决策具有关联 ID、策略版本、数据版本和原因码 | QA-07 |
 
@@ -173,7 +173,7 @@ flowchart TB
 | ADR-03 最终执行可行性 | 以 WorkflowShape 在一个被授权且连贯的执行范围内存在有效 CandidatePlan 为准入依据 | 比简单求和保守，但排除资源碎片造成的错误放行 |
 | ADR-04 资源事实各归其主 | Node/设备、远端可见性、Queue 以及 Workflow 绑定事实分别由对应组件提供 | 需要约定数据新鲜度和同一资源不可重复计数 |
 | ADR-05 持久化逻辑预约 | 使用受版本约束且可恢复的预约权威，禁止以进程内 map 作为全局账本 | 增加仲裁读写成本；具体状态转换在 IR-02 定义 |
-| ADR-06 非抢占公平调度 | 同一资源竞争域内采用层次化租户公平、稳定 FIFO、PR/Nightly 分时优先级、Reserve Node 与安全 Backfill；公平版本和预约权威联合仲裁 | 允许空间无冲突回填；借保护容量必须具可信强制运行上限与保护窗口，可能牺牲短期吞吐以兑现承诺 |
+| ADR-06 非抢占公平调度 | Runner 前置准入在物理竞争域内使用层次化租户公平、稳定 FIFO、Reserve Node 和安全 Backfill，并与预约权威版本联合仲裁；执行端 PR/Nightly 优先级由可信 PriorityClass 处理 | 空间无冲突回填为默认；借用保护容量只在可信强制运行上限与保护窗口成立时可选，避免双重优先级排序和抢占运行任务 |
 | ADR-07 跨调度器明确保证级别 | 预测性准入与有下游协调的预约保证是两种不同契约 | 无协调时不能对外承诺设备已锁定 |
 | ADR-08 安全降级 | 授权和核心一致性事实不可信时不得放行；可观测性故障不影响调度判定 | 关键依赖故障会降低可用性，但防止资源越权 |
 | ADR-09 单一有效预约仲裁 | 同一资源竞争域内的状态更新需要版本与代际保护 | 避免多实例同时承诺同一容量；需要恢复和对账路径 |
@@ -646,7 +646,7 @@ sequenceDiagram
 
 **问题：** 资源竞争中的重试、任务大小、不同租户及类别优先级，可能导致长期插队或无冲突容量无法利用。
 
-**目标：** 为 **SR-10** 定义可解释的 FIFO 顺序、分时优先级和 Reserve Node 保护，在不破坏保护承诺的前提下允许安全 Backfill。可行性由 CandidatePlan 负责，是否获准竞争容量由公平策略仲裁；不能把单次 Pod 扫描或单机 QueueSort 等同于跨实例、跨租户公平保证。
+**目标：** 为 **SR-10** 定义可解释的 Runner FIFO 顺序、租户公平和 Reserve Node 保护，在不破坏保护承诺的前提下允许安全 Backfill。PR/Nightly 的执行优先级交给真实 Workflow Scheduler 的 PriorityClass；准入侧不能维护第二套相互竞争的执行优先级。可行性由 CandidatePlan 负责，是否获准竞争容量由公平策略仲裁；不能把单次 Pod 扫描或单机 QueueSort 等同于跨实例、跨租户公平保证。
 
 #### 5.4.1 比较范围与队列身份
 
@@ -656,7 +656,7 @@ sequenceDiagram
 
 1. **资源域层**：对同一物理竞争域串行仲裁会冲突的容量承诺；不跨不相干的资源池设立人为全局队首。
 2. **租户层**：可信 tenantID 由平台授权策略产生，按策略配置的租户权重与已兑现 NPU 卡时形成服务份额；持续超额使用的租户在有竞争者时不得永久保持优先。权重不是 Pod 自填标签，默认不构成硬配额。
-3. **租户内任务层**：同一个可比较类别的任务按持久到达顺序 FIFO；跨 PR/Nightly 类别先应用分时优先级与防饥饿规则。跨租户选择采用按有效权重归一化的服务欠账（deficit）优先；欠账相同时，按持久到达顺序和 DemandID 稳定比较。
+3. **租户内任务层**：可比较 Runner 需求按持久到达顺序 FIFO，组级需求只占一个位置；跨租户以有效权重归一化的服务欠账（deficit）优先，欠账相同时按到达顺序和 DemandID 比较。PR/Nightly 的实际执行顺序由 Workflow Pod/PodGroup 已授权的 PriorityClass 与下游 Queue 策略决定；前置准入不重复以时钟对等待中的旧 Job 重排。
 4. **拓扑竞争层**：当不同任务候选集交叉但不相等时，按对相同资源有效的仲裁顺序决定优先者；一个任务可以有多个 CandidatePlan，但只能在一次公平授权中选定一个执行计划和预留集合，不能在多个池里同时占据队首权益。
 
 **排序键**：arrivalSequence 由可信队列接收点持久化单调分配；同一序列冲突时使用 DemandID 稳定打破平局。Pod CreationTimestamp 只可用作辅助证据，不承担跨集群严格排序权威。失败重试或 Scheduler 切换不改变 arrivalSequence；重新提交的独立 Job attempt 使用新键。拒绝越权或永久不可能执行的需求不得阻塞后继。
@@ -664,20 +664,20 @@ sequenceDiagram
 
 **组级 FIFO 身份。** 可信 WorkloadGroup 在同一 Queue 与竞争域内占据一个稳定的 arrivalSequence；Leader/Worker 异步创建不能将后到 PR 插入组内，同组成员也不能相互设置 FIFO 阻塞。两个组到达序列相同，以完整 groupID（含实例代际）一致打破平局，不能分别用成员 UID 排出相互循环的先后关系。组内实际 Pod 的放置顺序由执行端 Gang Scheduler 决定。
 
-#### 5.4.2 PR/Nightly 分时优先级与防饥饿
+#### 5.4.2 PR/Nightly 执行优先级与前置公平边界
 
-定义策略版本 PolicyEpoch，包含 IANA 时区、日/夜优先级时间窗口、权重、平局规则、保护阈值及状态变更时刻。跨夏令时和地区使用明确的时区解释，不使用服务器本地隐式时间。策略切换由平台时间事件触发，并为等待队列生成新裁决版本。
+**一处策略源、两处生效阶段。** 由可信平台作业策略按 IANA 时区和提交时刻判定 PR/Nightly 的执行类别，生成适用于真实 Workflow Pod/PodGroup 的 `priorityClassName`。类别、所选 PriorityClass、策略版本及 JobAttempt 与可信需求契约绑定，创建 Workflow Pod 前由受控接口核验；普通 Pod 标签、未授权 Queue 或 Runner 自填的 PriorityClass 不能升级优先级。
 
-| 场景 | 调度政策 |
+| 决策阶段 | 责任与约束 |
 |---|---|
-| 白天 PR 优先 | 同一竞争域内优先授予 PR 可执行任务；Nightly 继续入队并保留原始到达顺序 |
-| 夜间 Nightly 优先 | 优先授予可执行 Nightly；白天未完成的 PR 不被取消，其有效预留仍受保护 |
-| 窗口切换 | 对**尚未被承诺**的需求按新策略重排；已建立的 ReserveCommitment/HELD 按其有效协议保持或受控迁移 |
-| 连续高优先级任务涌入 | 长期等待的低优先级租户/类别通过策略规定的最大连续跳过次数与保留机会获得候选仲裁权 |
-| 永久不可执行需求 | 返回 INFEASIBLE 并退出该池的有效竞争顺序，不永久封锁后继 |
-| 暂时资源不足 | 保留到达顺序，进入有界保护集合，并在资源释放时重新判断，不以繁忙重试次数修改公平顺序 |
+| **平台分类** | 白天 PR、夜间 Nightly 的优先级映射在 JobAttempt 生成时确定，记录时区和策略版本；优先级变化作用于新提交的 Job，**不通过时钟重写已有 Pod 的 priorityClassName** |
+| **Runner 前置准入** | 维护可信 Queue/WorkloadGroup 的 FIFO、公平保护和可行性判断；引用最终计划中的 PriorityClass 以避免与已保护资源冲突，**不额外实现独立的 PR/Nightly 执行优先级调度器** |
+| **Workflow 实际调度** | Kubernetes/Volcano Scheduler 根据可信 PriorityClass、Queue 及 PodGroup 的实际生效策略选取可运行任务；需保证不通过预抢占已运行 CI 作业提升优先级 |
+| **长期等待保护** | Runner 侧在同一竞争域使用 Reserve Node/公平欠账保证有条件的防饥饿；实际 Workflow 侧须验证优先级、Queue 份额及非抢占策略不会使受保护任务持续无法得到资源 |
 
-**活性保证是条件性的**：在授权和拓扑持续有效、所需资源最终能够释放、后续任务遵守本域仲裁协议、旧任务数及有效跳过上界可控时，受保护需求不会因不断到来的新请求无限次插队。不能把这一性质扩展成“任意资源永远不足时仍能在有限时间完成”。分时优先级不主动抢占运行中的 CI 作业。
+**非抢占约束。** 采用 Kubernetes 非抢占 PriorityClass 时，设定 `preemptionPolicy: Never` 可禁止该类 Pod 主动抢占低优先级 Pod，但**不能保证该 Pod 不被其他更高优先级 Pod 抢占**。受管理资源域还必须确保其他 Scheduler/Volcano 的 `preempt`/`reclaim` 等策略与“不驱逐正在运行的 CI Job”的系统要求相容；否则不能对全域宣称非抢占保证。PodGroup 成员的 PriorityClass 须满足实际 LWS/调度器版本的相容性要求。
+
+**PolicyEpoch 与 FIFO 保持。** PolicyEpoch 记录 Queue 授权、租户公平权重、优先级映射规则和保护版本的有效策略代际，用于新请求的可信分类与预约版本检查，而不表示每到日夜切换就重新排序已有 Runner/Workflow。既有有效 ReserveCommitment/HELD 继续受其原协议保护；更高优先级的新 Workflow 不能突破已承诺容量或偷偷撤销已有保护。此处的活性保证仍有条件：资源最终释放、任务具有合法拓扑且所有相关执行者遵守公平/非抢占边界，不承诺在硬件永远不足时有限等待。
 
 #### 5.4.3 Reserve Node：预留承诺与软保护
 
@@ -697,7 +697,7 @@ Reserve Node 是为当前受保护的未满足需求选择一组具体节点/拓
 
 #### 5.4.4 安全 Backfill 判定
 
-安全回填的目标是提高空闲 NPU 使用，而**不推迟已建立的有效 ReserveCommitment**。与保护对象无资源冲突的空间回填可不依赖任务结束时间；需要借用保护节点资源的时间回填，则必须具备可信且可执行的任务最大运行时间和保护窗口。
+安全回填的目标是提高空闲 NPU 使用，而**不推迟已建立的有效 ReserveCommitment**。**默认仅启用空间安全回填**：与保护对象无资源冲突的空间回填不依赖运行时间估计。时间型回填只是可选的强契约能力，只有可强制执行包括准备、执行、清理和资源释放在内的全生命周期最晚完成时间，并验证保护窗口时才允许借用受保护资源。未获得这种执行端能力时不能按历史耗时放行。
 
 ~~~text
 SafeBackfill(B, P, R, S, V) =
@@ -785,7 +785,7 @@ flowchart TD
 |---|---|---|
 | Fairness Policy 或保护账本不可读取 | 对受影响域返回 FAIRNESS_STATE_UNAVAILABLE，保护现有承诺并等待重评估 | 直接 fail-open 让新任务绕过排序 |
 | 事件重复、顺序错乱 | 使用 arrivalSequence、PolicyEpoch、保护版本幂等处理 | 改写历史顺序或重复占用保护容量 |
-| PR/Nightly 窗口切换 | 对未承诺任务重评估，保留有效旧承诺 | 无记录地收回已有保护 |
+| PR/Nightly PriorityClass 映射窗口切换 | 仅对新 JobAttempt 应用新版优先级映射，旧需求保留到达顺序与已提交保护；必要时复核授权 | 原地重排旧 Runner 队列、修改已有 Pod 的优先级或取消旧保护 |
 | 远端资源失联 | 隔离失联域、重算独立可信域的候选 | 用其他无关域的空闲卡数填补保护承诺 |
 | 运行任务没有可信上限 | 仅在空间不冲突时回填 | 依据平均耗时允许借用保护节点 |
 | 资源域 CAS 冲突 | 刷新域版本、保护状态及 CandidatePlan 重评估 | 许可仍按旧候选继续 Reserve |
@@ -799,8 +799,8 @@ flowchart TD
 | TC-F03 | 旧 8 卡在一节点已有 4 卡运行、4 卡空闲；新 1 卡需借空闲受保护卡，但无可靠运行上限 | 不允许时间回填；保留队首完成所需的 4 卡保护 |
 | TC-F04 | 可信保护窗口还余 60 分钟，新任务可信执行上限加释放裕量为 45 分钟 | 在完整 Node、租户、配额与域级 CAS 均有效时可时间回填 |
 | TC-F05 | 保护窗口 60 分钟，新任务仅历史 P90 为 30 分钟，无可信运行上限 | 禁止将该预测当作安全时间回填证据 |
-| TC-F06 | 白天 PR 优先、夜间 Nightly 优先，切换时队列内已有有效保护 | 新的未承诺任务按新 PolicyEpoch 排序，旧承诺不得被隐式撤销 |
-| TC-F07 | 夜间持续有 Nightly，PR 排队达到保护阈值，第二天仍有新 PR | 按欠账及跳过上界保留等待权利，不能被无限次越过 |
+| TC-F06 | 白天 PR / 夜间 Nightly 的 PriorityClass 策略窗口切换，队列内已有受保护 Job | 新 JobAttempt 采用新映射；已有 Workflow PriorityClass 和 Runner arrivalSequence 不因时钟被重写，旧保护仍有效 |
+| TC-F07 | 夜间持续有高优先级 Nightly，低优先级 PR 因拓扑竞争长期等待 | Runner 侧保护和执行侧 Queue/优先级策略须共同保障有条件的等待权益，不能把 PriorityClass 单独当作防饥饿保证 |
 | TC-F08 | 两个租户竞争相同域，租户 A 权重高且已长期占满资源，B 正在等待 | 按已兑现 NPU 卡时和权重计算服务欠账，不能只以绝对权重长期选 A |
 | TC-F09 | Liqo 同一物理节点出现两个虚拟视图，任务分属不同 Namespace | 候选物理冲突必须进入相同公平与容量仲裁边界 |
 | TC-F10 | 两个任务拓扑约束部分重叠、互不相等 | 只限制真实冲突的可行计划；不按字符串相同或不同机械划池 |
@@ -1263,7 +1263,7 @@ sequenceDiagram
 | TC-P09 | 多节点组合求解超过 100 ms | 返回 FEASIBILITY_BUDGET_EXCEEDED；不伪造 INFEASIBLE |
 | TC-P10 | API 返回 429、CAS 冲突激增 | 有界重试/退避，保持公平位置与有效保护 |
 | TC-P11 | 10,000 条事件只影响一个域 | 合并事件、只唤醒受影响的可执行队首 |
-| TC-P12 | PR/Nightly 时间窗切换且 Q 高 | 保护版本仍受 CAS 约束，事件不会全池失控 |
+| TC-P12 | PR/Nightly 新 Job 分类窗口切换且等待队列 Q 高 | 仅新 JobAttempt 接受新 PriorityClass 映射；现有 Runner 无全队重排，已有保护继续受 CAS 约束 |
 | TC-P13 | 两个 Liqo 虚拟 Node 映射相同物理卡 | 分区去重，容量不会因虚拟视图数量增加 |
 | TC-P14 | 资源事实过期、但性能预算即将超时 | 不为达到 PB 目标使用旧事实提升保证 |
 
@@ -1463,7 +1463,7 @@ PB-01～PB-07 的决策耗时和 RA-01～RA-06 的可靠性事件以**5 分钟�
 | TC-O08 | API 429 造成决策等待 | 记录 API 依赖原因，不误报 NPU 容量不足 |
 | TC-O09 | GitHub 接单时间不可获取 | 不虚构 Job 总排队时间，仍能计算 RunnerQueueWait |
 | TC-O10 | 大量 Workflow 缺少 UID 关联 | 关联覆盖率下降，不凭名称补全 |
-| TC-O11 | PR/Nightly 分时窗口发生切换 | 诊断关联 PolicyEpoch 与等待原因 |
+| TC-O11 | PR/Nightly PriorityClass 映射窗口发生切换 | 记录新 JobAttempt 的策略版本与实际执行 PriorityClass；旧 Job 的到达顺序及原因不因时间变化改写 |
 | TC-O12 | 预约超时但分配事实未知 | 状态为 UNCERTAIN，不能输出已释放的结论 |
 | TC-O13 | Runner 已通过组级可行性判断，但执行端 PodGroup 仍等待成员/拓扑 | 独立显示 RUNNER_ADMITTED 与 GROUP_WAIT/原因、groupID/generation 和执行端来源，不误报 NPU 已分配 |
 
@@ -1481,7 +1481,7 @@ PB-01～PB-07 的决策耗时和 RA-01～RA-06 的可靠性事件以**5 分钟�
 | FM-04 | Reserve 后崩溃，Runner 状态未知而预约悬挂 | M | 持久状态与对账，禁止 TTL 直接释放 | TC-R04/R05、TC-A01 | 下游一直不可查询时部分容量持续隔离 |
 | FM-05 | Workflow 交接前释放逻辑预约 | H | UID/Node/Requests 可信证据、无交接空窗 | TC-R06/R10、TC-O06 | 分配事实滞后会导致短期保守双计 |
 | FM-06 | 旧 Scheduler 故障转移后继续写入 | H | writerEpoch + CAS 与恢复屏障 | TC-R08、TC-A02 | API 无法提供权威写入时强预约暂不可用 |
-| FM-07 | PR/Nightly 策略切换破坏既有队首保护 | M | arrivalSequence、PolicyEpoch、protectionVersion | TC-F06/F07/F13 | 物理容量长期不足时不保证有限等待 |
+| FM-07 | PR/Nightly PriorityClass 映射与 Runner 队首保护各自变化，产生顺序冲突 | M | 可信 JobAttempt 分类、执行端 PriorityClass 与 Runner 保护代际分离 | TC-F06/F07/F13 | 依赖下游 Queue/优先级策略配合才能避免长时间饥饿 |
 | FM-08 | Backfill 根据历史运行 P90 误判释放时间 | M | 空间回填优先，时间回填强制时长上限 | TC-F03/F05/F14 | 最坏清理和传播时间必须纳入安全裕量 |
 | FM-09 | 不可信 PR 伪造 Queue/规格/优先级 | H | 授权策略、可信身份、最小权限 | TC-S01/S02/S07 | 上游可信身份服务故障会阻止新强授权 |
 | FM-10 | Volcano capability/deserved/guarantee 混用 | H | 按 Queue 策略和作用域核验硬额度 | TC-I08/I09、TC-A05 | 不支持共享配额协议时无法跨域强承诺 |
