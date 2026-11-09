@@ -349,7 +349,7 @@ ScoreDomain       ⊆ FilterCandidate
 | TC-C05 | 匹配型号有 8 卡，其他型号还有 8 卡，请求某型号 12 卡 | 不准入 | 不同扩展资源名不可相加 |
 | TC-C06 | 一个节点 8 卡，真实已分配 2 卡，未交接预约 3 卡，请求 4 卡 | 不可立即准入 | 可用量仅 3 卡 |
 | TC-C07 | 同一物理 8 卡在本地视图和虚拟视图各出现一次 | 至多按 8 卡计入 | 必须去重，禁止镜像重复计量 |
-| TC-C08 | Liqo 不允许该 namespace 使用远端 | 远端不参与候选 | 授权优先于容量 |
+| TC-C08 | Liqo 不允许该 namespace 使用远端，即使远端声称有完整可行方案 | 远端不参与候选 | 授权优先于容量和远端证据 |
 | TC-C09 | Queue 上限允许 2 卡，请求 4 卡 | 不得以充足物理容量绕过配额 | Queue 适用范围与真实已占用口径 |
 | TC-C10 | Informer/预约账本数据过期或不可确认 | WAIT DATA_UNAVAILABLE；仅独立可信域可继续 | 不能从未知事实推导容量 |
 | TC-C11 | 两次并发读取同一余量 | 预约须以版本仲裁，失败者重试 | 快照判断不是并发承诺 |
@@ -889,36 +889,52 @@ flowchart TD
 
 #### 5.6.4 Liqo 与成员集群职责
 
+**问题：** Liqo VirtualNode 汇总远端协商资源额度，不能直接表明成员集群存在符合型号、单节点/多节点拓扑、亲和与 Queue 约束的物理执行计划。若只按虚拟 Node 的聚合 NPU 卡数准入，Runner 可能被提前放行而真实 Workflow 继续排队。
+
+**目标：** Liqo 提供 Offloading 许可与路由，成员集群的可信可行性提供者按完整 WorkflowShape 检查真实物理资源；本地凭有效证据进行前瞻准入，成员集群 Scheduler 独立决定最终物理 Node 和 Gang 绑定。
+
 ~~~mermaid
 sequenceDiagram
-  participant NS as NPU Scheduler / CandidatePlanner
-  participant L as Liqo可见性与Offloading
+  participant NS as Runner NPU Scheduler
+  participant L as Liqo授权/VirtualNode
+  participant RF as 远端可行性提供者
   participant API as 本地Kubernetes API
-  participant VR as 虚拟Node
-  participant MC as 成员集群Scheduler
-  NS->>L: 查询Namespace授权、允许的远端集群
-  L-->>NS: 授权远端集合/策略版本
-  NS->>API: 读取远端映射、资源事实
-  API-->>NS: VirtualNode / 可验证容量证据
-  alt 映射包含完整可信物理执行拓扑
-    NS->>NS: 形成远端CandidatePlan
-  else 仅聚合容量或映射不可信
-    NS-->>API: 不能声明具体物理可执行或强保证
+  participant VR as Liqo VirtualKubelet
+  participant MC as 成员集群Workflow Scheduler
+  NS->>L: 检查Namespace Offloading与远端范围
+  L-->>NS: 已授权远端及虚拟资源映射
+  NS->>RF: CheckFeasibility(DemandID,完整WorkflowShape,约束/版本)
+  alt 完整可行性证据有效
+    RF-->>NS: Feasible + 约束证明/证据版本/有效期
+    NS->>NS: 远端CandidatePlan进入公平及预约仲裁
+  else 仅聚合余量、证据过期或不可验证
+    RF-->>NS: UNKNOWN / INFEASIBLE（附原因）
+    NS-->>API: WAIT / 重新评估（不按聚合容量放行）
   end
-  NS->>API: 表达已授权的远端候选域约束（非物理卡绑定）
-  API->>VR: VirtualNode对应Offloading选择
-  VR->>MC: Offloading后的Workflow Pod由远端调度
-  MC->>MC: 按物理Node、拓扑、设备进行最终放置
-  MC-->>API: 真实分配证据供交接
+  Note over NS,MC: 远端检查不等于已绑定或已锁定NPU
+  opt Runner按有效候选完成准入，Hooks后续创建Workflow
+    API->>VR: 已授权的Workflow Pod选择远端VirtualNode
+    VR->>MC: Offloading后的Pod/PodGroup执行约束
+    MC->>MC: 按真实Node/设备/拓扑完成调度
+    MC-->>API: 分配或等待状态和交接证据
+  end
 ~~~
 
-<p align="center"><strong>图 7　Liqo 远端资源选择与实际放置时序</strong></p>
+<p align="center"><strong>图 7　Liqo 远端可行性验证与实际执行时序</strong></p>
 
-**说明：** 本地根据 Offloading 授权确定可用远端资源域，成员集群负责真实 Workflow Pod 的物理节点放置；虚拟节点的聚合容量不等于物理可执行性。
+**说明：** Liqo 决定远端是否允许访问，远端可信提供者核验完整 NPU 规格是否有物理可行路径，成员集群 Scheduler 决定真实节点。只有有效检查证据可以进入前瞻准入；检查不产生物理锁定。
 
-**决策权**：本地 Scheduler + Liqo 只决定是否可以把工作负载提交到**已授权的远端资源域**；成员集群 Scheduler 才有权选择真实 NPU Node。Liqo virtual Node 的聚合容量，不自动等于成员集群中存在单台满足需求的物理机器。
+**远端可行性查询契约（逻辑接口）**：
 
-**一致性要求**：Offloading 授权与虚拟资源映射应使用同一有效策略版本；远端物理 Node 能否被实际分配必须由可信成员事实或参与的下游协议确认。远端集群失联、Offloading 撤销、映射冲突时将该域标记为不可验证并触发重评估，不从“虚拟节点仍存在”推断远端容量仍可用。若只拿到聚合可见性、无法证明满足完整 WorkflowShape，应返回 REMOTE_TOPOLOGY_UNKNOWN / DATA_UNAVAILABLE，并等待成员集群可信拓扑证据；**不得给出 ESTIMATED 准入，更不能给出 COORDINATED 保证**。ESTIMATED 也要求存在符合第 4.3 节的完整 CandidatePlan。
+| 项目 | 责任与最小信息 |
+|---|---|
+| CheckFeasibility 请求 | DemandID、JobAttempt、授权 remoteClusterID、WorkflowShape/WorkloadGroup、资源型号/成员数、网络拓扑/亲和/Queue 硬约束、请求时的策略版本 |
+| 证据生产者 | 经平台信任的远端 Scheduler/资源事实提供者；使用成员集群真实 Node、设备、Pod 分配和 Queue 状态，不能直接从 VirtualNode 汇总推断 |
+| 成功响应 | 所检查需求/规格摘要、Feasible 结果、成员集群/授权/拓扑/Queue 证据版本及有效期、可验证的完整放置证明（可不公开具体 Node 清单）、提供者身份 |
+| 失败响应 | INFEASIBLE（在声明的授权与容量上限下硬约束不可能）；WAIT/INSUFFICIENT_CAPACITY（资源暂时被占用）；REMOTE_TOPOLOGY_UNKNOWN/DATA_UNAVAILABLE（证据不完整或无法核验），分别提供重评估条件 |
+| 强保证升级 | 若下游另接入共同 AccountingDomain 与预约/交接/撤销协议，才能升级 COORDINATED；仅 CheckFeasibility 成功始终最多 ESTIMATED |
+
+**失效及隔离：** 本地核验提供者身份、DemandID/WorkflowShape 摘要、Offloading 授权、Queue/物理域映射、证据有效期和来源代际。远端失联、映射改变或证据过期时禁止用旧结果新建准入，已经确认的预约依 5.2 保守核对；独立且可信的本地资源域可以继续。不同成员集群不可为单集群 Gang 直接拼接卡数；跨集群 Gang 必须单独具备端到端调度和原子承诺协议。
 
 #### 5.6.5 Volcano Queue 与 Workflow Scheduler 协同
 
@@ -950,6 +966,7 @@ sequenceDiagram
 | Framework Reserve CAS 冲突 | RESERVATION_CONFLICT | 获取新资源/策略/保护版本后重算，不循环复用旧 CycleState | 已由其他任务取得的承诺有效 |
 | Kubernetes API 关键版本/账本不可用 | RESERVATION_STATE_UNAVAILABLE | 停止受影响域的 COORDINATED 提交；API 与账本恢复后对账 | 未证实可释放的承诺维持保护 |
 | Liqo Offloading 取消或远端不可达 | REMOTE_DOMAIN_UNAVAILABLE | 移除失效候选，独立本地域如可信可重算；远端恢复后重评估 | 远端在途预约进入保守核对 |
+| 远端可行性查询无可信回应、证据版本/需求摘要不符 | REMOTE_TOPOLOGY_UNKNOWN / DATA_UNAVAILABLE | 不用 VirtualNode 汇总量替代证明；获取新成员事实或有效签发证据后重评估 | 旧预约按权威证据保守持有 |
 | Liqo 远端只暴露汇总、缺失物理映射 | REMOTE_TOPOLOGY_UNKNOWN | 不宣称单节点可行或强保证；等待可信物理拓扑证据 | 不新增无法兑现的强预约 |
 | Volcano Queue 状态未知或配额不可信 | QUEUE_STATE_UNAVAILABLE | 受影响 Queue 不绕过配额；Queue 数据/策略恢复后重评估 | 已获有效授权的承诺须有明确撤销机制 |
 | Volcano Queue 已达硬上限 | QUEUE_QUOTA_EXCEEDED | 等待配额释放或授权的 Queue 变更 | 不以其它 Queue 闲置额度自动冒用 |
@@ -957,7 +974,7 @@ sequenceDiagram
 | Workflow Scheduler 未确认预约协议 | DOWNSTREAM_UNCOORDINATED | 只声明 ESTIMATED，并向调用方说明仍可能有 Workflow Pending | 不宣称物理排他 |
 | Workflow 绑定/释放证据缺失或矛盾 | RESERVATION_HANDOFF_MISMATCH | 转 UNCERTAIN、保守计量并对账，证据更新后解除 | 不提前释放逻辑预约 |
 
-**重评估信号**：Pod/Node 资源变化、Runner/Workflow 状态变化、有效预约释放、Offloading 授权变化、Queue 状态变化、公平策略窗口切换，以及明确的账本恢复事件。Kubernetes Framework 对原生 Pod/Node 事件可以使用 EnqueueExtension/QueueingHint；Liqo/Volcano 自定义对象变化须经**显式事件桥接到被调度 Runner 的可重评估状态**，或通过有界周期核对补偿。不得声称自定义 CRD 自动具备通用 QueueingHint 能力。
+**重评估信号**：可信需求契约到达/修订、Pod/Node 资源变化、Runner/Workflow 状态变化、有效预约释放、Offloading 授权变化、成员集群可行性证据更新或失效、Queue 状态变化、受控 PriorityClass 策略变化，以及明确的账本恢复事件。Kubernetes Framework 对原生 Pod/Node 事件可以使用 EnqueueExtension/QueueingHint；Liqo/Volcano 自定义对象变化须经**显式事件桥接到被调度 Runner 的可重评估状态**，或通过有界周期核对补偿。不得声称自定义 CRD 自动具备通用 QueueingHint 能力。
 
 **故障恢复原则**：重复事件保持幂等；关键事实过期则等待；与失败域无关的资源域可继续；对疑似已占用的 NPU 容量保守保护；诊断/指标输出不可用不影响授权和容量正确性。重试采用按原因分类的事件触发与有界退避，避免控制面故障触发全池高频扫描。
 
@@ -1022,8 +1039,8 @@ sequenceDiagram
 | TC-I03 | Runner 调度成功而 Workflow 使用另一 schedulerName | 仍可 Pending；未接共享仲裁时只报告 ESTIMATED |
 | TC-I04 | Framework 的 Runner Node Filter 与 Workflow CandidatePlan 拥有不同 NodeSelector | 两者各按自身约束检查，不合并为一个 NodeSelector |
 | TC-I05 | Reserve 成功但 Bind 失败，Unreserve 重复或未到达 | 由持久状态受控撤销/对账；不因回调丢失泄漏或误释放 |
-| TC-I06 | Liqo 虚拟节点仅提供聚合余量，但映射到的物理节点均不满足完整单节点需求 | 不以虚拟聚合量宣称单节点可执行，须验证成员节点放置条件 |
-| TC-I07 | Liqo Offloading 撤销而 Pod/Node 缓存尚未刷新 | 停止受影响域的新承诺并重核授权；不继续沿用旧候选 |
+| TC-I06 | Liqo 虚拟节点聚合 16 卡，但实际两台物理节点各只有 8 卡，单节点需求 12 卡 | 仅聚合值不能放行；远端完整可行性证明无法成立则 WAIT/INFEASIBLE，依真实约束分类 |
+| TC-I07 | Liqo Offloading 撤销或成员集群可行性证据到期，而本地缓存仍显示虚拟 NPU 余量 | 停止受影响域新的远端准入，等待新授权/证据；已提交预约进入受控核对 |
 | TC-I08 | Volcano Queue capability 仅余 2 卡而资源域物理还剩 8 卡，任务需 4 卡 | 因 Queue 额度不足等待，不借用未授权的 Queue 份额 |
 | TC-I09 | Volcano Queue 有 deserved 与 guarantee，但其策略插件不一致或版本未知 | QUEUE_STATE_UNAVAILABLE；不能把不同份额语义都视为硬上限或设备锁 |
 | TC-I10 | 公平保护在 Reserve 与 PreBind 之间发生变化 | 绑定前复核保护/预约版本；协议不再有效时受控撤销并重排 |
