@@ -149,7 +149,7 @@ flowchart TB
 | Demand | DemandID、Runner UID、namespace、租户、resourceName、count、WorkflowShape、policyVersion | DemandID 唯一标识一项未来 NPU 需求 |
 | WorkflowShape | 单节点或多节点形态、每节点卡数、节点/拓扑约束、集群可达性 | 决定资源是否可被组合，而非只记录总卡数 |
 
-| TrustedDemandContract | JobAttempt、可信消费者类型、工作负载规格/版本、资源型号和数量、WorkflowShape/WorkloadGroup、tenant/queue/allowedDomains、生产者身份、有效期 | 在 Runner 可调度之前生成且与 Runner UID 可信绑定；缺失不能推断零 NPU |
+| TrustedDemandContract | JobAttempt、可信消费者类型、工作负载规格/版本、资源型号和数量、WorkflowShape/WorkloadGroup、tenant/queue/allowedDomains、executionPriorityClass、生产者身份、策略版本与有效期 | 在 Runner 可调度之前生成且与 Runner UID 可信绑定；缺失不能推断零 NPU |
 | WorkloadGroup | groupID（含集群、Namespace、工作负载 UID、组实例/代际）、groupSize、成员规格、成员集合/版本、groupPolicy | 将 LWS/PodGroup 的一个明确组实例作为一个准入及公平比较单位；仅在可信来源确定时有效 |
 | ResourceDomain | domainID、clusterID、model、授权范围、物理节点集合或可靠映射、数据版本 | 只在此域具备可信视图时参与候选 |
 
@@ -691,7 +691,7 @@ Reserve Node 是为当前受保护的未满足需求选择一组具体节点/拓
 2. 保护前先考虑已有已兑现资源、Queue 约束、其他有效预留以及运行任务的不可抢占属性。资源释放时间不可信时不声明确定的时间承诺。
 3. 将 ReserveCommitment 与公平版本写入同一个 AccountingDomain 的受保护决策状态，并让随后申请 HELD 的任务在域级 CAS 时检查该保护版本；避免“公平允许”与“容量写入”之间出现 TOCTOU 竞态。
 4. 保护可因需求取消、失去授权、已满足、拓扑故障或策略明确的受控迁移而释放/重算；不得仅因新高优先级任务到来就悄悄抹除已承诺的保护。
-5. 新的更紧迫任务可竞争**未保护**的容量，也可依明确规则请求保护迁移；迁移必须证明原受保护任务不受损，或明确声明取消旧保证并形成可追溯的策略决策。
+5. 新任务（包括更高执行 PriorityClass 的 Workflow）只可竞争**未保护**的容量；已有效保护的候选不能仅因新任务优先级较高而被改写。保护迁移必须证明原受保护任务的有效性与等待权益不受损，并留下策略版本及原因证据；任何取消需按 5.2 的受控撤销流程处理。
 
 **有界保护**：每域受保护任务数量和预留容量须有可配置上限；优先从有稳定顺序的等待队首选取保护对象；不能因为预留全部节点而让本可并行的任务永久空转。剩余容量可按安全 Backfill 使用。
 
@@ -909,7 +909,7 @@ sequenceDiagram
     NS->>NS: 远端CandidatePlan进入公平及预约仲裁
   else 仅聚合余量、证据过期或不可验证
     RF-->>NS: UNKNOWN / INFEASIBLE（附原因）
-    NS-->>API: WAIT / 重新评估（不按聚合容量放行）
+    NS-->>API: WAIT / REJECT（按可恢复性分类；不按聚合容量放行）
   end
   Note over NS,MC: 远端检查不等于已绑定或已锁定NPU
   opt Runner按有效候选完成准入，Hooks后续创建Workflow
@@ -1041,8 +1041,8 @@ sequenceDiagram
 
 | TC | 架构场景 | 可判定的设计结论 |
 |---|---|---|
-| TC-I01 | ARC Runner Pod 不请求 NPU，但可信规格表明后续 Workflow 请求 8 卡 | PreFilter 基于 WorkflowShape 准入；Runner 的 CPU Node 与未来 NPU Node 分别过滤 |
-| TC-I02 | Container Mode 的 Workflow 没有可信 NPU 需求声明 | DEMAND_UNAVAILABLE；不以 0 卡默许 Runner 占位 |
+| TC-I01 | Runner Pod 只申请 CPU，但 CI 接入侧在调度前向 JobAttempt 绑定了可信的 Workflow 8 卡需求 | PreFilter 依据 TrustedDemandContract 规划 NPU；Runner CPU Node 与未来 NPU Node 分别过滤 |
+| TC-I02 | Container Mode 中只有 Runner CPU Requests，无法在接单前取得可信 NPU 需求 | DEMAND_UNAVAILABLE；不得猜测 0 卡，明确该 CI 接入路径不具备前瞻准入资格 |
 | TC-I03 | Runner 调度成功而 Workflow 使用另一 schedulerName | 仍可 Pending；未接共享仲裁时只报告 ESTIMATED |
 | TC-I04 | Framework 的 Runner Node Filter 与 Workflow CandidatePlan 拥有不同 NodeSelector | 两者各按自身约束检查，不合并为一个 NodeSelector |
 | TC-I05 | Reserve 成功但 Bind 失败，Unreserve 重复或未到达 | 由持久状态受控撤销/对账；不因回调丢失泄漏或误释放 |
@@ -1052,7 +1052,7 @@ sequenceDiagram
 | TC-I09 | Volcano Queue 有 deserved 与 guarantee，但其策略插件不一致或版本未知 | QUEUE_STATE_UNAVAILABLE；不能把不同份额语义都视为硬上限或设备锁 |
 | TC-I10 | 公平保护在 Reserve 与 PreBind 之间发生变化 | 绑定前复核保护/预约版本；协议不再有效时受控撤销并重排 |
 | TC-I11 | 账本故障，但 Node 空闲且 Score 值很高 | 停止 COORDINATED，不能由 Score 绕过权威预约 |
-| TC-I12 | Workflow Scheduler 拒绝或不支持接入协议 | 不升级为 COORDINATED；如路径允许预测性放行须明确残余风险 |
+| TC-I12 | 远端已提供完整 WorkflowShape 可行性证明，但独立 Workflow Scheduler 不接受共享预约 | 最多 ESTIMATED；Runner 可被预测性放行，但仍可能产生下游 NPU Pending，必须保留保证级别与原因 |
 | TC-I13 | Liqo/Volcano CR 更新，但没有关联的原生 Pod/Node 事件 | 必须有桥接或有界周期重评估，不可依赖不存在的自动唤醒 |
 | TC-I14 | 应用的 PostFilter 具备可抢占行为，而本子系统目标不抢占 | 相应调度路径不允许通过抢占来满足 Queue/Reserve Node 的资源承诺 |
 | TC-I15 | LWS 的组级策略为每副本 PodGroup，Runner 提前按整个 LWS 总容量判断 | 应按真实 PodGroup 粒度和成员要求形成需求，不能错误冻结整个 LWS 的容量 |
@@ -1519,18 +1519,18 @@ PB-01～PB-07 的决策耗时和 RA-01～RA-06 的可靠性事件以**5 分钟�
 
 | SR | 主要设计 | ADR | QA | 设计证据 |
 |---|---|---|---|---|
-| SR-01 可信需求 | 4.1、5.1、5.6.2、6.1 | 02、10、13 | 01、06 | INV-S01～S04；TC-C10、TC-S01～S04 |
+| SR-01 可信需求 | 4.1、5.1、5.6.2、6.1 | 02、10、13、15 | 01、06 | INV-S01～S04；TC-C10、TC-S01～S04 |
 | SR-02 容量计量 | 4.2、4.7、5.1、5.2 | 03、04、05 | 01、04 | INV-C01～C06、INV-R02/R03；TC-C01～C09、TC-R01 |
-| SR-03 可执行性 | 4.3～4.8、5.1、5.6.5、6.2.3 | 03、07、12、13 | 01、03 | TC-C01～C14、TC-I01/I03、TC-P09 |
+| SR-03 可执行性 | 4.3～4.8、5.1、5.6.4～5.6.5、6.2.3 | 03、07、12、13、16 | 01、03 | TC-C01～C14、TC-I01/I03、TC-P09 |
 | SR-04 预约 | 3.4、5.2、6.2.4、6.3 | 05、09、12、13 | 01、04、05 | INV-R01～R06、INV-A01～A06；TC-R01～R14、TC-A01～A16 |
 | SR-05 交接 | 5.2.3、5.2.5～5.2.8、6.4 | 05、07、11、13 | 01、04、07 | TC-R04～R12、TC-O03～O06 |
-| SR-06 Liqo | 4.2、4.5、5.3、5.6.4 | 02、04 | 01、06 | INV-I03；TC-C07/C08、TC-I06/I07 |
+| SR-06 Liqo | 4.2、4.5、5.3、5.6.4 | 02、04、16 | 01、06 | INV-I03；TC-C07/C08、TC-I06/I07 |
 | SR-07 资源域 | 4.3～4.7、5.3、5.6.4 | 03、04、07 | 01、03 | TC-C01～C04、TC-I04/I06 |
-| SR-08 Queue | 4.5、5.3、5.6.5、6.1 | 04、10 | 01、06 | INV-I04、INV-S01；TC-C09、TC-I08/I09、TC-S02 |
+| SR-08 Queue | 4.5、5.3、5.6.5、6.1 | 04、10、14、17 | 01、06 | INV-I04、INV-S01；TC-C09、TC-I08/I09、TC-S02 |
 | SR-09 Filter/Score | 4.4、5.3、5.6.3 | 01、03 | 01、03 | INV-I02；TC-C04、TC-I01～I05 |
-| SR-10 公平/Backfill | 5.4、6.2 | 05、06、12、13、14 | 02、03、04 | INV-F01～F08；TC-F01～F18、TC-P06/P12 |
-| SR-11 事件 | 5.5、5.6.6、6.2.5、6.3、6.4 | 08、11、12、14 | 03～05、07 | INV-A06、INV-O06；TC-I13、TC-A07、TC-O04 |
-| SR-12 运行诊断 | 5.5、5.6、6.1～6.4 | 07～14 | 04～07 | PB-01～PB-07、RA-01～RA-06；TC-A01～A16、TC-S01～S14、TC-O01～O13 |
+| SR-10 公平/Backfill | 5.4、5.6.5、6.2 | 05、06、12、13、14、17 | 02、03、04 | INV-F01～F08；TC-F01～F18、TC-P06/P12 |
+| SR-11 事件 | 5.5、5.6.6、6.2.5、6.3、6.4 | 08、11、12、14～16 | 03～05、07 | INV-A06、INV-O06；TC-I13、TC-A07、TC-O04 |
+| SR-12 运行诊断 | 5.5、5.6、6.1～6.4 | 07～17 | 04～07 | PB-01～PB-07、RA-01～RA-06；TC-A01～A16、TC-S01～S14、TC-O01～O13 |
 
 表中两位数字是 ADR-XX、QA-XX 的简写，定义分别见 3.5 和 2.2。每个 SR 有设计章节、关键决策、质量属性及可判断场景。
 
@@ -1539,12 +1539,12 @@ PB-01～PB-07 的决策耗时和 RA-01～RA-06 的可靠性事件以**5 分钟�
 | QA | 目标设计关注点 | 不变量及验收入口 |
 |---|---|---|
 | QA-01 正确性 | 物理拓扑可行、容量 CAS、交接无空窗 | INV-C/R/I、TC-C/R/I；FM-01～03、05 |
-| QA-02 公平性 | 共享 Queue、组级 FIFO、PR/Nightly、Reserve Node 与安全 Backfill | INV-F、TC-F01～F18；FM-07～08 |
-| QA-03 性能与容量 | S1、PB-01～PB-07、有界索引和仲裁 | INV-P、TC-P01～P14；FM-12 |
+| QA-02 公平性 | 共享 Queue、组级 FIFO、Runner Reserve Node/安全 Backfill 与执行端可信 PriorityClass 的责任分离 | INV-F、TC-F01～F18；FM-07～08 |
+| QA-03 性能与容量 | S1、PB-01～PB-07、远端证据等待分账、有界索引和仲裁 | INV-P、TC-P01～P14；FM-12 |
 | QA-04 可靠性 | 代际隔离、幂等、对账和恢复 | INV-R/A、TC-R/A；FM-03～06、11 |
 | QA-05 可用性 | 局部降级 D0～D4、RA-01～RA-06 | INV-A、TC-A01～A16；FM-04、06、11 |
 | QA-06 安全性 | 可信 Queue/Group 授权、最小权限、跨租户隔离 | INV-S、TC-S01～S14；FM-09～10、13 |
-| QA-07 可服务性 | 原因码、关联 UID、等待及卡时口径、覆盖率 | INV-O、TC-O01～O13；FM-11、13～14 |
+| QA-07 可服务性 | 原因码、UID 关联、提前放行率、远端证据覆盖率、组交接与回填卡时 | INV-O、TC-O01～O13；FM-11、13～14 |
 
 ### 7.3 场景索引与架构验收准则
 
@@ -1579,3 +1579,5 @@ PB-01～PB-07 的决策耗时和 RA-01～RA-06 的可靠性事件以**5 分钟�
 - [LeaderWorkerSet Gang Scheduling](https://lws.sigs.k8s.io/stable/docs/concepts/leaderworkerset/gang-scheduling/)：组级调度等级、Workload/PodGroup 关联及原生 Gang 权威。
 - [LeaderWorkerSet Volcano Scheduling](https://lws.sigs.k8s.io/main/docs/concepts/leaderworkerset/volcano-scheduling/)：Volcano provider 及 PodGroup/拓扑责任边界；具体能力以部署版本为准。
 - [Volcano Queue Resource Management](https://volcano.sh/docs/keyfeatures/queueresourcemanagement/)：capability、deserved、guarantee 的不同资源份额语义及 Queue 调度责任。
+- [Volcano Priority](https://volcano.sh/docs/scheduler/plugins/priority/)：Job/Task 依据 PriorityClass 排序；其 PreemptableFn 与实际调度动作必须分别审视。
+- [Volcano Scheduler Actions](https://volcano.sh/docs/scheduler/overview/)：enqueue、allocate、preempt、reclaim、backfill 等真实执行端调度行为。
