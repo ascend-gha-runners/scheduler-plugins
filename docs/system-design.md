@@ -22,6 +22,8 @@
 | 逻辑预约 | 记录准入承诺、处理竞争和交接；表达资源保证级别 | Workflow Scheduler 执行真正的 Pod 放置和绑定；设备插件管理设备资源 |
 | 配额与隔离 | 将资源域和租户授权约束纳入决策，拒绝未经授权的候选 | Volcano 负责其 Queue 管理与实际工作负载调度 |
 | 运维质量 | 定义一致性、故障恢复、诊断事件和质量属性契约 | Kubernetes 控制面与平台观测设施提供基础运行能力 |
+| 共享 FIFO 队列 | 按可信的 Queue 身份与真实资源竞争关系组织跨 Namespace 等待顺序；组级需求只占一个公平位置 | 平台策略管理 Namespace 到 Queue 的授权映射；Kubernetes 提供 Namespace 元数据 |
+| 多 Pod 任务 | 识别可信的组级执行规格、执行范围和整组准入需求，维护 Runner 与组级执行结果的关联 | LeaderWorkerSet（LWS）/PodGroup 提供组身份与成员规格；Workflow Scheduler（Volcano 或原生能力）负责最终 Gang Scheduling、Pod 绑定和失败处理 |
 
 **边界约束：** Runner 被绑定，不等于 Workflow 已得到 NPU；子系统不能控制 ARC Listener 接单或 GitHub UI 的 Queued 状态；也不能仅凭本地逻辑预约宣称另一个 Scheduler 已锁定设备。此文档不涉及沙箱设计。
 
@@ -34,6 +36,7 @@
 5. 任务公平顺序、跨租户竞争与跨拓扑竞争须有明确作用域。
 6. Scheduler 扩展点只承担其语义允许的职责，不把一次调度周期内的通知等价为分布式硬锁。
 7. 所有放行、等待、拒绝和失效选择均具有原因码、证据版本及责任组件。
+8. 组级需求在 Runner 准入阶段按完整 WorkflowShape 判定；不能把若干 Pod 的聚合容量当作可执行证明。Gang 成员的真实绑定由执行端统一协调，避免两个 Scheduler 各自维护不一致的组级许可。
 
 ## 2 需求基线
 
@@ -41,10 +44,10 @@
 
 | IR | 需要解决的问题 | 设计目标 | 对应 SR | BG |
 |---|---|---|---|---|
-| IR-01 | 需求声明与最终执行规格脱节，聚合容量无法证明执行可行性 | 校验可信需求及授权，形成满足型号、容量、拓扑和放置约束的可行执行计划 | SR-01 需求校验；SR-02 资源核算；SR-03 可行性判断 | BG-01 |
+| IR-01 | 需求声明与最终执行规格脱节，聚合容量无法证明执行可行性 | 校验可信单 Pod/组级需求及授权，形成满足型号、容量、拓扑、成员数量和放置约束的可行执行计划 | SR-01 需求校验；SR-02 资源核算；SR-03 可行性判断 | BG-01 |
 | IR-02 | 并发准入可能重复承诺容量，预约与真实分配之间存在交接空窗 | 建立版本化、可恢复的逻辑预约及一致的分配交接与对账 | SR-04 预约和回收；SR-05 跨阶段关联与对账 | BG-01 |
 | IR-03 | 跨资源域可见性、授权、Queue 配额和节点放置约束可能不一致 | 构建授权且可验证的候选资源域，在同一约束口径下选择、过滤和评分 | SR-06 Liqo 候选；SR-07 资源域选择；SR-08 Queue 约束；SR-09 Filter/Score 一致性 | BG-01 |
-| IR-04 | 队列重试与任务规模差异造成持续插队，严格 FIFO 又可能阻塞无冲突资源 | 在明确竞争域内统一 FIFO、分时优先级、Reserve Node 及安全 Backfill | SR-10 竞争任务调度 | BG-02 |
+| IR-04 | 队列重试、跨 Namespace 竞争、组成员异步创建与任务规模差异造成持续插队，严格 FIFO 又可能阻塞无冲突资源 | 以可信 Queue 身份及任务组身份建立稳定 FIFO，并统一分时优先级、Reserve Node 及安全 Backfill | SR-10 竞争任务调度 | BG-02 |
 | IR-05 | 外部状态变化和组件故障可能导致过期决策、难以恢复或无法定位等待原因 | 提供可追踪的重评估、数据一致性、故障恢复与诊断契约 | SR-11 状态变化与重评估；SR-12 运行支撑 | BG-01 / BG-02 |
 
 ### 2.2 DFX 质量属性
@@ -136,10 +139,12 @@ flowchart TB
 |---|---|---|
 | Demand | DemandID、Runner UID、namespace、租户、resourceName、count、WorkflowShape、policyVersion | DemandID 唯一标识一项未来 NPU 需求 |
 | WorkflowShape | 单节点或多节点形态、每节点卡数、节点/拓扑约束、集群可达性 | 决定资源是否可被组合，而非只记录总卡数 |
+| WorkloadGroup | groupID（含集群、Namespace、工作负载 UID、组实例/代际）、groupSize、成员规格、成员集合/版本、groupPolicy | 将 LWS/PodGroup 的一个明确组实例作为一个准入及公平比较单位；仅在可信来源确定时有效 |
 | ResourceDomain | domainID、clusterID、model、授权范围、物理节点集合或可靠映射、数据版本 | 只在此域具备可信视图时参与候选 |
 | CapacityView | allocatable、committed、eligibleFree、snapshotVersion、freshness | 可供准入的调度容量，不等同实时设备利用率 |
 | CandidatePlan | demandID、domainID、节点/拓扑绑定集合、可行性证据及版本 | 完整的未来 Workflow 放置方案 |
 | FairnessOrder | fairnessPoolID、tenantID、jobClass、arrivalSequence、PolicyEpoch、deficit、protectionVersion | 同域竞争排序及跨租户服务份额；详见 5.4.1～5.4.2 |
+| FairnessQueue | queueID、tenant/Namespace 授权映射、policyVersion、scope、failureState | 规定可跨 Namespace 比较的身份及作用域；同名字符串不替代资源域与租户授权，见 5.4.1 |
 | ReserveCommitment | protectedDemandID、fairnessPoolID、candidatePlanID、受保护节点向量、protectionVersion、PolicyEpoch、有效性/释放边界 | 队首软保护，非物理锁或已占用卡数；详见 5.4.3～5.4.4 |
 | LogicalReservation | reservationID、DemandID、domainID、nodeResourceVector、owner、generation、writerEpoch、state、leaseDeadline、workflowRef、evidenceVersion | 预约生命周期权威及跨阶段交接；见 5.2 |
 | AccountingDomain | domainID、physicalResourceIdentity、nodeCapacityVector、reservationIndex、version、writerEpoch、PolicyEpoch、protectionVersion | 有界且物理互斥的容量及公平承诺原子域，见 5.2 和 6.2.4 | 
@@ -162,6 +167,8 @@ flowchart TB
 | ADR-10 最小权限及租户隔离 | 用户身份、Queue 权限和远端授权分开验证；控制面权限受最小权限约束 | 管理复杂度换取明确的信任边界 |
 | ADR-11 原因链诊断 | 需求、候选、等待、预约、Workflow 交接使用同一关联链 | 需要控制高基数指标与事件保留范围 |
 | ADR-12 有界容量仲裁与增量索引 | 物理不重叠的有界 AccountingDomain、增量资源/队列索引、预算化拓扑搜索和有界 CAS 重试 | 跨分区 Gang/全局 Queue 配额需要额外强协议；缺失时不能宣称强保证（6.2.4） |
+| ADR-13 组级执行责任归属 | Runner 侧只判断整个 WorkloadGroup 的需求与候选可行性；LWS/PodGroup 与 Workflow Scheduler 负责实际 Gang、成员放置及回滚 | 不在 ARCSync 和下游同时维护独立的 Gang Permit；仅下游明确提供共同协议时才能宣称组级协调保证 |
+| ADR-14 可信共享 FIFO Queue | 用受控配置将 Namespace 映射到队列，和物理 FairnessPool 交叉确定竞争关系；队列及版本不可被任务自声明改变 | Queue 身份无法验证时不得回退为独立 Namespace 队列放行，牺牲局部可用性以保公平和隔离 |
 
 ## 4 NPU 需求与容量准入设计（IR-01、IR-03）
 
@@ -231,6 +238,7 @@ Feasible(D,S,R) ⇔
 **CapacityFit** 比较该计划中每个节点实际可分配的对应型号卡数，而非只比较集群总和。**QueueQuotaFit** 与 **Authorized** 同时约束本地及远端候选；**FactsFreshAndConsistent** 要求计划中引用的数据具有可核验版本及有效性。
 
 得到有效 P 只是资源可行性结论，不等于公平仲裁已经准许该任务，也不等于另一个 Scheduler 必定在未来兑现分配。
+**组级需求可行性。** 对 WorkloadGroup，P 必须覆盖全部必需成员的每节点 Requests、拓扑/亲和性、Queue 配额和集群范围，并由 Workflow Scheduler 支持对应的 Gang 策略。仅有 `groupSize × 每 Pod NPU` 的集群聚合余量不能证明有合法的全组放置方案；若多个独立 AccountingDomain 无整体原子协议，不声明跨域 Gang 的 COORDINATED 保证。LWS 可按副本、整个 LWS 或角色形成不同组，groupSize 和成员版本必须由真实 LWS/PodGroup 契约确定，而不能从单个 Pod 的自由标签推断。
 
 ### 4.4 决策顺序与算法
 
@@ -317,6 +325,8 @@ ScoreDomain       ⊆ FilterCandidate
 | TC-C10 | Informer/预约账本数据过期或不可确认 | WAIT DATA_UNAVAILABLE；仅独立可信域可继续 | 不能从未知事实推导容量 |
 | TC-C11 | 两次并发读取同一余量 | 预约须以版本仲裁，失败者重试 | 快照判断不是并发承诺 |
 | TC-C12 | 下游使用独立 Scheduler 且未共享预约 | ESTIMATED，不得声明 COORDINATED | 明确跨 Scheduler 竞争风险 |
+| TC-C13 | 两个成员各需 8 卡，池总余量 16 卡，但仅一个合法拓扑节点有 8 卡 | WAIT/INFEASIBLE 按可恢复性分类；不能凭总余量认为整组可运行 | 完整多节点 CandidatePlan |
+| TC-C14 | LWS 组成员数量、版本或拓扑声明与可信 PodGroup 不一致 | INVALID_DEMAND/WORKFLOW_SPEC_MISMATCH 或等待可信规格，不建立整组保证 | 组实例与成员规格校验 |
 
 ### 4.8 正确性与异常契约
 
@@ -329,6 +339,7 @@ ScoreDomain       ⊆ FilterCandidate
 **INV-C04：** 未授权或未知状态不能被“容量足够”“评分较高”或“远端可见”等非授权信号覆盖。
 
 **INV-C05：** Score 只对有效候选排序。不存在可行候选时，调度不会通过修改 Score 创造容量。复杂拓扑搜索超预算为证据不足，不自动构成不可执行证明（见 6.2.3）。
+**INV-C06：** WorkloadGroup 的 CandidatePlan 同时满足所有必需成员、每节点要求和实际执行端的 Gang 能力；部分成员可安置或聚合卡数充足不构成完整组准入。
 
 异常类型包括非法需求、权限不满足、资源永久不兼容、暂时资源不足、数据过期、竞态版本冲突和下游协调失败。可恢复异常必须声明重评估事件；安全性相关错误不得静默放行。
 
@@ -534,6 +545,7 @@ sequenceDiagram
 交接必须以显式 DemandID、Runner UID、Workflow UID、namespace 与实际 Node/资源证明身份和范围，不允许通过名称去后缀猜测关联。下游不配合预约核验和撤销协议时，Runner 可以获得 ESTIMATED 结论，但不能升级 COORDINATED；Workflow 的实际分配仍可能等待。
 
 对于 Gang 任务，只有个别成员 Pod 出现不代表整个多节点承诺已经交接完成。必须按照每节点向量分别确认，未确认部分继续占用逻辑额度，并遵循整体任务的失败/撤销策略。
+组级预约以 `groupID + generation + JobAttempt` 关联各成员 UID 和每节点资源向量。成员 Pod 的真实 NPU Requests、Scheduler assume 状态和 Runner 侧逻辑预约分别计量，只有在权威分配证据确认之后才归并；不得因为成员同时带有需求标签和真实 Requests 而重复扣减，也不能在只见部分成员时提前释放其余成员承诺。组内任一成员的绑定失败、超时或重建必须按下游组级策略进行完整重评估/回滚，并将结果关联回 Runner；无法证明组释放时保持 UNCERTAIN，而不是按超时直接回收。
 
 #### 5.2.6 故障、租约与恢复
 
@@ -582,6 +594,8 @@ sequenceDiagram
 | TC-R10 | Workflow 终止先于 Node 资源释放视图刷新 | 只在可信释放证据具备时释放逻辑承诺 |
 | TC-R11 | Workflow Scheduler 不参与预约协议 | 只能声明 ESTIMATED，不能声称跨调度器物理排他 |
 | TC-R12 | 同一物理节点映射为两个虚拟资源域 | 不允许双重仲裁承诺；映射冲突时禁止强承诺 |
+| TC-R13 | LWS 成员同时存在真实 NPU Requests 和组需求元数据 | 真实分配与逻辑预约分别记录并经证据归并，不重复扣减 |
+| TC-R14 | 多 Pod 组仅一部分完成绑定，随后超时或组实例重建 | 未确认成员仍受保护；按下游整组状态受控回滚/对账，不提前释放 |
 
 上述 TC 是**设计可判定场景**，不是测试执行记录；须与 INV-R01～R06、ADR-05/07/09 和 QA-01/04/05/07 保持追踪一致。
 
