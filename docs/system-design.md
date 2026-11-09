@@ -87,6 +87,9 @@
 flowchart TB
   subgraph EXT["外部系统及资源事实"]
     ARC["ARC Controller / Listener"]
+    INP["CI 需求生产者：前瞻规格"]
+    REM["远端可行性提供者"]
+    LWS["LWS / Workflow Scheduler：Gang与PriorityClass"]
     API[("Kubernetes API")]
     LIQO["Liqo：远端资源与授权"]
     VQ["Volcano：Queue 与 Workflow 调度"]
@@ -97,11 +100,14 @@ flowchart TB
     DEM["需求校验"]
     SNAP["资源事实视图"]
     FEAS["资源域可行性判定"]
-    FAIR["公平/优先级/Backfill 仲裁"]
+    FAIR["FIFO / Reserve Node / Backfill 仲裁"]
     RES["逻辑预约与交接"]
     DIAG["诊断、事件与一致性监视"]
   end
-  ARC -->|"Runner/需求"| API
+  INP -->|"JobAttempt可信需求"| API
+  ARC -->|"Runner/关联"| API
+  REM -->|"远端可行性证据"| API
+  LWS --> API
   DEVICE --> API
   LIQO --> API
   VQ --> API
@@ -132,8 +138,9 @@ flowchart TB
 | 可行性判定 | 为未来 Workflow 计算能满足硬约束的候选执行计划 | 需求、授权候选域、剩余量、拓扑和可信数据版本 | 不通过跨域余量求和宣称 Workflow 一定可运行 |
 | 公平仲裁 | 维护可比较任务排序及预留保护，决定是否轮到当前任务 | 租户/队列策略、任务到达顺序、保留承诺 | 不控制 GitHub Job 接单与跨系统抢占 |
 | 预约与交接 | 对逻辑预约进行有版本约束的竞争仲裁、释放及对账 | 持久化预约记录、Pod UID、Workflow 分配事实 | 不在下游未协同时提供设备硬锁 |
-| Workflow Scheduler | 最终 Workflow Pod 放置及设备分配 | 真实 Workflow Pod、Node 和设备分配 | 不由 Runner 成功绑定所替代 |
 | 诊断与事件适配 | 描述等待、拒绝、重试和交接的原因及证据 | 各决策组件的状态变化 | 不另行形成一套容量权威数据 |
+
+**外部执行权威：** CI 接入侧是 TrustedDemandContract 的生产者，ARC 维护 Runner/Job 生命周期；Workflow Scheduler（含 LWS/Volcano）负责实际 NPU PodGroup 的优先级、Gang、Node 绑定与释放，Device Plugin 负责设备资源事实。其状态仅经受信任的关联协议进入本子系统的证据视图，不能把外部组件写入内部责任链。
 
 ### 3.4 规范化领域对象
 
@@ -828,15 +835,15 @@ flowchart TD
 
 | 边界 | 输入及可信来源 | 本子系统的输出与作用 | 责任边界及降级 |
 |---|---|---|---|
-| **ARC Controller / Runner / Hooks** | Runner UID、Namespace、Job attempt 关联、可信 NPU Demand 与实际作业模式 | 需求准入、Runner Pending 原因、关联 DemandID/ReservationID | ARC Listener 决定接单；hooks/Runner 在约定的作业模式下创建 Workflow Pod；无可信前瞻需求时不能声称 NPU 感知排队 |
+| **CI 需求生产者 / ARC Controller / Runner / Hooks** | CI 接入侧提前提供可信 JobAttempt 与完整 NPU 规格；ARC 提供 Runner UID/生命周期，Hooks 创建真实作业 Pod | 需求准入、Runner Pending 原因、关联 DemandID/ReservationID | 不假定 ARC 默认公开未来 Workflow 资源；没有接单前数据通路时不能实现 BG-01 的事前判断，Hooks 创建的规格须再次核对 |
 | **Kubernetes Scheduling Framework** | 待调度 Runner Pod、合法调度 Profile、Runner Node 信息和 Scheduler CycleState | Demand 验证、Workflow 候选证据、Runner 节点过滤/评分、域级预约、绑定前校验、失败回退 | 只能对 Runner 的 schedulerName 所属调度周期直接产生绑定行为；既有通用 Filter 对 Runner 自身的约束仍生效 |
 | **Kubernetes API / Device Plugin** | Node Allocatable、Pod Requests、实际绑定状态、资源版本和可见性 | CapacityView、版本化预约状态、状态变化触发 | 扩展资源的物理权威属于设备插件/成员集群；API 快照不能证明卡上 AI Core 实际利用率 |
-| **Liqo** | Namespace Offloading 授权、被选远端、虚拟节点映射、资源可见性 | 过滤可执行的远端候选域，并说明成员集群的最终物理放置责任 | 远端映射若不包含可核验的物理拓扑，则不可宣称单节点/多节点强可行性 |
+| **Liqo / 远端可行性提供者** | Offloading 授权、VirtualNode 聚合可见性；远端按真实成员节点和 Queue 产生完整 WorkflowShape 可行性证据 | 仅在远端可信、版本与约束可核验时纳入 CandidatePlan | Liqo 聚合视图不等于物理可行；提供者的查询结果不是强预约，不能替代成员集群真实放置 |
 | **Volcano Queue** | 可信任务 Queue 身份、Queue 生效策略、配额/使用量版本和生效范围 | 检查 Queue 约束，形成可追踪配额判断 | capability 是使用上限；deserved/guarantee 含不同份额语义；读取 Queue 对象不是执行配额锁定 |
 | **Workflow Scheduler（Volcano 或其他）** | 真实 Workflow UID、Requests、PodGroup/拓扑、其自身的调度策略 | 消费可验证的预约关联、执行真实放置、提供交接和释放证据 | 未支持共同仲裁和撤销协议时只能 ESTIMATED；本子系统不得把其选择结果写成自身的节点绑定 |
 | **预约权威与 Fairness Policy** | 域级节点向量、PolicyEpoch、protectionVersion、writerEpoch、候选证据 | 原子承诺/回退、受保护公平次序与重评估 | 只约束参与相同协议的执行者；与实际 Node/Pod 分配证据保持可对账 |
 
-**需求存在的前置条件：** ARC Runner 与作业负载可以分成两个 Pod 的路径，必须由可信平台模板或工作流契约提供**与实际作业 Pod 一致的资源规格**，而不是从 Runner Pod 本身的 CPU Requests 猜测。对于不通过容器 hooks 创建独立作业 Pod 的 Workflow，不能机械套用该路径；需要分别确定实际 NPU 消费者及其调度责任。若无法可信地预先获知需求，受 NPU 准入管理的任务应返回 DEMAND_UNAVAILABLE 并保留等待/拒绝语义，不能默认按 0 卡放行。
+**需求存在的前置条件：** 在 ARC Runner 与作业负载分属两个 Pod 的路径，必须由 CI 接入侧**先于 Runner Pod 调度**提供可验证的 JobAttempt 关联与真实 NPU 消费者完整资源规格，而不是由 ARC 默认提供或从 Runner 的 CPU Requests 猜测。Hooks 创建后核实实际 Pod Requests 与前瞻契约一致。其他作业模式按真实 NPU 消费者定义对应契约；没有事前规格的路径不适用于 BG-01，返回 DEMAND_UNAVAILABLE，不能按 0 卡放行。
 
 #### 5.6.2 Runner/Workflow 身份与需求协议
 
@@ -849,9 +856,17 @@ flowchart TD
 | reservationID、generation、writerEpoch、protectionVersion | 预约权威与公平仲裁产生 | 跨阶段交接、幂等更新、故障恢复；所有者身份须核验 |
 | workflowRef（Cluster/Namespace/UID）、allocationEvidenceVersion | 最终 Workflow 调度/Pod 事实提供，经可信关联验证 | Reservation Reconciler；只有证据满足目标资源域和型号才能交接 |
 
+| trustedDemandRef、JobAttempt、producerIdentity、specDigest、expiresAt | CI 需求生产者在 Runner 可调度前创建；关联层对 Runner UID 绑定与校验 | Demand Validation：防止仅依据 Runner CPU 请求、仓库默认值或未认证 annotation 推断 NPU |
+| executionPriorityClass / nonPreemptPolicy | 受控平台 JobClass/时间窗口策略产生，并在真实 Workflow Pod/PodGroup 创建前固定 | Workflow Scheduler：验证 PriorityClass 授权与执行端非抢占策略；Runner 不自建第二套执行优先级 |
+| remoteFeasibilityRef、evidenceVersion、expiresAt | 远端可信可行性提供者基于成员物理事实返回；需绑定 DemandID/WorkflowShape | CandidatePlanner：核验签发者、拓扑/Queue/型号、时效；没有完整证明时不得给出远端可行计划 |
+
 **模式判定**：在 ARC Kubernetes container mode 创建独立作业 Pod 的场景，Runner 资源约束与 Workflow Pod 资源约束分别计算；如无独立作业 Pod 则以真正的 NPU 消费者为准。若作业 Pod 的实际 Requests 大于声明、型号不符或 Node/拓扑约束不同，**不得继承旧预约保证**；返回 WORKFLOW_SPEC_MISMATCH，保留或受控撤销原承诺，再对真实需求重新准入。
 
 **最小关联协议：** Runner/Job 标识 → DemandID → ReservationID → Workflow UID。身份是逻辑契约，不规定传递载体必须是 annotation、CRD 或 RPC；但应保证不可信任务不能伪造有效授权或交接证据。
+
+**需求生产与时序契约：** CI 需求生产者先根据受信任作业模板、项目许可与提交参数生成 `JobAttempt + specDigest + WorkflowShape + producerIdentity`；受控关联层随后在 Runner Pod 参与调度前将该契约关联到真实 Runner UID，并确认该 Pod 只能消费本次 JobAttempt。可以通过可信注入、受保护对象引用或接口传递，但必须具备“先于调度可见、身份可核验、规格有版本”的共同语义。若 CI Provider 只能在 Runner 接单后才暴露真实资源规格，而又无事先声明，NPU 受管理路径返回 DEMAND_UNAVAILABLE；该作业不享受 BG-01 预先准入能力。后续 Hooks 生成的 Workflow 必须提供同一 JobAttempt 和完整真实规格供核对；不允许以 Pod 名称、运行时猜测或自行声明优先级替代授权。
+
+**消费与变更契约：** 同一 JobAttempt 只能绑定预期的 Runner/Workflow 实例和经授权的 Demand generation；多 Pod 任务从可信 LWS/PodGroup 获得组级需求。作业规格、Queue、资源型号、PodGroup 或成员约束变更后，旧 CandidatePlan/预约不得直接继承，新代际须重新准入并依 5.2 对账。数据生产者没有可持续提供完整规格的能力时，应明确该接入路径不支持前瞻 NPU 调度，而非默许零 NPU。
 
 #### 5.6.3 Scheduling Framework 扩展点职责
 
