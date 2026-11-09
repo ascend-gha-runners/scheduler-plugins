@@ -8,18 +8,20 @@
 
 **典型场景。** 在 ARC Container Mode 中，Runner Pod 自身可能仅申请 CPU，已启动的 Runner 随后创建真正消耗 NPU 的 Workflow Pod。例如，本地剩余 8 卡、远端剩余 10 卡，而 Workflow 需要单节点 12 卡。虽然空闲量合计为 18 卡，但不存在满足要求的单节点；如果只依据 Runner 自身资源或跨域总量放行，就会出现 Runner 已启动、Workflow 却持续等待 NPU 的情况。设计目标是在 Runner Pod 调度前利用可信的执行规格作出可行性判断。
 
-**BG-02 公平等待与资源效能。** 解决资源竞争时到达顺序失真、大任务持续被插队以及严格 FIFO 队首阻塞影响吞吐的问题。目标是在明确的竞争范围内实行稳定 FIFO、PR/Nightly 分时优先级、Reserve Node 保护及安全 Backfill，使公平性与资源利用率兼顾，不通过抢占终止运行中的任务。
+**BG-02 公平等待与资源效能。** 解决资源竞争时到达顺序失真、大任务持续被插队以及严格 FIFO 队首阻塞影响吞吐的问题。目标是在明确竞争范围内实现稳定 FIFO、Reserve Node 保护与安全 Backfill；PR/Nightly 的真实 Workflow 执行优先级由受控 PriorityClass 在下游调度阶段执行，不以抢占正在运行的任务换取吞吐。
 
 两个目标并列。准入负责判定“是否有可执行资源”，公平策略负责判定“谁先获得可用资源”。两者不得通过一个聚合容量判断或一个 FIFO 谓词相互替代。
+
+**目标可验证边界。** BG-01 分为“前瞻需求可验证、降低错误提前启动”的基础能力，以及“下游参与共同预约协议、减少准入后再次排队”的协调能力。前者不保证 Workflow 立即运行，后者仅在明确的参与者、资源域、有效期和回收契约内成立。BG-02 的 Runner 公平准入与下游 Workflow Pod 的执行优先级分别负责各自阶段；不能用前者替代后者。
 
 ### 1.2 子系统职责与外部边界
 
 | 范围 | 子系统职责 | 外部系统职责 |
 |---|---|---|
-| NPU 需求 | 解释、校验 Runner 所代表的 Workflow 资源规格；标记需求来源和授权范围 | ARC 提供 Runner 与 Job 的关联；可信平台配置提供可声明的规格 |
-| 候选资源 | 依据资源事实、授权和最终执行约束构造可行候选域 | Kubernetes 提供 Node/Pod 资源事实；Liqo 暴露远端资源和 Offloading 约束 |
-| 公平调度 | 对可比较任务执行排序、优先级、保护性预留和 Backfill 裁决 | GitHub Actions/ARC Listener 负责 Job 分发，不由本子系统控制 |
-| 逻辑预约 | 记录准入承诺、处理竞争和交接；表达资源保证级别 | Workflow Scheduler 执行真正的 Pod 放置和绑定；设备插件管理设备资源 |
+| NPU 需求 | 在 Runner 调度前验证 JobAttempt 与最终 NPU 消费者的完整需求关联，缺失时明确等待/拒绝 | CI 接入侧/可信需求生产者在 Runner 可调度之前提供经授权的需求契约；ARC 提供 Runner/Job 生命周期关联 |
+| 候选资源 | 依据资源事实、授权和最终执行约束构造可行候选域，验证远端可行性证据 | Kubernetes 提供 Node/Pod 资源事实；Liqo 提供远端可见性/Offloading；远端可信可行性提供者证明成员集群放置约束 |
+| 公平调度 | 对可比较 Runner 需求执行 FIFO、租户公平、Reserve Node 和安全 Backfill 裁决；不复制下游 Pod 优先级调度 | CI Provider/ARC Listener 负责 Job 分发；Workflow Scheduler 使用可信 PriorityClass 执行 PR/Nightly 优先级，不由本子系统抢占运行任务 |
+| 逻辑预约 | 记录 Runner 准入侧的资源承诺、处理竞争和交接；只在共同协议下提供强协调保证 | Workflow Scheduler 负责真实 Pod 放置、优先级与绑定；设备插件管理设备资源；独立分配端不受本地逻辑预约约束 |
 | 配额与隔离 | 将资源域和租户授权约束纳入决策，拒绝未经授权的候选 | Volcano 负责其 Queue 管理与实际工作负载调度 |
 | 运维质量 | 定义一致性、故障恢复、诊断事件和质量属性契约 | Kubernetes 控制面与平台观测设施提供基础运行能力 |
 | 共享 FIFO 队列 | 按可信的 Queue 身份与真实资源竞争关系组织跨 Namespace 等待顺序；组级需求只占一个公平位置 | 平台策略管理 Namespace 到 Queue 的授权映射；Kubernetes 提供 Namespace 元数据 |
@@ -44,10 +46,10 @@
 
 | IR | 需要解决的问题 | 设计目标 | 对应 SR | BG |
 |---|---|---|---|---|
-| IR-01 | 需求声明与最终执行规格脱节，聚合容量无法证明执行可行性 | 校验可信单 Pod/组级需求及授权，形成满足型号、容量、拓扑、成员数量和放置约束的可行执行计划 | SR-01 需求校验；SR-02 资源核算；SR-03 可行性判断 | BG-01 |
-| IR-02 | 并发准入可能重复承诺容量，预约与真实分配之间存在交接空窗 | 建立版本化、可恢复的逻辑预约及一致的分配交接与对账 | SR-04 预约和回收；SR-05 跨阶段关联与对账 | BG-01 |
-| IR-03 | 跨资源域可见性、授权、Queue 配额和节点放置约束可能不一致 | 构建授权且可验证的候选资源域，在同一约束口径下选择、过滤和评分 | SR-06 Liqo 候选；SR-07 资源域选择；SR-08 Queue 约束；SR-09 Filter/Score 一致性 | BG-01 |
-| IR-04 | 队列重试、跨 Namespace 竞争、组成员异步创建与任务规模差异造成持续插队，严格 FIFO 又可能阻塞无冲突资源 | 以可信 Queue 身份及任务组身份建立稳定 FIFO，并统一分时优先级、Reserve Node 及安全 Backfill | SR-10 竞争任务调度 | BG-02 |
+| IR-01 | Runner 启动前无法自然获知后续 Workflow 的真实 NPU 规格，聚合容量也无法证明执行可行性 | 要求 CI 接入侧在 Runner 可调度前提供与 JobAttempt 绑定的可信需求契约，并验证单 Pod/组级型号、容量和拓扑 | SR-01 需求校验；SR-02 资源核算；SR-03 可行性判断 | BG-01 |
+| IR-02 | 并发准入可能重复承诺容量，预测性判断又不能阻止独立 Workflow Scheduler 抢先分配 | 明确 ESTIMATED/COORDINATED 的能力边界，建立可恢复的逻辑预约及真实分配交接和对账 | SR-04 预约和回收；SR-05 跨阶段关联与对账 | BG-01 |
+| IR-03 | Liqo 聚合 VirtualNode 不能证明远端物理拓扑与可调度性，跨资源域授权和 Queue 口径也可能不一致 | 引入可信远端可行性证据，按授权、型号、拓扑、配额与证据时效构建候选域 | SR-06 Liqo 候选；SR-07 资源域选择；SR-08 Queue 约束；SR-09 Filter/Score 一致性 | BG-01 |
+| IR-04 | 跨 Namespace/组成员的到达顺序失真、大任务饥饿、严格 FIFO 阻塞无冲突容量，且 Runner 与 Workflow 优先级可能重复仲裁 | 用可信 Queue/WorkloadGroup 建立稳定 FIFO、Reserve Node 和空间安全 Backfill；PR/Nightly Pod 优先级交由执行端按可信 PriorityClass 处理 | SR-10 竞争任务调度 | BG-02 |
 | IR-05 | 外部状态变化和组件故障可能导致过期决策、难以恢复或无法定位等待原因 | 提供可追踪的重评估、数据一致性、故障恢复与诊断契约 | SR-11 状态变化与重评估；SR-12 运行支撑 | BG-01 / BG-02 |
 
 ### 2.2 DFX 质量属性
@@ -60,7 +62,7 @@
 | QA-04 | 可靠性 | 并发、重复事件、预约失效和资源事实不一致如何处理？ |
 | QA-05 | 可用性 | 控制面或外部依赖不可用时如何安全降级、恢复和重新调度？ |
 | QA-06 | 安全性 | 不可信租户能否通过伪造需求、队列或资源域标签获取额外 NPU？ |
-| QA-07 | 可服务性 | 能否解释每个 Runner 等待原因，并将其关联到后续 Workflow？ |
+| QA-07 | 可服务性 | 能否区分 Runner 准入等待、Workflow 实际等待和组级交接，并衡量提前放行与公平回填的结果？ |
 
 质量属性需以场景、架构控制和可观察结果组成完整契约。性能阈值和故障恢复边界由容量和运行质量设计统一确定，不能以缺少测量数据代替设计要求。
 
@@ -75,7 +77,7 @@
 | AP-03 事实与预测分离 | 区分资源事实、预测性准入、逻辑预约和真实 Workflow 分配 | QA-01/04 |
 | AP-04 授权先于候选 | 资源类型、租户、Queue、Offloading 和需求来源须经可信规则校验 | QA-06 |
 | AP-05 单一状态权威 | 预约应有持久、版本化、可对账的权威数据；本地缓存仅是派生视图 | QA-01/04/05 |
-| AP-06 公平与利用率兼顾 | FIFO、分时优先级和安全 Backfill 统一仲裁，不抢占运行任务 | QA-02/03 |
+| AP-06 公平与利用率兼顾 | Runner 前置 FIFO/Reserve Node/安全 Backfill 和执行端可信 PriorityClass 分工，禁止两套相互矛盾的执行优先级或抢占策略 | QA-02/03 |
 | AP-07 明确失效语义 | 依赖异常按授权、安全性和一致性影响选择等待、拒绝或有限降级 | QA-04/05/06 |
 | AP-08 可诊断的决策 | 决策具有关联 ID、策略版本、数据版本和原因码 | QA-07 |
 
@@ -85,6 +87,9 @@
 flowchart TB
   subgraph EXT["外部系统及资源事实"]
     ARC["ARC Controller / Listener"]
+    INP["CI 需求生产者：前瞻规格"]
+    REM["远端可行性提供者"]
+    LWS["LWS / Workflow Scheduler：Gang与PriorityClass"]
     API[("Kubernetes API")]
     LIQO["Liqo：远端资源与授权"]
     VQ["Volcano：Queue 与 Workflow 调度"]
@@ -95,11 +100,14 @@ flowchart TB
     DEM["需求校验"]
     SNAP["资源事实视图"]
     FEAS["资源域可行性判定"]
-    FAIR["公平/优先级/Backfill 仲裁"]
+    FAIR["FIFO / Reserve Node / Backfill 仲裁"]
     RES["逻辑预约与交接"]
     DIAG["诊断、事件与一致性监视"]
   end
-  ARC -->|"Runner/需求"| API
+  INP -->|"JobAttempt可信需求"| API
+  ARC -->|"Runner/关联"| API
+  REM -->|"远端可行性证据"| API
+  LWS --> API
   DEVICE --> API
   LIQO --> API
   VQ --> API
@@ -130,8 +138,9 @@ flowchart TB
 | 可行性判定 | 为未来 Workflow 计算能满足硬约束的候选执行计划 | 需求、授权候选域、剩余量、拓扑和可信数据版本 | 不通过跨域余量求和宣称 Workflow 一定可运行 |
 | 公平仲裁 | 维护可比较任务排序及预留保护，决定是否轮到当前任务 | 租户/队列策略、任务到达顺序、保留承诺 | 不控制 GitHub Job 接单与跨系统抢占 |
 | 预约与交接 | 对逻辑预约进行有版本约束的竞争仲裁、释放及对账 | 持久化预约记录、Pod UID、Workflow 分配事实 | 不在下游未协同时提供设备硬锁 |
-| Workflow Scheduler | 最终 Workflow Pod 放置及设备分配 | 真实 Workflow Pod、Node 和设备分配 | 不由 Runner 成功绑定所替代 |
 | 诊断与事件适配 | 描述等待、拒绝、重试和交接的原因及证据 | 各决策组件的状态变化 | 不另行形成一套容量权威数据 |
+
+**外部执行权威：** CI 接入侧是 TrustedDemandContract 的生产者，ARC 维护 Runner/Job 生命周期；Workflow Scheduler（含 LWS/Volcano）负责实际 NPU PodGroup 的优先级、Gang、Node 绑定与释放，Device Plugin 负责设备资源事实。其状态仅经受信任的关联协议进入本子系统的证据视图，不能把外部组件写入内部责任链。
 
 ### 3.4 规范化领域对象
 
@@ -139,10 +148,14 @@ flowchart TB
 |---|---|---|
 | Demand | DemandID、Runner UID、namespace、租户、resourceName、count、WorkflowShape、policyVersion | DemandID 唯一标识一项未来 NPU 需求 |
 | WorkflowShape | 单节点或多节点形态、每节点卡数、节点/拓扑约束、集群可达性 | 决定资源是否可被组合，而非只记录总卡数 |
+
+| TrustedDemandContract | JobAttempt、可信消费者类型、工作负载规格/版本、资源型号和数量、WorkflowShape/WorkloadGroup、tenant/queue/allowedDomains、executionPriorityClass、生产者身份、策略版本与有效期 | 在 Runner 可调度之前生成且与 Runner UID 可信绑定；缺失不能推断零 NPU |
 | WorkloadGroup | groupID（含集群、Namespace、工作负载 UID、组实例/代际）、groupSize、成员规格、成员集合/版本、groupPolicy | 将 LWS/PodGroup 的一个明确组实例作为一个准入及公平比较单位；仅在可信来源确定时有效 |
 | ResourceDomain | domainID、clusterID、model、授权范围、物理节点集合或可靠映射、数据版本 | 只在此域具备可信视图时参与候选 |
+
+| RemoteFeasibilityEvidence | remoteClusterID、DemandID、WorkflowShape 摘要、授权/Queue/拓扑版本、结果、有效期、签发主体、可核验物理放置证明 | 可由远端权威在不公开具体 Node 信息的情况下证明完整 WorkflowShape 的可行性；不是占用承诺 |
 | CapacityView | allocatable、committed、eligibleFree、snapshotVersion、freshness | 可供准入的调度容量，不等同实时设备利用率 |
-| CandidatePlan | demandID、domainID、节点/拓扑绑定集合、可行性证据及版本 | 完整的未来 Workflow 放置方案 |
+| CandidatePlan | demandID、domainID、已验证的节点/拓扑绑定集合或远端可核验的完整放置证明、可行性证据与版本 | 单节点及多节点完整 Workflow 计划；远端不要求泄露物理节点明细，但必须证明全部硬约束 |
 | FairnessOrder | fairnessPoolID、tenantID、jobClass、arrivalSequence、PolicyEpoch、deficit、protectionVersion | 同域竞争排序及跨租户服务份额；详见 5.4.1～5.4.2 |
 | FairnessQueue | queueID、tenant/Namespace 授权映射、policyVersion、scope、failureState | 规定可跨 Namespace 比较的身份及作用域；同名字符串不替代资源域与租户授权，见 5.4.1 |
 | ReserveCommitment | protectedDemandID、fairnessPoolID、candidatePlanID、受保护节点向量、protectionVersion、PolicyEpoch、有效性/释放边界 | 队首软保护，非物理锁或已占用卡数；详见 5.4.3～5.4.4 |
@@ -160,7 +173,7 @@ flowchart TB
 | ADR-03 最终执行可行性 | 以 WorkflowShape 在一个被授权且连贯的执行范围内存在有效 CandidatePlan 为准入依据 | 比简单求和保守，但排除资源碎片造成的错误放行 |
 | ADR-04 资源事实各归其主 | Node/设备、远端可见性、Queue 以及 Workflow 绑定事实分别由对应组件提供 | 需要约定数据新鲜度和同一资源不可重复计数 |
 | ADR-05 持久化逻辑预约 | 使用受版本约束且可恢复的预约权威，禁止以进程内 map 作为全局账本 | 增加仲裁读写成本；具体状态转换在 IR-02 定义 |
-| ADR-06 非抢占公平调度 | 同一资源竞争域内采用层次化租户公平、稳定 FIFO、PR/Nightly 分时优先级、Reserve Node 与安全 Backfill；公平版本和预约权威联合仲裁 | 允许空间无冲突回填；借保护容量必须具可信强制运行上限与保护窗口，可能牺牲短期吞吐以兑现承诺 |
+| ADR-06 非抢占公平调度 | Runner 前置准入在物理竞争域内使用层次化租户公平、稳定 FIFO、Reserve Node 和安全 Backfill，并与预约权威版本联合仲裁；执行端 PR/Nightly 优先级由可信 PriorityClass 处理 | 空间无冲突回填为默认；借用保护容量只在可信强制运行上限与保护窗口成立时可选，避免双重优先级排序和抢占运行任务 |
 | ADR-07 跨调度器明确保证级别 | 预测性准入与有下游协调的预约保证是两种不同契约 | 无协调时不能对外承诺设备已锁定 |
 | ADR-08 安全降级 | 授权和核心一致性事实不可信时不得放行；可观测性故障不影响调度判定 | 关键依赖故障会降低可用性，但防止资源越权 |
 | ADR-09 单一有效预约仲裁 | 同一资源竞争域内的状态更新需要版本与代际保护 | 避免多实例同时承诺同一容量；需要恢复和对账路径 |
@@ -170,9 +183,15 @@ flowchart TB
 | ADR-13 组级执行责任归属 | Runner 侧只判断整个 WorkloadGroup 的需求与候选可行性；LWS/PodGroup 与 Workflow Scheduler 负责实际 Gang、成员放置及回滚 | 不在 ARCSync 和下游同时维护独立的 Gang Permit；仅下游明确提供共同协议时才能宣称组级协调保证 |
 | ADR-14 可信共享 FIFO Queue | 用受控配置将 Namespace 映射到队列，和物理 FairnessPool 交叉确定竞争关系；队列及版本不可被任务自声明改变 | Queue 身份无法验证时不得回退为独立 Namespace 队列放行，牺牲局部可用性以保公平和隔离 |
 
+| ADR-15 前瞻需求契约 | CI 接入侧须在 Runner 调度前提供 JobAttempt 绑定的可信完整 NPU 需求；与真实 Workflow 不符时撤销旧承诺并重评估 | 单靠 ARC Runner Pod 的 CPU Requests 无法实现 BG-01；无可信契约的作业不进入受管理的 NPU 预测性准入 |
+| ADR-16 远端可行性证明 | Liqo 负责可见性与 Offloading 授权；远端可信调度/资源事实服务提供完整 WorkflowShape 可行性证明 | 虚拟 Node 聚合卡数不构成可行性；证据缺失时等待，证明可行但无共享预约时最多 ESTIMATED |
+| ADR-17 优先级与 Backfill 责任 | Runner 准入侧管 FIFO/公平保护；PR/Nightly 的实际 Workflow 执行优先级由可信 PriorityClass 和下游 Scheduler 负责，空间 Backfill 为默认安全路径 | 不维护第二套独立的执行优先级/抢占机制；时间 Backfill 仅在可强制执行全生命周期上限且不破坏保护时可选 |
+
 ## 4 NPU 需求与容量准入设计（IR-01、IR-03）
 
 ### 4.1 准入的目标语义
+
+**需求前置条件。** ARC Kubernetes Container Mode 的 Runner 可能先于真实 NPU Workflow Pod 创建，因此无法从尚未出现的 Pod Requests 直接得知资源规格。系统要求一个**可信 CI 需求生产者**（平台作业模板/CI 接入契约，非普通用户 Pod annotation）在 Runner 开始调度之前，按明确的 CI JobAttempt 产出 TrustedDemandContract，并经受控关联层绑定到 Runner UID。仅拥有仓库级默认卡数、Runner 标签或 CPU Requests 不算完整需求证明。没有可用的事前数据通路时，该作业不能声称获得 BG-01 的 NPU 感知准入。
 
 **问题：** 调度对象的资源申请和最终执行负载的要求可能不同；单独检查调度对象能否绑定，不能证明目标 NPU 需求能够满足。
 
@@ -185,7 +204,8 @@ flowchart TB
 - WorkflowShape：单节点或明确的多节点形态，每节点需求、拓扑亲和/反亲和及设备/网络条件。
 - executionScope：允许的本地或远端集群、资源池与授权限制。
 - tenant/queue：用于确定资源归属及配额语义。
-- identity：Runner UID、namespace、Job attempt 关联及策略版本，禁止仅凭名称推导身份。
+- identity：CI Provider JobAttempt、Runner UID、namespace、需求生产者身份、模板版本和策略版本，禁止仅凭名称推导身份。
+- readiness：可信需求必须先于 Runner 进入可调度阶段可被查询，且描述实际 NPU 消费者的单 Pod/PodGroup 规格；规格改变需重新准入。
 
 **输入非法（INVALID_DEMAND）**、**未授权（UNAUTHORIZED）**、**无可行拓扑（INFEASIBLE）**、**暂时无余量（INSUFFICIENT_CAPACITY）**、**资源事实不可信（DATA_UNAVAILABLE）**是不同结果。
 
@@ -209,6 +229,8 @@ Free(n, r, v) = max(0, Allocatable(n,r,v)
 其中 v 表示经过一致性校验的事实版本。公式**仅用于同一事实域内的资源账面估算**；当请求可能受其他独立 Scheduler 消耗且其分配不可见时，不能据此声明已获得强保证。
 
 **资源域判定原则：**
+
+**远端事实边界。** Liqo VirtualNode 的 Allocatable 是远端协商的聚合资源切片，不是物理 NPU Node 的可执行证明。对于远端候选，完整可行性可以由可信远端提供者返回可核验的物理放置证明或版本化 Feasible/NotFeasible 结果（含所核对的 WorkflowShape 摘要及约束）；无需将敏感的每台 Node 清单暴露给本地。这个结果只证明检查时刻可行，不代表已预约；非可信聚合数不能替代证明。
 
 - 本地资源域由可见物理节点构成；每个节点独立检查型号和放置约束。
 - Liqo 远端资源域必须先验证 NamespaceOffloading 授权，再确认远端映射与最终 Workflow 放置语义。一个聚合虚拟节点不应自动被视为一台具有同等卡数的真实物理节点。
@@ -236,6 +258,8 @@ Feasible(D,S,R) ⇔
 **SameCoherentExecutionScope** 并非总要求单个 Node：对于单节点 Workflow，P 必须落在一个满足全部条件的物理节点；对于明确的多节点 Workflow，P 可包含多个节点，但必须满足声明的组调度、网络拓扑和每节点需求，且不能从无协同关系的集群中拼接卡数。
 
 **CapacityFit** 比较该计划中每个节点实际可分配的对应型号卡数，而非只比较集群总和。**QueueQuotaFit** 与 **Authorized** 同时约束本地及远端候选；**FactsFreshAndConsistent** 要求计划中引用的数据具有可核验版本及有效性。
+
+对于远端，由受信任的远端可行性提供者在成员集群真实节点、型号、网络与 Queue 约束上执行同等检查，并返回可验证的完整计划证明，视为 CandidatePlan 的一种可行性证据。仅返回“总共有 16 卡”或不含需求摘要、授权、版本/有效期的裸布尔值，不满足该条件。完整远端证明仍不足以自行产生 COORDINATED：必须另有下游共同预约/撤销协议。
 
 得到有效 P 只是资源可行性结论，不等于公平仲裁已经准许该任务，也不等于另一个 Scheduler 必定在未来兑现分配。
 **组级需求可行性。** 对 WorkloadGroup，P 必须覆盖全部必需成员的每节点 Requests、拓扑/亲和性、Queue 配额和集群范围，并由 Workflow Scheduler 支持对应的 Gang 策略。仅有 `groupSize × 每 Pod NPU` 的集群聚合余量不能证明有合法的全组放置方案；若多个独立 AccountingDomain 无整体原子协议，不声明跨域 Gang 的 COORDINATED 保证。LWS 可按副本、整个 LWS 或角色形成不同组，groupSize 和成员版本必须由真实 LWS/PodGroup 契约确定，而不能从单个 Pod 的自由标签推断。
@@ -294,20 +318,25 @@ ScoreDomain       ⊆ FilterCandidate
 |---|---|
 | 本地和远端都满足完整 WorkflowShape | 按公平策略、授权、策略性偏好和资源效能选取；优先偏好不能改变可行性 |
 | 本地总余量大，但所有单节点都不足 | 对单节点需求不选本地；只有显式可执行的多节点形态可以组合 |
-| 远端虚拟节点空闲量为聚合视图 | 必须获得对应成员真实放置条件，或者按可明确表达的非保证级别处理；不能把汇总卡数当作一台机器 |
+| 远端虚拟节点空闲量为聚合视图 | 只有可信远端提供者确认完整 WorkflowShape 可行时才进入候选；裸聚合量仅触发进一步查询，不可直接形成 ESTIMATED |
 | 本地无授权，远端充足 | 不因容量充足绕过授权 |
 | 远端授权、映射或可达性异常 | 仅在本地独立满足所有要求时选本地；不得把未知远端视为可用 |
 | 任何候选配额不足 | 仅保留配额满足的候选，配额必须以相同租户/Queue 口径应用 |
+
+| 远端提供完整可行性证明但不参加共同预约 | 可输出 ESTIMATED，说明远端真实调度仍可能失败或等待；不宣称设备锁定 |
+| 远端证明过期、签发者不可信或只验证汇总容量 | REMOTE_TOPOLOGY_UNKNOWN / DATA_UNAVAILABLE，等待更新证据；不得按预计可用量默认放行 |
 
 ### 4.6 保证级别与跨 Scheduler 协作边界
 
 | 级别 | 必要条件 | 可对外说明 | 不能承诺 |
 |---|---|---|---|
-| **ESTIMATED** 预测性准入 | 存在基于可信快照的完整 CandidatePlan，且策略允许机会性准入 | 在快照时刻该 Workflow 具备可行资源计划 | NPU 已锁定、Workflow 必然立即运行、不会与其他 Scheduler 竞争 |
-| **COORDINATED** 受协调准入 | 除 ESTIMATED 条件外，下游 Scheduler/分配端确认同一资源域的预约、版本、交接和撤销语义 | 在协议明示的范围和有效期内保留协调承诺 | 跨协议边界或超出有效期后的绝对资源保证 |
+| **ESTIMATED** 预测性准入 | 已有可信前瞻需求与完整 CandidatePlan（含必要远端可行性证明），但下游未参与共同预约 | 在决策事实版本有效时判断该 Workflow 有可行执行路径；可降低明显错误的 Runner 提前启动 | NPU 已锁定、Workflow 将立即运行、不同 Scheduler 不会竞争、后续不会再次排队 |
+| **COORDINATED** 受协调准入 | 除 ESTIMATED 条件外，所有相关分配端共同验证同一资源域、Queue 额度、版本、预约/撤销与交接语义 | 在共同协议限定的资源、执行范围和期限内防止重复承诺并支持真实分配交接 | 全局无失败、外部未参与者的资源竞争、超有效期的无条件立即运行 |
 | **WAIT / REJECT** | 关键事实缺失、权限不通过、不可执行或无剩余量 | 解释等待/拒绝的原因与重评估条件 | 用“已通过 Runner Filter”替代资源保证 |
 
 逻辑预约不会自动升级 ESTIMATED 为 COORDINATED；若 Workflow Scheduler 不参与预约协议，只能保持预测性声明。**只有同一份资源占用与预约仲裁契约被所有相关分配参与者遵守时，才可要求防止跨调度器超卖。**
+
+**基础能力与强保证分界。** ESTIMATED 下 Runner 的逻辑预约只约束**参与本地仲裁的请求**，不限制独立 Workflow Scheduler，因而仍可能在 Workflow 创建后等待 NPU。只有 COORDINATED 路径可将避免“放行后因相同资源被并发分配而再次等待”作为受协议约束的目标；任一级别都不能把 Runner Bind 当作 Workflow 已成功调度。缺少前瞻需求契约则不进入上述两种准入等级，而返回 DEMAND_UNAVAILABLE。
 
 ### 4.7 边界情景与判定
 
@@ -320,7 +349,7 @@ ScoreDomain       ⊆ FilterCandidate
 | TC-C05 | 匹配型号有 8 卡，其他型号还有 8 卡，请求某型号 12 卡 | 不准入 | 不同扩展资源名不可相加 |
 | TC-C06 | 一个节点 8 卡，真实已分配 2 卡，未交接预约 3 卡，请求 4 卡 | 不可立即准入 | 可用量仅 3 卡 |
 | TC-C07 | 同一物理 8 卡在本地视图和虚拟视图各出现一次 | 至多按 8 卡计入 | 必须去重，禁止镜像重复计量 |
-| TC-C08 | Liqo 不允许该 namespace 使用远端 | 远端不参与候选 | 授权优先于容量 |
+| TC-C08 | Liqo 不允许该 namespace 使用远端，即使远端声称有完整可行方案 | 远端不参与候选 | 授权优先于容量和远端证据 |
 | TC-C09 | Queue 上限允许 2 卡，请求 4 卡 | 不得以充足物理容量绕过配额 | Queue 适用范围与真实已占用口径 |
 | TC-C10 | Informer/预约账本数据过期或不可确认 | WAIT DATA_UNAVAILABLE；仅独立可信域可继续 | 不能从未知事实推导容量 |
 | TC-C11 | 两次并发读取同一余量 | 预约须以版本仲裁，失败者重试 | 快照判断不是并发承诺 |
@@ -617,7 +646,7 @@ sequenceDiagram
 
 **问题：** 资源竞争中的重试、任务大小、不同租户及类别优先级，可能导致长期插队或无冲突容量无法利用。
 
-**目标：** 为 **SR-10** 定义可解释的 FIFO 顺序、分时优先级和 Reserve Node 保护，在不破坏保护承诺的前提下允许安全 Backfill。可行性由 CandidatePlan 负责，是否获准竞争容量由公平策略仲裁；不能把单次 Pod 扫描或单机 QueueSort 等同于跨实例、跨租户公平保证。
+**目标：** 为 **SR-10** 定义可解释的 Runner FIFO 顺序、租户公平和 Reserve Node 保护，在不破坏保护承诺的前提下允许安全 Backfill。PR/Nightly 的执行优先级交给真实 Workflow Scheduler 的 PriorityClass；准入侧不能维护第二套相互竞争的执行优先级。可行性由 CandidatePlan 负责，是否获准竞争容量由公平策略仲裁；不能把单次 Pod 扫描或单机 QueueSort 等同于跨实例、跨租户公平保证。
 
 #### 5.4.1 比较范围与队列身份
 
@@ -627,7 +656,7 @@ sequenceDiagram
 
 1. **资源域层**：对同一物理竞争域串行仲裁会冲突的容量承诺；不跨不相干的资源池设立人为全局队首。
 2. **租户层**：可信 tenantID 由平台授权策略产生，按策略配置的租户权重与已兑现 NPU 卡时形成服务份额；持续超额使用的租户在有竞争者时不得永久保持优先。权重不是 Pod 自填标签，默认不构成硬配额。
-3. **租户内任务层**：同一个可比较类别的任务按持久到达顺序 FIFO；跨 PR/Nightly 类别先应用分时优先级与防饥饿规则。跨租户选择采用按有效权重归一化的服务欠账（deficit）优先；欠账相同时，按持久到达顺序和 DemandID 稳定比较。
+3. **租户内任务层**：可比较 Runner 需求按持久到达顺序 FIFO，组级需求只占一个位置；跨租户以有效权重归一化的服务欠账（deficit）优先，欠账相同时按到达顺序和 DemandID 比较。PR/Nightly 的实际执行顺序由 Workflow Pod/PodGroup 已授权的 PriorityClass 与下游 Queue 策略决定；前置准入不重复以时钟对等待中的旧 Job 重排。
 4. **拓扑竞争层**：当不同任务候选集交叉但不相等时，按对相同资源有效的仲裁顺序决定优先者；一个任务可以有多个 CandidatePlan，但只能在一次公平授权中选定一个执行计划和预留集合，不能在多个池里同时占据队首权益。
 
 **排序键**：arrivalSequence 由可信队列接收点持久化单调分配；同一序列冲突时使用 DemandID 稳定打破平局。Pod CreationTimestamp 只可用作辅助证据，不承担跨集群严格排序权威。失败重试或 Scheduler 切换不改变 arrivalSequence；重新提交的独立 Job attempt 使用新键。拒绝越权或永久不可能执行的需求不得阻塞后继。
@@ -635,20 +664,20 @@ sequenceDiagram
 
 **组级 FIFO 身份。** 可信 WorkloadGroup 在同一 Queue 与竞争域内占据一个稳定的 arrivalSequence；Leader/Worker 异步创建不能将后到 PR 插入组内，同组成员也不能相互设置 FIFO 阻塞。两个组到达序列相同，以完整 groupID（含实例代际）一致打破平局，不能分别用成员 UID 排出相互循环的先后关系。组内实际 Pod 的放置顺序由执行端 Gang Scheduler 决定。
 
-#### 5.4.2 PR/Nightly 分时优先级与防饥饿
+#### 5.4.2 PR/Nightly 执行优先级与前置公平边界
 
-定义策略版本 PolicyEpoch，包含 IANA 时区、日/夜优先级时间窗口、权重、平局规则、保护阈值及状态变更时刻。跨夏令时和地区使用明确的时区解释，不使用服务器本地隐式时间。策略切换由平台时间事件触发，并为等待队列生成新裁决版本。
+**一处策略源、两处生效阶段。** 由可信平台作业策略按 IANA 时区和提交时刻判定 PR/Nightly 的执行类别，生成适用于真实 Workflow Pod/PodGroup 的 `priorityClassName`。类别、所选 PriorityClass、策略版本及 JobAttempt 与可信需求契约绑定，创建 Workflow Pod 前由受控接口核验；普通 Pod 标签、未授权 Queue 或 Runner 自填的 PriorityClass 不能升级优先级。
 
-| 场景 | 调度政策 |
+| 决策阶段 | 责任与约束 |
 |---|---|
-| 白天 PR 优先 | 同一竞争域内优先授予 PR 可执行任务；Nightly 继续入队并保留原始到达顺序 |
-| 夜间 Nightly 优先 | 优先授予可执行 Nightly；白天未完成的 PR 不被取消，其有效预留仍受保护 |
-| 窗口切换 | 对**尚未被承诺**的需求按新策略重排；已建立的 ReserveCommitment/HELD 按其有效协议保持或受控迁移 |
-| 连续高优先级任务涌入 | 长期等待的低优先级租户/类别通过策略规定的最大连续跳过次数与保留机会获得候选仲裁权 |
-| 永久不可执行需求 | 返回 INFEASIBLE 并退出该池的有效竞争顺序，不永久封锁后继 |
-| 暂时资源不足 | 保留到达顺序，进入有界保护集合，并在资源释放时重新判断，不以繁忙重试次数修改公平顺序 |
+| **平台分类** | 白天 PR、夜间 Nightly 的优先级映射在 JobAttempt 生成时确定，记录时区和策略版本；优先级变化作用于新提交的 Job，**不通过时钟重写已有 Pod 的 priorityClassName** |
+| **Runner 前置准入** | 维护可信 Queue/WorkloadGroup 的 FIFO、公平保护和可行性判断；引用最终计划中的 PriorityClass 以避免与已保护资源冲突，**不额外实现独立的 PR/Nightly 执行优先级调度器** |
+| **Workflow 实际调度** | Kubernetes/Volcano Scheduler 根据可信 PriorityClass、Queue 及 PodGroup 的实际生效策略选取可运行任务；需保证不通过预抢占已运行 CI 作业提升优先级 |
+| **长期等待保护** | Runner 侧在同一竞争域使用 Reserve Node/公平欠账保证有条件的防饥饿；实际 Workflow 侧须验证优先级、Queue 份额及非抢占策略不会使受保护任务持续无法得到资源 |
 
-**活性保证是条件性的**：在授权和拓扑持续有效、所需资源最终能够释放、后续任务遵守本域仲裁协议、旧任务数及有效跳过上界可控时，受保护需求不会因不断到来的新请求无限次插队。不能把这一性质扩展成“任意资源永远不足时仍能在有限时间完成”。分时优先级不主动抢占运行中的 CI 作业。
+**非抢占约束。** 采用 Kubernetes 非抢占 PriorityClass 时，设定 `preemptionPolicy: Never` 可禁止该类 Pod 主动抢占低优先级 Pod，但**不能保证该 Pod 不被其他更高优先级 Pod 抢占**。受管理资源域还必须确保其他 Scheduler/Volcano 的 `preempt`/`reclaim` 等策略与“不驱逐正在运行的 CI Job”的系统要求相容；否则不能对全域宣称非抢占保证。PodGroup 成员的 PriorityClass 须满足实际 LWS/调度器版本的相容性要求。
+
+**PolicyEpoch 与 FIFO 保持。** PolicyEpoch 记录 Queue 授权、租户公平权重、优先级映射规则和保护版本的有效策略代际，用于新请求的可信分类与预约版本检查，而不表示每到日夜切换就重新排序已有 Runner/Workflow。既有有效 ReserveCommitment/HELD 继续受其原协议保护；更高优先级的新 Workflow 不能突破已承诺容量或偷偷撤销已有保护。此处的活性保证仍有条件：资源最终释放、任务具有合法拓扑且所有相关执行者遵守公平/非抢占边界，不承诺在硬件永远不足时有限等待。
 
 #### 5.4.3 Reserve Node：预留承诺与软保护
 
@@ -662,13 +691,13 @@ Reserve Node 是为当前受保护的未满足需求选择一组具体节点/拓
 2. 保护前先考虑已有已兑现资源、Queue 约束、其他有效预留以及运行任务的不可抢占属性。资源释放时间不可信时不声明确定的时间承诺。
 3. 将 ReserveCommitment 与公平版本写入同一个 AccountingDomain 的受保护决策状态，并让随后申请 HELD 的任务在域级 CAS 时检查该保护版本；避免“公平允许”与“容量写入”之间出现 TOCTOU 竞态。
 4. 保护可因需求取消、失去授权、已满足、拓扑故障或策略明确的受控迁移而释放/重算；不得仅因新高优先级任务到来就悄悄抹除已承诺的保护。
-5. 新的更紧迫任务可竞争**未保护**的容量，也可依明确规则请求保护迁移；迁移必须证明原受保护任务不受损，或明确声明取消旧保证并形成可追溯的策略决策。
+5. 新任务（包括更高执行 PriorityClass 的 Workflow）只可竞争**未保护**的容量；已有效保护的候选不能仅因新任务优先级较高而被改写。保护迁移必须证明原受保护任务的有效性与等待权益不受损，并留下策略版本及原因证据；任何取消需按 5.2 的受控撤销流程处理。
 
 **有界保护**：每域受保护任务数量和预留容量须有可配置上限；优先从有稳定顺序的等待队首选取保护对象；不能因为预留全部节点而让本可并行的任务永久空转。剩余容量可按安全 Backfill 使用。
 
 #### 5.4.4 安全 Backfill 判定
 
-安全回填的目标是提高空闲 NPU 使用，而**不推迟已建立的有效 ReserveCommitment**。与保护对象无资源冲突的空间回填可不依赖任务结束时间；需要借用保护节点资源的时间回填，则必须具备可信且可执行的任务最大运行时间和保护窗口。
+安全回填的目标是提高空闲 NPU 使用，而**不推迟已建立的有效 ReserveCommitment**。**默认仅启用空间安全回填**：与保护对象无资源冲突的空间回填不依赖运行时间估计。时间型回填只是可选的强契约能力，只有可强制执行包括准备、执行、清理和资源释放在内的全生命周期最晚完成时间，并验证保护窗口时才允许借用受保护资源。未获得这种执行端能力时不能按历史耗时放行。
 
 ~~~text
 SafeBackfill(B, P, R, S, V) =
@@ -756,7 +785,7 @@ flowchart TD
 |---|---|---|
 | Fairness Policy 或保护账本不可读取 | 对受影响域返回 FAIRNESS_STATE_UNAVAILABLE，保护现有承诺并等待重评估 | 直接 fail-open 让新任务绕过排序 |
 | 事件重复、顺序错乱 | 使用 arrivalSequence、PolicyEpoch、保护版本幂等处理 | 改写历史顺序或重复占用保护容量 |
-| PR/Nightly 窗口切换 | 对未承诺任务重评估，保留有效旧承诺 | 无记录地收回已有保护 |
+| PR/Nightly PriorityClass 映射窗口切换 | 仅对新 JobAttempt 应用新版优先级映射，旧需求保留到达顺序与已提交保护；必要时复核授权 | 原地重排旧 Runner 队列、修改已有 Pod 的优先级或取消旧保护 |
 | 远端资源失联 | 隔离失联域、重算独立可信域的候选 | 用其他无关域的空闲卡数填补保护承诺 |
 | 运行任务没有可信上限 | 仅在空间不冲突时回填 | 依据平均耗时允许借用保护节点 |
 | 资源域 CAS 冲突 | 刷新域版本、保护状态及 CandidatePlan 重评估 | 许可仍按旧候选继续 Reserve |
@@ -770,8 +799,8 @@ flowchart TD
 | TC-F03 | 旧 8 卡在一节点已有 4 卡运行、4 卡空闲；新 1 卡需借空闲受保护卡，但无可靠运行上限 | 不允许时间回填；保留队首完成所需的 4 卡保护 |
 | TC-F04 | 可信保护窗口还余 60 分钟，新任务可信执行上限加释放裕量为 45 分钟 | 在完整 Node、租户、配额与域级 CAS 均有效时可时间回填 |
 | TC-F05 | 保护窗口 60 分钟，新任务仅历史 P90 为 30 分钟，无可信运行上限 | 禁止将该预测当作安全时间回填证据 |
-| TC-F06 | 白天 PR 优先、夜间 Nightly 优先，切换时队列内已有有效保护 | 新的未承诺任务按新 PolicyEpoch 排序，旧承诺不得被隐式撤销 |
-| TC-F07 | 夜间持续有 Nightly，PR 排队达到保护阈值，第二天仍有新 PR | 按欠账及跳过上界保留等待权利，不能被无限次越过 |
+| TC-F06 | 白天 PR / 夜间 Nightly 的 PriorityClass 策略窗口切换，队列内已有受保护 Job | 新 JobAttempt 采用新映射；已有 Workflow PriorityClass 和 Runner arrivalSequence 不因时钟被重写，旧保护仍有效 |
+| TC-F07 | 夜间持续有高优先级 Nightly，低优先级 PR 因拓扑竞争长期等待 | Runner 侧保护和执行侧 Queue/优先级策略须共同保障有条件的等待权益，不能把 PriorityClass 单独当作防饥饿保证 |
 | TC-F08 | 两个租户竞争相同域，租户 A 权重高且已长期占满资源，B 正在等待 | 按已兑现 NPU 卡时和权重计算服务欠账，不能只以绝对权重长期选 A |
 | TC-F09 | Liqo 同一物理节点出现两个虚拟视图，任务分属不同 Namespace | 候选物理冲突必须进入相同公平与容量仲裁边界 |
 | TC-F10 | 两个任务拓扑约束部分重叠、互不相等 | 只限制真实冲突的可行计划；不按字符串相同或不同机械划池 |
@@ -806,15 +835,15 @@ flowchart TD
 
 | 边界 | 输入及可信来源 | 本子系统的输出与作用 | 责任边界及降级 |
 |---|---|---|---|
-| **ARC Controller / Runner / Hooks** | Runner UID、Namespace、Job attempt 关联、可信 NPU Demand 与实际作业模式 | 需求准入、Runner Pending 原因、关联 DemandID/ReservationID | ARC Listener 决定接单；hooks/Runner 在约定的作业模式下创建 Workflow Pod；无可信前瞻需求时不能声称 NPU 感知排队 |
+| **CI 需求生产者 / ARC Controller / Runner / Hooks** | CI 接入侧提前提供可信 JobAttempt 与完整 NPU 规格；ARC 提供 Runner UID/生命周期，Hooks 创建真实作业 Pod | 需求准入、Runner Pending 原因、关联 DemandID/ReservationID | 不假定 ARC 默认公开未来 Workflow 资源；没有接单前数据通路时不能实现 BG-01 的事前判断，Hooks 创建的规格须再次核对 |
 | **Kubernetes Scheduling Framework** | 待调度 Runner Pod、合法调度 Profile、Runner Node 信息和 Scheduler CycleState | Demand 验证、Workflow 候选证据、Runner 节点过滤/评分、域级预约、绑定前校验、失败回退 | 只能对 Runner 的 schedulerName 所属调度周期直接产生绑定行为；既有通用 Filter 对 Runner 自身的约束仍生效 |
 | **Kubernetes API / Device Plugin** | Node Allocatable、Pod Requests、实际绑定状态、资源版本和可见性 | CapacityView、版本化预约状态、状态变化触发 | 扩展资源的物理权威属于设备插件/成员集群；API 快照不能证明卡上 AI Core 实际利用率 |
-| **Liqo** | Namespace Offloading 授权、被选远端、虚拟节点映射、资源可见性 | 过滤可执行的远端候选域，并说明成员集群的最终物理放置责任 | 远端映射若不包含可核验的物理拓扑，则不可宣称单节点/多节点强可行性 |
+| **Liqo / 远端可行性提供者** | Offloading 授权、VirtualNode 聚合可见性；远端按真实成员节点和 Queue 产生完整 WorkflowShape 可行性证据 | 仅在远端可信、版本与约束可核验时纳入 CandidatePlan | Liqo 聚合视图不等于物理可行；提供者的查询结果不是强预约，不能替代成员集群真实放置 |
 | **Volcano Queue** | 可信任务 Queue 身份、Queue 生效策略、配额/使用量版本和生效范围 | 检查 Queue 约束，形成可追踪配额判断 | capability 是使用上限；deserved/guarantee 含不同份额语义；读取 Queue 对象不是执行配额锁定 |
 | **Workflow Scheduler（Volcano 或其他）** | 真实 Workflow UID、Requests、PodGroup/拓扑、其自身的调度策略 | 消费可验证的预约关联、执行真实放置、提供交接和释放证据 | 未支持共同仲裁和撤销协议时只能 ESTIMATED；本子系统不得把其选择结果写成自身的节点绑定 |
 | **预约权威与 Fairness Policy** | 域级节点向量、PolicyEpoch、protectionVersion、writerEpoch、候选证据 | 原子承诺/回退、受保护公平次序与重评估 | 只约束参与相同协议的执行者；与实际 Node/Pod 分配证据保持可对账 |
 
-**需求存在的前置条件：** ARC Runner 与作业负载可以分成两个 Pod 的路径，必须由可信平台模板或工作流契约提供**与实际作业 Pod 一致的资源规格**，而不是从 Runner Pod 本身的 CPU Requests 猜测。对于不通过容器 hooks 创建独立作业 Pod 的 Workflow，不能机械套用该路径；需要分别确定实际 NPU 消费者及其调度责任。若无法可信地预先获知需求，受 NPU 准入管理的任务应返回 DEMAND_UNAVAILABLE 并保留等待/拒绝语义，不能默认按 0 卡放行。
+**需求存在的前置条件：** 在 ARC Runner 与作业负载分属两个 Pod 的路径，必须由 CI 接入侧**先于 Runner Pod 调度**提供可验证的 JobAttempt 关联与真实 NPU 消费者完整资源规格，而不是由 ARC 默认提供或从 Runner 的 CPU Requests 猜测。Hooks 创建后核实实际 Pod Requests 与前瞻契约一致。其他作业模式按真实 NPU 消费者定义对应契约；没有事前规格的路径不适用于 BG-01，返回 DEMAND_UNAVAILABLE，不能按 0 卡放行。
 
 #### 5.6.2 Runner/Workflow 身份与需求协议
 
@@ -827,9 +856,17 @@ flowchart TD
 | reservationID、generation、writerEpoch、protectionVersion | 预约权威与公平仲裁产生 | 跨阶段交接、幂等更新、故障恢复；所有者身份须核验 |
 | workflowRef（Cluster/Namespace/UID）、allocationEvidenceVersion | 最终 Workflow 调度/Pod 事实提供，经可信关联验证 | Reservation Reconciler；只有证据满足目标资源域和型号才能交接 |
 
+| trustedDemandRef、JobAttempt、producerIdentity、specDigest、expiresAt | CI 需求生产者在 Runner 可调度前创建；关联层对 Runner UID 绑定与校验 | Demand Validation：防止仅依据 Runner CPU 请求、仓库默认值或未认证 annotation 推断 NPU |
+| executionPriorityClass / nonPreemptPolicy | 受控平台 JobClass/时间窗口策略产生，并在真实 Workflow Pod/PodGroup 创建前固定 | Workflow Scheduler：验证 PriorityClass 授权与执行端非抢占策略；Runner 不自建第二套执行优先级 |
+| remoteFeasibilityRef、evidenceVersion、expiresAt | 远端可信可行性提供者基于成员物理事实返回；需绑定 DemandID/WorkflowShape | CandidatePlanner：核验签发者、拓扑/Queue/型号、时效；没有完整证明时不得给出远端可行计划 |
+
 **模式判定**：在 ARC Kubernetes container mode 创建独立作业 Pod 的场景，Runner 资源约束与 Workflow Pod 资源约束分别计算；如无独立作业 Pod 则以真正的 NPU 消费者为准。若作业 Pod 的实际 Requests 大于声明、型号不符或 Node/拓扑约束不同，**不得继承旧预约保证**；返回 WORKFLOW_SPEC_MISMATCH，保留或受控撤销原承诺，再对真实需求重新准入。
 
 **最小关联协议：** Runner/Job 标识 → DemandID → ReservationID → Workflow UID。身份是逻辑契约，不规定传递载体必须是 annotation、CRD 或 RPC；但应保证不可信任务不能伪造有效授权或交接证据。
+
+**需求生产与时序契约：** CI 需求生产者先根据受信任作业模板、项目许可与提交参数生成 `JobAttempt + specDigest + WorkflowShape + producerIdentity`；受控关联层随后在 Runner Pod 参与调度前将该契约关联到真实 Runner UID，并确认该 Pod 只能消费本次 JobAttempt。可以通过可信注入、受保护对象引用或接口传递，但必须具备“先于调度可见、身份可核验、规格有版本”的共同语义。若 CI Provider 只能在 Runner 接单后才暴露真实资源规格，而又无事先声明，NPU 受管理路径返回 DEMAND_UNAVAILABLE；该作业不享受 BG-01 预先准入能力。后续 Hooks 生成的 Workflow 必须提供同一 JobAttempt 和完整真实规格供核对；不允许以 Pod 名称、运行时猜测或自行声明优先级替代授权。
+
+**消费与变更契约：** 同一 JobAttempt 只能绑定预期的 Runner/Workflow 实例和经授权的 Demand generation；多 Pod 任务从可信 LWS/PodGroup 获得组级需求。作业规格、Queue、资源型号、PodGroup 或成员约束变更后，旧 CandidatePlan/预约不得直接继承，新代际须重新准入并依 5.2 对账。数据生产者没有可持续提供完整规格的能力时，应明确该接入路径不支持前瞻 NPU 调度，而非默许零 NPU。
 
 #### 5.6.3 Scheduling Framework 扩展点职责
 
@@ -837,7 +874,7 @@ flowchart TD
 |---|---|---|
 | **QueueSort** | 对同一 Scheduler 进程只配置一个合法队列比较器；多 Profile 必须采用一致的队列排序行为，局部映射稳定公平顺序 | 不假定独立 Scheduler 进程的队列天然同序；不能同时启用多个 QueueSort 实现 |
 | **PreEnqueue（可选）** | 根据可信且已可得的准入/策略结果阻止明显不可进入活动队列的 Runner | 不依赖它完成长期阻塞任务的唯一唤醒；不可把不可信旧缓存变成硬拒绝 |
-| **PreFilter** | 规范化 Runner 需求、准备 Workflow CandidatePlan、读取同版本授权与 Fairness 判定，输出本轮 CycleState | 不能在此直接修改持久预约，亦不应在 Runner CPU 节点上判断 Workflow NPU 是否被物理绑定 |
+| **PreFilter** | 先核验 Runner 调度前可用的 TrustedDemandContract/JobAttempt 与真实消费者需求，再准备 Workflow CandidatePlan、读取同版本授权与 Fairness 判定，输出本轮 CycleState | 无前瞻需求不得按零卡继续；不能在此修改持久预约，也不应在 Runner CPU 节点上判断 Workflow NPU 是否已物理绑定 |
 | **Filter** | 过滤**Runner Pod 自己**不符合 Kubernetes 节点/Pod 约束的节点；校验本轮所选资源域的 Runner 可达/交互限制 | 不把将来 Workflow 的 NPU CandidatePlan 节点硬套成 Runner 的运行节点；不把 Filter 成功等于实际 NPU 分配 |
 | **Score/NormalizeScore** | 在 Runner 合法候选内优化 Runner 节点放置偏好；Workflow 执行域的策略评分由 CandidatePlanner 独立决定 | 不把未满足硬约束的 Node 通过高分重新引入可行集合 |
 | **Reserve** | 对已获公平许可及有效 Workflow CandidatePlan 执行 AccountingDomain 的域级 CAS，生成 HELD 逻辑预约；附域版本、策略与保护版本 | Framework 的本轮 Reserve 不是对另一个 Scheduler 的物理设备保留 |
@@ -852,36 +889,52 @@ flowchart TD
 
 #### 5.6.4 Liqo 与成员集群职责
 
+**问题：** Liqo VirtualNode 汇总远端协商资源额度，不能直接表明成员集群存在符合型号、单节点/多节点拓扑、亲和与 Queue 约束的物理执行计划。若只按虚拟 Node 的聚合 NPU 卡数准入，Runner 可能被提前放行而真实 Workflow 继续排队。
+
+**目标：** Liqo 提供 Offloading 许可与路由，成员集群的可信可行性提供者按完整 WorkflowShape 检查真实物理资源；本地凭有效证据进行前瞻准入，成员集群 Scheduler 独立决定最终物理 Node 和 Gang 绑定。
+
 ~~~mermaid
 sequenceDiagram
-  participant NS as NPU Scheduler / CandidatePlanner
-  participant L as Liqo可见性与Offloading
+  participant NS as Runner NPU Scheduler
+  participant L as Liqo授权/VirtualNode
+  participant RF as 远端可行性提供者
   participant API as 本地Kubernetes API
-  participant VR as 虚拟Node
-  participant MC as 成员集群Scheduler
-  NS->>L: 查询Namespace授权、允许的远端集群
-  L-->>NS: 授权远端集合/策略版本
-  NS->>API: 读取远端映射、资源事实
-  API-->>NS: VirtualNode / 可验证容量证据
-  alt 映射包含完整可信物理执行拓扑
-    NS->>NS: 形成远端CandidatePlan
-  else 仅聚合容量或映射不可信
-    NS-->>API: 不能声明具体物理可执行或强保证
+  participant VR as Liqo VirtualKubelet
+  participant MC as 成员集群Workflow Scheduler
+  NS->>L: 检查Namespace Offloading与远端范围
+  L-->>NS: 已授权远端及虚拟资源映射
+  NS->>RF: CheckFeasibility(DemandID,完整WorkflowShape,约束/版本)
+  alt 完整可行性证据有效
+    RF-->>NS: Feasible + 约束证明/证据版本/有效期
+    NS->>NS: 远端CandidatePlan进入公平及预约仲裁
+  else 仅聚合余量、证据过期或不可验证
+    RF-->>NS: UNKNOWN / INFEASIBLE（附原因）
+    NS-->>API: WAIT / REJECT（按可恢复性分类；不按聚合容量放行）
   end
-  NS->>API: 表达已授权的远端候选域约束（非物理卡绑定）
-  API->>VR: VirtualNode对应Offloading选择
-  VR->>MC: Offloading后的Workflow Pod由远端调度
-  MC->>MC: 按物理Node、拓扑、设备进行最终放置
-  MC-->>API: 真实分配证据供交接
+  Note over NS,MC: 远端检查不等于已绑定或已锁定NPU
+  opt Runner按有效候选完成准入，Hooks后续创建Workflow
+    API->>VR: 已授权的Workflow Pod选择远端VirtualNode
+    VR->>MC: Offloading后的Pod/PodGroup执行约束
+    MC->>MC: 按真实Node/设备/拓扑完成调度
+    MC-->>API: 分配或等待状态和交接证据
+  end
 ~~~
 
-<p align="center"><strong>图 7　Liqo 远端资源选择与实际放置时序</strong></p>
+<p align="center"><strong>图 7　Liqo 远端可行性验证与实际执行时序</strong></p>
 
-**说明：** 本地根据 Offloading 授权确定可用远端资源域，成员集群负责真实 Workflow Pod 的物理节点放置；虚拟节点的聚合容量不等于物理可执行性。
+**说明：** Liqo 决定远端是否允许访问，远端可信提供者核验完整 NPU 规格是否有物理可行路径，成员集群 Scheduler 决定真实节点。只有有效检查证据可以进入前瞻准入；检查不产生物理锁定。
 
-**决策权**：本地 Scheduler + Liqo 只决定是否可以把工作负载提交到**已授权的远端资源域**；成员集群 Scheduler 才有权选择真实 NPU Node。Liqo virtual Node 的聚合容量，不自动等于成员集群中存在单台满足需求的物理机器。
+**远端可行性查询契约（逻辑接口）**：
 
-**一致性要求**：Offloading 授权与虚拟资源映射应使用同一有效策略版本；远端物理 Node 能否被实际分配必须由可信成员事实或参与的下游协议确认。远端集群失联、Offloading 撤销、映射冲突时将该域标记为不可验证并触发重评估，不从“虚拟节点仍存在”推断远端容量仍可用。若只拿到聚合可见性、无法证明满足完整 WorkflowShape，应返回 REMOTE_TOPOLOGY_UNKNOWN / DATA_UNAVAILABLE，并等待成员集群可信拓扑证据；**不得给出 ESTIMATED 准入，更不能给出 COORDINATED 保证**。ESTIMATED 也要求存在符合第 4.3 节的完整 CandidatePlan。
+| 项目 | 责任与最小信息 |
+|---|---|
+| CheckFeasibility 请求 | DemandID、JobAttempt、授权 remoteClusterID、WorkflowShape/WorkloadGroup、资源型号/成员数、网络拓扑/亲和/Queue 硬约束、请求时的策略版本 |
+| 证据生产者 | 经平台信任的远端 Scheduler/资源事实提供者；使用成员集群真实 Node、设备、Pod 分配和 Queue 状态，不能直接从 VirtualNode 汇总推断 |
+| 成功响应 | 所检查需求/规格摘要、Feasible 结果、成员集群/授权/拓扑/Queue 证据版本及有效期、可验证的完整放置证明（可不公开具体 Node 清单）、提供者身份 |
+| 失败响应 | INFEASIBLE（在声明的授权与容量上限下硬约束不可能）；WAIT/INSUFFICIENT_CAPACITY（资源暂时被占用）；REMOTE_TOPOLOGY_UNKNOWN/DATA_UNAVAILABLE（证据不完整或无法核验），分别提供重评估条件 |
+| 强保证升级 | 若下游另接入共同 AccountingDomain 与预约/交接/撤销协议，才能升级 COORDINATED；仅 CheckFeasibility 成功始终最多 ESTIMATED |
+
+**失效及隔离：** 本地核验提供者身份、DemandID/WorkflowShape 摘要、Offloading 授权、Queue/物理域映射、证据有效期和来源代际。远端失联、映射改变或证据过期时禁止用旧结果新建准入，已经确认的预约依 5.2 保守核对；独立且可信的本地资源域可以继续。不同成员集群不可为单集群 Gang 直接拼接卡数；跨集群 Gang 必须单独具备端到端调度和原子承诺协议。
 
 #### 5.6.5 Volcano Queue 与 Workflow Scheduler 协同
 
@@ -894,10 +947,15 @@ sequenceDiagram
 | deserved/guarantee | 按 Volcano 已定义的共享份额/保留语义影响策略，不能当作额外物理 Allocatable | 不把借用或软份额误写成不可撤销的 NPU 锁 |
 | Scheduler 配置 | 明确 enqueue、allocate、reclaim、preempt 与 Queue 插件的策略边界 | 当前设计不允许通过外部抢占打破“不抢占运行任务”的目标 |
 | Workflow Pod/PodGroup | 由真正执行端判定 Gang、Node 选择和作业生命周期 | Runner 预约不等于 Volcano PodGroup 已满足组调度要求 |
+
+| PriorityClass / JobClass | CI 受控策略按 JobAttempt 生成实际 Workflow Pod 的 priorityClassName，LWS/PodGroup 继承兼容的成员优先级 | Runner 不复制执行优先级队列；每个调度器必须核对非抢占与 Queue 策略 |
+| Gang provider 兼容 | Native Workload-Aware Scheduling 和 Volcano PodGroup 是不同执行契约；明确部署版本、feature gate、group granularity 与实际 schedulerName | 不能假定所有 LWS 版本支持 whole-LWS/role/native Gang；以真实 PodGroup 为前瞻准入及交接单位 |
 | 协调保证 | 下游必须接入同一 AccountingDomain 授权、提交、交接、撤销及版本协议 | 没有该协议只能 ESTIMATED；只读取 Queue CR 不能升级 COORDINATED |
 **LWS/Gang 执行端协议。** WorkloadGroup 来源为可信 LWS/PodGroup，至少核对工作负载 UID、Namespace、组实例及代际、所选组级策略（副本/整体/角色）、有效成员数量、各成员 Requests/拓扑、Queue/priorityClass、实际 schedulerName。标准 LWS 的组级对象可能是原生 PodGroup 或 Volcano PodGroup，必须以部署版本支持的真实 API 为准，不能把 `leaderworkerset.sigs.k8s.io/group-key` 和 `leaderworkerset.sigs.k8s.io/size` 两个 Pod 元数据字段单独当作完整的组调度协议。组身份与成员资格应由控制器/准入侧核验，避免使用者伪造 size 或借用别的组。
 
 **单一 Gang 执行权威。** 目标设计优先复用 LWS 配套的原生/Volcano Gang 功能：Runner 侧的组级 CandidatePlan 只是前置资源可行性与公平准入；执行端负责将成员形成 PodGroup、约束其整组绑定、处理 timeout/retry/rollback 并给出整体状态。成员集群负责真实 Node 和设备分配。若 Workflow Scheduler 不支持 Gang，则不能因 ARCSync 预测通过而声称整组可执行；若它支持 Gang，也不得再由 ARCSync 并行维护另一套互不协调的 Workflow Permit 计数器。原生/Volcano 接口按实际兼容版本选择，不能假定所有 LWS 部署同时支持两者。
+
+**Provider 选择与组粒度。** Native LWS 的 Whole-LWS、Replica 和 Role 分组语义与 Volcano provider 的实际 PodGroup 粒度必须按目标版本分别核验。尤其不能由 `replicas × size` 机械构造一个全局 Gang，也不能把 `LeaderCreated` 与 `LeaderReady` 当作相同的整组等待策略。受管理的 NPU CI 多机任务应在可信需求中明确预期 PodGroup 粒度、完整必需成员及其相容的 PriorityClass；若版本或 Scheduler 不支持该粒度，应返回不支持或等待可信契约，而非用 Runner Permit 假装实现同一能力。
 
 **全组确认与失败恢复。** 执行端至少反馈 groupID/generation、预期成员数、已确认成员 UID/Node/Requests、组级条件、不可调度原因及释放证据。只确认若干成员不代表整个组成功；超时、成员重建、PodGroup 变更和调度器故障需要有界重评估和幂等回滚。跨独立 AccountingDomain 没有共享原子协议时保持 ESTIMATED 或按未协调状态等待，不能以若干局部 Permit 成功升级 COORDINATED。
 
@@ -907,20 +965,21 @@ sequenceDiagram
 
 | 触发边界 | 错误/等待原因 | 目标响应与再评估条件 | 能否保留既有承诺 |
 |---|---|---|---|
-| ARC 缺少可信的前瞻 NPU 需求 | DEMAND_UNAVAILABLE | 不按 0 卡放行；需求补齐或作业模式明确后重评估 | 已合法建立的预约维持其协议 |
+| ARC 接单后才能知道真实需求、TrustedDemandContract 缺失/未绑定正确 JobAttempt | DEMAND_UNAVAILABLE | 不按 0 卡放行；由 CI 需求生产者补充签发并在 Runner 调度前关联，或者明确该作业路径不适用 BG-01 | 已合法建立的预约维持其协议 |
 | Runner/Workflow 规格不一致 | WORKFLOW_SPEC_MISMATCH | 现有预约进入受控撤销/隔离，对真实规格重新做授权准入 | 不得沿用不匹配的旧承诺 |
 | Framework 资源不足/可行集为空 | INSUFFICIENT_CAPACITY / INFEASIBLE | 分别随资源释放或规格/授权变化重评估；拒绝永久不可能的规格 | 无新承诺 |
 | Framework Reserve CAS 冲突 | RESERVATION_CONFLICT | 获取新资源/策略/保护版本后重算，不循环复用旧 CycleState | 已由其他任务取得的承诺有效 |
 | Kubernetes API 关键版本/账本不可用 | RESERVATION_STATE_UNAVAILABLE | 停止受影响域的 COORDINATED 提交；API 与账本恢复后对账 | 未证实可释放的承诺维持保护 |
 | Liqo Offloading 取消或远端不可达 | REMOTE_DOMAIN_UNAVAILABLE | 移除失效候选，独立本地域如可信可重算；远端恢复后重评估 | 远端在途预约进入保守核对 |
+| 远端可行性查询无可信回应、证据版本/需求摘要不符 | REMOTE_TOPOLOGY_UNKNOWN / DATA_UNAVAILABLE | 不用 VirtualNode 汇总量替代证明；获取新成员事实或有效签发证据后重评估 | 旧预约按权威证据保守持有 |
 | Liqo 远端只暴露汇总、缺失物理映射 | REMOTE_TOPOLOGY_UNKNOWN | 不宣称单节点可行或强保证；等待可信物理拓扑证据 | 不新增无法兑现的强预约 |
 | Volcano Queue 状态未知或配额不可信 | QUEUE_STATE_UNAVAILABLE | 受影响 Queue 不绕过配额；Queue 数据/策略恢复后重评估 | 已获有效授权的承诺须有明确撤销机制 |
 | Volcano Queue 已达硬上限 | QUEUE_QUOTA_EXCEEDED | 等待配额释放或授权的 Queue 变更 | 不以其它 Queue 闲置额度自动冒用 |
-| Fairness Policy/保护版本变化 | FAIRNESS_STATE_UNAVAILABLE / FAIRNESS_WAIT | 按新 PolicyEpoch、protectionVersion 重算 | 不可悄悄取消已有有效保护 |
+| Fairness Policy/保护版本变化 | FAIRNESS_STATE_UNAVAILABLE / FAIRNESS_WAIT | 重新核验可信 Queue/保护版本；新的 PR/Nightly 类别映射只用于新 JobAttempt，不凭时钟重排已有 Runner | 不可悄悄取消已有有效保护 |
 | Workflow Scheduler 未确认预约协议 | DOWNSTREAM_UNCOORDINATED | 只声明 ESTIMATED，并向调用方说明仍可能有 Workflow Pending | 不宣称物理排他 |
 | Workflow 绑定/释放证据缺失或矛盾 | RESERVATION_HANDOFF_MISMATCH | 转 UNCERTAIN、保守计量并对账，证据更新后解除 | 不提前释放逻辑预约 |
 
-**重评估信号**：Pod/Node 资源变化、Runner/Workflow 状态变化、有效预约释放、Offloading 授权变化、Queue 状态变化、公平策略窗口切换，以及明确的账本恢复事件。Kubernetes Framework 对原生 Pod/Node 事件可以使用 EnqueueExtension/QueueingHint；Liqo/Volcano 自定义对象变化须经**显式事件桥接到被调度 Runner 的可重评估状态**，或通过有界周期核对补偿。不得声称自定义 CRD 自动具备通用 QueueingHint 能力。
+**重评估信号**：可信需求契约到达/修订、Pod/Node 资源变化、Runner/Workflow 状态变化、有效预约释放、Offloading 授权变化、成员集群可行性证据更新或失效、Queue 状态变化、受控 PriorityClass 策略变化，以及明确的账本恢复事件。Kubernetes Framework 对原生 Pod/Node 事件可以使用 EnqueueExtension/QueueingHint；Liqo/Volcano 自定义对象变化须经**显式事件桥接到被调度 Runner 的可重评估状态**，或通过有界周期核对补偿。不得声称自定义 CRD 自动具备通用 QueueingHint 能力。
 
 **故障恢复原则**：重复事件保持幂等；关键事实过期则等待；与失败域无关的资源域可继续；对疑似已占用的 NPU 容量保守保护；诊断/指标输出不可用不影响授权和容量正确性。重试采用按原因分类的事件触发与有界退避，避免控制面故障触发全池高频扫描。
 
@@ -962,6 +1021,8 @@ sequenceDiagram
 
 **保证范围**：PreFilter/Filter/Score 不产生资源排他；Runner Bind 不代表下游 Workflow 成功启动；只有预约权威和最终资源分配端共同遵守契约时才能声明 COORDINATED。成员集群对物理 NPU Node 的选择、真实设备分配与故障处理是其明确的责任，不能由 Liqo 虚拟节点或 Runner Scheduler 代行。
 
+**阶段正确性：** 图中逻辑预约先于 Runner Bind，但在 ESTIMATED 路径，本地持有只约束参与本地仲裁的 Runner，不代表下游独立 Scheduler 承认预约。成员集群若未明确接入共享协议，后续 Workflow Pending 仍可能发生；不能从图中 `HELD` 或 `ALLOCATED` 的状态箭头推导没有竞争窗口。仅在 COORDINATED 路径，双方确认预约权威与交接/撤销状态后，才在限定作用域内避免重复承诺。
+
 #### 5.6.8 一致性不变量与设计场景
 
 **INV-I01**：ARC 需求声明与真实 Workflow 消费者必须关联同一个 Job attempt 和资源规格；缺少可信来源不允许按零卡假定。
@@ -980,18 +1041,18 @@ sequenceDiagram
 
 | TC | 架构场景 | 可判定的设计结论 |
 |---|---|---|
-| TC-I01 | ARC Runner Pod 不请求 NPU，但可信规格表明后续 Workflow 请求 8 卡 | PreFilter 基于 WorkflowShape 准入；Runner 的 CPU Node 与未来 NPU Node 分别过滤 |
-| TC-I02 | Container Mode 的 Workflow 没有可信 NPU 需求声明 | DEMAND_UNAVAILABLE；不以 0 卡默许 Runner 占位 |
+| TC-I01 | Runner Pod 只申请 CPU，但 CI 接入侧在调度前向 JobAttempt 绑定了可信的 Workflow 8 卡需求 | PreFilter 依据 TrustedDemandContract 规划 NPU；Runner CPU Node 与未来 NPU Node 分别过滤 |
+| TC-I02 | Container Mode 中只有 Runner CPU Requests，无法在接单前取得可信 NPU 需求 | DEMAND_UNAVAILABLE；不得猜测 0 卡，明确该 CI 接入路径不具备前瞻准入资格 |
 | TC-I03 | Runner 调度成功而 Workflow 使用另一 schedulerName | 仍可 Pending；未接共享仲裁时只报告 ESTIMATED |
 | TC-I04 | Framework 的 Runner Node Filter 与 Workflow CandidatePlan 拥有不同 NodeSelector | 两者各按自身约束检查，不合并为一个 NodeSelector |
 | TC-I05 | Reserve 成功但 Bind 失败，Unreserve 重复或未到达 | 由持久状态受控撤销/对账；不因回调丢失泄漏或误释放 |
-| TC-I06 | Liqo 虚拟节点仅提供聚合余量，但映射到的物理节点均不满足完整单节点需求 | 不以虚拟聚合量宣称单节点可执行，须验证成员节点放置条件 |
-| TC-I07 | Liqo Offloading 撤销而 Pod/Node 缓存尚未刷新 | 停止受影响域的新承诺并重核授权；不继续沿用旧候选 |
+| TC-I06 | Liqo 虚拟节点聚合 16 卡，但实际两台物理节点各只有 8 卡，单节点需求 12 卡 | 仅聚合值不能放行；远端完整可行性证明无法成立则 WAIT/INFEASIBLE，依真实约束分类 |
+| TC-I07 | Liqo Offloading 撤销或成员集群可行性证据到期，而本地缓存仍显示虚拟 NPU 余量 | 停止受影响域新的远端准入，等待新授权/证据；已提交预约进入受控核对 |
 | TC-I08 | Volcano Queue capability 仅余 2 卡而资源域物理还剩 8 卡，任务需 4 卡 | 因 Queue 额度不足等待，不借用未授权的 Queue 份额 |
 | TC-I09 | Volcano Queue 有 deserved 与 guarantee，但其策略插件不一致或版本未知 | QUEUE_STATE_UNAVAILABLE；不能把不同份额语义都视为硬上限或设备锁 |
 | TC-I10 | 公平保护在 Reserve 与 PreBind 之间发生变化 | 绑定前复核保护/预约版本；协议不再有效时受控撤销并重排 |
 | TC-I11 | 账本故障，但 Node 空闲且 Score 值很高 | 停止 COORDINATED，不能由 Score 绕过权威预约 |
-| TC-I12 | Workflow Scheduler 拒绝或不支持接入协议 | 不升级为 COORDINATED；如路径允许预测性放行须明确残余风险 |
+| TC-I12 | 远端已提供完整 WorkflowShape 可行性证明，但独立 Workflow Scheduler 不接受共享预约 | 最多 ESTIMATED；Runner 可被预测性放行，但仍可能产生下游 NPU Pending，必须保留保证级别与原因 |
 | TC-I13 | Liqo/Volcano CR 更新，但没有关联的原生 Pod/Node 事件 | 必须有桥接或有界周期重评估，不可依赖不存在的自动唤醒 |
 | TC-I14 | 应用的 PostFilter 具备可抢占行为，而本子系统目标不抢占 | 相应调度路径不允许通过抢占来满足 Queue/Reserve Node 的资源承诺 |
 | TC-I15 | LWS 的组级策略为每副本 PodGroup，Runner 提前按整个 LWS 总容量判断 | 应按真实 PodGroup 粒度和成员要求形成需求，不能错误冻结整个 LWS 的容量 |
@@ -1111,6 +1172,8 @@ sequenceDiagram
 | ReevaluationLatency | 已接收权威资源或策略变化后，相关可执行队首再次获得判定的时间 | 不计入外部尚未传达事件的时间 |
 | DecisionWork / CASConflictRate | 决策访问的 Node、Queue、预约索引数量及 CAS 冲突比率 | 衡量是否随全局 Pod/Queue 规模线性退化 |
 
+| RemoteFeasibilityLatency | 可信远端可行性请求到有效证据或失败的往返时间；按远端域、原因族分类 | 单独计量外部交互，不误算为本地 CandidatePlanner 计算开销 |
+
 **统计窗口：固定连续 5 分钟。** 每个有效窗口使用 P50/P95/P99、吞吐与样本量，正常竞争和外部故障分开统计；没有样本不能认定达标。诊断使用低基数资源域/任务类型维度，DemandID、Runner UID 不作为高基数时序标签（见 6.4）。
 
 #### 6.2.2 规划容量包络和性能预算
@@ -1128,6 +1191,8 @@ sequenceDiagram
 | PB-07 候选搜索 | 一次 CandidatePlan 规划计算预算 ≤100 ms | 无法形成结论时返回不确定等待，而非误报不可执行 |
 
 这些预算是明确、可修订的架构约束。必须同时满足正确性与公平不变量。超过 S1 包络应进行容量分区或明确报告超出设计容量，不能隐式降低保证级别。端到端 CI 等待还包括真实 NPU 资源占用和外部 CI Provider 时间，不能从 PB-03 推断 CI Job 只需 1 s 排队。
+
+远端可行性证据可按 Demand 摘要、授权域、Queue/拓扑版本及有效期缓存或异步更新；不在 Runner 的每次 PreFilter 中同步扫描远端全部 Node。**PB-03 的 1 s 预算只适用于所需证据已有效的正常准入请求**，如果尚须远端查询，则进入可重评估等待，远端查询延迟单独计量，不用旧证据伪装满足该预算。
 
 #### 6.2.3 关键路径与复杂度
 
@@ -1209,7 +1274,7 @@ sequenceDiagram
 | TC-P09 | 多节点组合求解超过 100 ms | 返回 FEASIBILITY_BUDGET_EXCEEDED；不伪造 INFEASIBLE |
 | TC-P10 | API 返回 429、CAS 冲突激增 | 有界重试/退避，保持公平位置与有效保护 |
 | TC-P11 | 10,000 条事件只影响一个域 | 合并事件、只唤醒受影响的可执行队首 |
-| TC-P12 | PR/Nightly 时间窗切换且 Q 高 | 保护版本仍受 CAS 约束，事件不会全池失控 |
+| TC-P12 | PR/Nightly 新 Job 分类窗口切换且等待队列 Q 高 | 仅新 JobAttempt 接受新 PriorityClass 映射；现有 Runner 无全队重排，已有保护继续受 CAS 约束 |
 | TC-P13 | 两个 Liqo 虚拟 Node 映射相同物理卡 | 分区去重，容量不会因虚拟视图数量增加 |
 | TC-P14 | 资源事实过期、但性能预算即将超时 | 不为达到 PB 目标使用旧事实提升保证 |
 
@@ -1359,7 +1424,15 @@ D2 只适用于**下游尚不共享协议、但授权与可行性事实仍可独
 | AllocatedNPUCardHours | 由可信 Pod/设备分配事实核算的卡时 | 不是 AI Core 计算利用率 |
 | ProcessActiveNPUCardHours | NPU 上有进程运行的卡时，须由设备/进程监控直接提供 | 本调度器不从 Pod Requests 或预约推断 |
 
+| PrematureRunnerAdmissionRate | 在可关联且有下游原因证据的样本中，Runner 已获准入但 Workflow 仍因 NPU 容量/拓扑/Queue 而 Pending 的 JobAttempt 数 / 有效 Runner 已准入 JobAttempt 数 | 分 ESTIMATED/COORDINATED 报告；无下游原因证据标 UNKNOWN 并给出覆盖率，不得视为 0 |
+| RemoteFeasibilityEvidenceCoverage | 远端候选中具有可信、完整且未过期可行性证明的 Demand 数 / 全部需要远端判断的 Demand 数 | 区分无授权、证据过期、远端不可达和永久硬约束不满足 |
+| ProtectedHeadWaitAge | 当前仍等待且有有效 ReserveCommitment 的最老需求自首获保护以来的等待时长 | 仅同一实际竞争域可比较，按等待原因族聚合，不泄露跨租户身份 |
+| SpatialBackfillAllocatedCardHours | 在未侵占任何有效保护向量的条件下被空间 Backfill 放行并实际分配的 NPU 卡时 | 只反映回填工作量，不自动等于相对于反事实基线的净增利用率 |
+| GroupHandoffCompletionRate | 需整组交接的 WorkloadGroup 中，在有效组级协议内确认所有必需成员绑定并完成交接的组数 / 可观察且已进入交接阶段的组数 | 按组代际计，部分成功/超时/未知证据分别记录，不以首成员成功替代整个组 |
+
 每个等待时间区间有唯一的**主原因**。Runner/Workflow 阶段可按时间拆分，但交叠区间不得简单累加。外部 CI Provider 或 Workflow Scheduler 未提供阶段证据时，仅报告本系统可观察范围内的时间与覆盖率，不能推断 GitHub Job 端到端等待。
+
+**BG 验证口径：** BG-01 观察 PrematureRunnerAdmissionRate 与远端证据覆盖率，并按是否具备共同预约协议分组；BG-02 观察 ProtectedHeadWaitAge、同竞争域等待分布和 SpatialBackfillAllocatedCardHours，持续显示 PR/Nightly 执行端真实 PriorityClass。跨时间对比必须控制项目、卡型、需求规模与资源供给变化，未建立可比基线时只陈述统计值，不直接宣称性能改善。
 
 #### 6.4.3 原因码与证据门槛
 
@@ -1399,9 +1472,9 @@ PB-01～PB-07 的决策耗时和 RA-01～RA-06 的可靠性事件以**5 分钟�
 
 | TC | 设计场景 | 可判定结论 |
 |---|---|---|
-| TC-O01 | Runner 被 Queue 配额阻止，物理 NPU 仍空闲 | 记录 QUEUE_QUOTA_EXCEEDED，不报资源不可执行 |
+| TC-O01 | Runner 被 Queue 配额阻止，物理 NPU 仍空闲 | 记录 QUEUE_QUOTA_EXCEEDED，不报物理 NPU 容量不可执行；不计为提前放行 |
 | TC-O02 | 受保护队首阻止后继 Backfill | 记录 FAIRNESS_WAIT 与保护版本，不泄露别人身份 |
-| TC-O03 | Workflow 被独立 Scheduler 排队且无其内部信号 | 下游原因 UNKNOWN，不猜测 Volcano 内部状态 |
+| TC-O03 | ESTIMATED 下 Runner 已绑定，Workflow 仍被独立 Scheduler 排队且无下游原因信号 | 下游原因 UNKNOWN，提前放行率分母标注覆盖率，不猜测 Volcano 内部容量原因 |
 | TC-O04 | Workflow 分配可见但交接事件缺失 | 以可信分配证据对账，保留 EVENT_GAP |
 | TC-O05 | 两 Namespace 有同名 Runner | 不合并不同 UID/DemandID |
 | TC-O06 | 逻辑预约 8 卡、设备真实分配 8 卡尚未完成交接 | 分开计量，不宣称实际消耗 16 卡 |
@@ -1409,7 +1482,7 @@ PB-01～PB-07 的决策耗时和 RA-01～RA-06 的可靠性事件以**5 分钟�
 | TC-O08 | API 429 造成决策等待 | 记录 API 依赖原因，不误报 NPU 容量不足 |
 | TC-O09 | GitHub 接单时间不可获取 | 不虚构 Job 总排队时间，仍能计算 RunnerQueueWait |
 | TC-O10 | 大量 Workflow 缺少 UID 关联 | 关联覆盖率下降，不凭名称补全 |
-| TC-O11 | PR/Nightly 分时窗口发生切换 | 诊断关联 PolicyEpoch 与等待原因 |
+| TC-O11 | PR/Nightly PriorityClass 映射窗口发生切换 | 记录新 JobAttempt 的策略版本与实际执行 PriorityClass；旧 Job 的到达顺序及原因不因时间变化改写 |
 | TC-O12 | 预约超时但分配事实未知 | 状态为 UNCERTAIN，不能输出已释放的结论 |
 | TC-O13 | Runner 已通过组级可行性判断，但执行端 PodGroup 仍等待成员/拓扑 | 独立显示 RUNNER_ADMITTED 与 GROUP_WAIT/原因、groupID/generation 和执行端来源，不误报 NPU 已分配 |
 
@@ -1427,7 +1500,7 @@ PB-01～PB-07 的决策耗时和 RA-01～RA-06 的可靠性事件以**5 分钟�
 | FM-04 | Reserve 后崩溃，Runner 状态未知而预约悬挂 | M | 持久状态与对账，禁止 TTL 直接释放 | TC-R04/R05、TC-A01 | 下游一直不可查询时部分容量持续隔离 |
 | FM-05 | Workflow 交接前释放逻辑预约 | H | UID/Node/Requests 可信证据、无交接空窗 | TC-R06/R10、TC-O06 | 分配事实滞后会导致短期保守双计 |
 | FM-06 | 旧 Scheduler 故障转移后继续写入 | H | writerEpoch + CAS 与恢复屏障 | TC-R08、TC-A02 | API 无法提供权威写入时强预约暂不可用 |
-| FM-07 | PR/Nightly 策略切换破坏既有队首保护 | M | arrivalSequence、PolicyEpoch、protectionVersion | TC-F06/F07/F13 | 物理容量长期不足时不保证有限等待 |
+| FM-07 | PR/Nightly PriorityClass 映射与 Runner 队首保护各自变化，产生顺序冲突 | M | 可信 JobAttempt 分类、执行端 PriorityClass 与 Runner 保护代际分离 | TC-F06/F07/F13 | 依赖下游 Queue/优先级策略配合才能避免长时间饥饿 |
 | FM-08 | Backfill 根据历史运行 P90 误判释放时间 | M | 空间回填优先，时间回填强制时长上限 | TC-F03/F05/F14 | 最坏清理和传播时间必须纳入安全裕量 |
 | FM-09 | 不可信 PR 伪造 Queue/规格/优先级 | H | 授权策略、可信身份、最小权限 | TC-S01/S02/S07 | 上游可信身份服务故障会阻止新强授权 |
 | FM-10 | Volcano capability/deserved/guarantee 混用 | H | 按 Queue 策略和作用域核验硬额度 | TC-I08/I09、TC-A05 | 不支持共享配额协议时无法跨域强承诺 |
@@ -1446,18 +1519,18 @@ PB-01～PB-07 的决策耗时和 RA-01～RA-06 的可靠性事件以**5 分钟�
 
 | SR | 主要设计 | ADR | QA | 设计证据 |
 |---|---|---|---|---|
-| SR-01 可信需求 | 4.1、5.1、5.6.2、6.1 | 02、10、13 | 01、06 | INV-S01～S04；TC-C10、TC-S01～S04 |
+| SR-01 可信需求 | 4.1、5.1、5.6.2、6.1 | 02、10、13、15 | 01、06 | INV-S01～S04；TC-C10、TC-S01～S04 |
 | SR-02 容量计量 | 4.2、4.7、5.1、5.2 | 03、04、05 | 01、04 | INV-C01～C06、INV-R02/R03；TC-C01～C09、TC-R01 |
-| SR-03 可执行性 | 4.3～4.8、5.1、5.6.5、6.2.3 | 03、07、12、13 | 01、03 | TC-C01～C14、TC-I01/I03、TC-P09 |
+| SR-03 可执行性 | 4.3～4.8、5.1、5.6.4～5.6.5、6.2.3 | 03、07、12、13、16 | 01、03 | TC-C01～C14、TC-I01/I03、TC-P09 |
 | SR-04 预约 | 3.4、5.2、6.2.4、6.3 | 05、09、12、13 | 01、04、05 | INV-R01～R06、INV-A01～A06；TC-R01～R14、TC-A01～A16 |
 | SR-05 交接 | 5.2.3、5.2.5～5.2.8、6.4 | 05、07、11、13 | 01、04、07 | TC-R04～R12、TC-O03～O06 |
-| SR-06 Liqo | 4.2、4.5、5.3、5.6.4 | 02、04 | 01、06 | INV-I03；TC-C07/C08、TC-I06/I07 |
+| SR-06 Liqo | 4.2、4.5、5.3、5.6.4 | 02、04、16 | 01、06 | INV-I03；TC-C07/C08、TC-I06/I07 |
 | SR-07 资源域 | 4.3～4.7、5.3、5.6.4 | 03、04、07 | 01、03 | TC-C01～C04、TC-I04/I06 |
-| SR-08 Queue | 4.5、5.3、5.6.5、6.1 | 04、10 | 01、06 | INV-I04、INV-S01；TC-C09、TC-I08/I09、TC-S02 |
+| SR-08 Queue | 4.5、5.3、5.6.5、6.1 | 04、10、14、17 | 01、06 | INV-I04、INV-S01；TC-C09、TC-I08/I09、TC-S02 |
 | SR-09 Filter/Score | 4.4、5.3、5.6.3 | 01、03 | 01、03 | INV-I02；TC-C04、TC-I01～I05 |
-| SR-10 公平/Backfill | 5.4、6.2 | 05、06、12、13、14 | 02、03、04 | INV-F01～F08；TC-F01～F18、TC-P06/P12 |
-| SR-11 事件 | 5.5、5.6.6、6.2.5、6.3、6.4 | 08、11、12、14 | 03～05、07 | INV-A06、INV-O06；TC-I13、TC-A07、TC-O04 |
-| SR-12 运行诊断 | 5.5、5.6、6.1～6.4 | 07～14 | 04～07 | PB-01～PB-07、RA-01～RA-06；TC-A01～A16、TC-S01～S14、TC-O01～O13 |
+| SR-10 公平/Backfill | 5.4、5.6.5、6.2 | 05、06、12、13、14、17 | 02、03、04 | INV-F01～F08；TC-F01～F18、TC-P06/P12 |
+| SR-11 事件 | 5.5、5.6.6、6.2.5、6.3、6.4 | 08、11、12、14～16 | 03～05、07 | INV-A06、INV-O06；TC-I13、TC-A07、TC-O04 |
+| SR-12 运行诊断 | 5.5、5.6、6.1～6.4 | 07～17 | 04～07 | PB-01～PB-07、RA-01～RA-06；TC-A01～A16、TC-S01～S14、TC-O01～O13 |
 
 表中两位数字是 ADR-XX、QA-XX 的简写，定义分别见 3.5 和 2.2。每个 SR 有设计章节、关键决策、质量属性及可判断场景。
 
@@ -1466,12 +1539,12 @@ PB-01～PB-07 的决策耗时和 RA-01～RA-06 的可靠性事件以**5 分钟�
 | QA | 目标设计关注点 | 不变量及验收入口 |
 |---|---|---|
 | QA-01 正确性 | 物理拓扑可行、容量 CAS、交接无空窗 | INV-C/R/I、TC-C/R/I；FM-01～03、05 |
-| QA-02 公平性 | 共享 Queue、组级 FIFO、PR/Nightly、Reserve Node 与安全 Backfill | INV-F、TC-F01～F18；FM-07～08 |
-| QA-03 性能与容量 | S1、PB-01～PB-07、有界索引和仲裁 | INV-P、TC-P01～P14；FM-12 |
+| QA-02 公平性 | 共享 Queue、组级 FIFO、Runner Reserve Node/安全 Backfill 与执行端可信 PriorityClass 的责任分离 | INV-F、TC-F01～F18；FM-07～08 |
+| QA-03 性能与容量 | S1、PB-01～PB-07、远端证据等待分账、有界索引和仲裁 | INV-P、TC-P01～P14；FM-12 |
 | QA-04 可靠性 | 代际隔离、幂等、对账和恢复 | INV-R/A、TC-R/A；FM-03～06、11 |
 | QA-05 可用性 | 局部降级 D0～D4、RA-01～RA-06 | INV-A、TC-A01～A16；FM-04、06、11 |
 | QA-06 安全性 | 可信 Queue/Group 授权、最小权限、跨租户隔离 | INV-S、TC-S01～S14；FM-09～10、13 |
-| QA-07 可服务性 | 原因码、关联 UID、等待及卡时口径、覆盖率 | INV-O、TC-O01～O13；FM-11、13～14 |
+| QA-07 可服务性 | 原因码、UID 关联、提前放行率、远端证据覆盖率、组交接与回填卡时 | INV-O、TC-O01～O13；FM-11、13～14 |
 
 ### 7.3 场景索引与架构验收准则
 
@@ -1494,13 +1567,17 @@ PB-01～PB-07 的决策耗时和 RA-01～RA-06 的可靠性事件以**5 分钟�
 
 本设计只保证目标架构定义的需求校验、可执行性判定、资源域公平、逻辑预约和跨阶段交接**契约**。若下游未采用共同的资源仲裁、配额与撤销协议，则只能声明 ESTIMATED，不能宣称物理 NPU 强预留。多节点跨独立 AccountingDomain 的整体强预约需要额外原子协议，未定义之前不得以多个局部 HELD 代替整体成功。
 
-**非目标**：不设计 ARC Listener 接单机制、不代替成员集群的真实 NPU Node 调度、不定义运行时沙箱；不陈述代码完成度、部署计划、落地步骤或性能实测。章节中的性能与可靠性数值仅是目标设计预算，104 个 TC 为设计可判定场景，不代表执行测试已经通过。
+**非目标**：不设计 ARC Listener 接单机制、不代替成员集群的真实 NPU Node 调度、不定义运行时沙箱；不陈述代码完成度、部署计划、落地步骤或性能实测。章节中的性能与可靠性数值仅是目标设计预算，120 个 TC 为设计可判定场景，不代表执行测试已经通过。
 
 
 - [Kubernetes Scheduling Framework](https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/)：Scheduler 扩展点、调度/绑定周期、QueueSort、Reserve/Unreserve。
 - [Kubernetes Running Multiple Schedulers](https://kubernetes.io/docs/concepts/scheduling-eviction/running-multiple-schedulers/)：多调度器间的节点和资源竞争边界。
 - [GitHub ARC Runner Scale Sets](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets)：ARC Kubernetes Container Mode 与 runner-container-hooks 创建作业 Pod 的责任边界。
-- [Liqo Offloading](https://docs.liqo.io/en/latest/features/offloading.html)：Namespace Offloading、远端虚拟节点及 Pod 选择策略。
+
+- [Kubernetes Pod Priority and Preemption](https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/)：PriorityClass、`preemptionPolicy: Never` 及其非抢占边界。
+- [Liqo Offloading](https://docs.liqo.io/en/stable/features/offloading.html)：Namespace Offloading、远端虚拟节点的聚合资源及成员集群真实调度边界。
 - [LeaderWorkerSet Gang Scheduling](https://lws.sigs.k8s.io/stable/docs/concepts/leaderworkerset/gang-scheduling/)：组级调度等级、Workload/PodGroup 关联及原生 Gang 权威。
 - [LeaderWorkerSet Volcano Scheduling](https://lws.sigs.k8s.io/main/docs/concepts/leaderworkerset/volcano-scheduling/)：Volcano provider 及 PodGroup/拓扑责任边界；具体能力以部署版本为准。
 - [Volcano Queue Resource Management](https://volcano.sh/docs/keyfeatures/queueresourcemanagement/)：capability、deserved、guarantee 的不同资源份额语义及 Queue 调度责任。
+- [Volcano Priority](https://volcano.sh/docs/scheduler/plugins/priority/)：Job/Task 依据 PriorityClass 排序；其 PreemptableFn 与实际调度动作必须分别审视。
+- [Volcano Scheduler Actions](https://volcano.sh/docs/scheduler/overview/)：enqueue、allocate、preempt、reclaim、backfill 等真实执行端调度行为。
