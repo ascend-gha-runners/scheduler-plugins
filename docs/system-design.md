@@ -114,6 +114,10 @@ flowchart TB
   RES --> DIAG
 ~~~
 
+<p align="center"><strong>图 1　NPU 调度子系统逻辑架构</strong></p>
+
+**说明：** 外部系统提供 Runner、资源与调度事实；子系统负责需求校验、可行性判定、公平仲裁、逻辑预约和诊断。图中方框表示逻辑职责，不对应固定进程或 Pod。
+
 该图划分**逻辑责任**，不要求一个方框对应一个进程、Pod 或 API 对象。资源事实流与决策流分离；功能模块不得绕过授权、预约仲裁或最终 Workflow 资源约束。
 
 ### 3.3 组件职责及数据权威
@@ -253,6 +257,10 @@ flowchart TD
   L -- 是 --> M["接受 Runner 准入，并声明保证级别"]
 ~~~
 
+<p align="center"><strong>图 2　NPU 准入决策流程</strong></p>
+
+**说明：** 依次核验需求授权、资源事实和完整 Workflow 执行计划，再进行公平裁决与逻辑预约。不同失败原因分别进入拒绝、等待或重新评估路径。
+
 算法步骤：
 
 1. 校验可信 DemandID、resourceName、正整数 count、WorkflowShape、租户与 Queue 授权；非法输入直接拒绝。
@@ -340,8 +348,6 @@ ScoreDomain       ⊆ FilterCandidate
 | SR-02 容量核算 | Node/Pod 有效 Requests、逻辑预约、物理资源映射和快照版本 | 形成按执行域/Node/型号去重的 CapacityView |
 | SR-03 可行性准入 | CandidatePlan、完整放置/拓扑条件、配额、数据新鲜度 | 按第 4 章决策状态返回，并不把估算等同协调承诺 |
 
-**交互时序：**
-
 ~~~mermaid
 sequenceDiagram
   participant A as ARC
@@ -363,6 +369,10 @@ sequenceDiagram
     R-->>A: 准入结果、保证级别、关联 ID
   end
 ~~~
+
+<p align="center"><strong>图 3　NPU 需求校验与准入交互时序</strong></p>
+
+**说明：** ARC 提供可信需求，校验和候选规划模块先检查授权与拓扑，获得公平许可后再由预约模块确定准入结果及保证级别。
 
 **接口契约：** 输入的资源数量和 WorkflowShape 不允许靠默认值掩盖格式错误；输出包含原因码、计划证据及版本，不暴露跨租户敏感资源详情。
 
@@ -433,6 +443,10 @@ stateDiagram-v2
   UNCERTAIN --> CLOSED: 证明无占用
   CLOSED --> [*]
 ~~~
+
+<p align="center"><strong>图 4　逻辑预约生命周期状态图</strong></p>
+
+**说明：** 预约从计划、持有、交接到分配和关闭遵循受控状态转换；分配证据不完整时进入 UNCERTAIN，不因租约到期直接释放容量。
 
 **跨阶段计量：** 相同资源只能归属于可承诺余量、未交接逻辑预约或已确认的真实分配。交接证据未完成核对，但真实 Pod 分配已出现在资源视图时，**允许临时保守双计**；不得为消除双计而先删除预约。完成验证后，在一致状态变更中解除对应逻辑扣减，同时保留真实分配计量。部分多节点 Workflow 的未交接资源向量仍须保留。
 
@@ -514,6 +528,10 @@ sequenceDiagram
   end
   Note over W,L: 未参与共享协议时仅有ESTIMATED保证
 ~~~
+
+<p align="center"><strong>图 5　Runner 与 Workflow 资源交接时序</strong></p>
+
+**说明：** 域级预约成功后，Runner 进行绑定；只有 Workflow 的真实资源分配被核实，逻辑预约才能完成交接。下游不参与共享协议时只具有预测性保证。
 
 交接必须以显式 DemandID、Runner UID、Workflow UID、namespace 与实际 Node/资源证明身份和范围，不允许通过名称去后缀猜测关联。下游不配合预约核验和撤销协议时，Runner 可以获得 ESTIMATED 结论，但不能升级 COORDINATED；Workflow 的实际分配仍可能等待。
 
@@ -685,6 +703,10 @@ flowchart TD
   M -- 是 --> O["许可与逻辑预约"]
 ~~~
 
+<p align="center"><strong>图 6　Reserve Node 与安全 Backfill 决策流程</strong></p>
+
+**说明：** 先保护优先等待任务的必要容量；后继任务只有在空间不冲突，或具有可强制执行的结束时间上限且不推迟保护任务时，才可回填。
+
 #### 5.4.5 与 Scheduler Framework、预约权威的接口
 
 | 决策接口 | 必需输入 | 输出与约束 |
@@ -831,6 +853,10 @@ sequenceDiagram
   MC-->>API: 真实分配证据供交接
 ~~~
 
+<p align="center"><strong>图 7　Liqo 远端资源选择与实际放置时序</strong></p>
+
+**说明：** 本地根据 Offloading 授权确定可用远端资源域，成员集群负责真实 Workflow Pod 的物理节点放置；虚拟节点的聚合容量不等于物理可执行性。
+
 **决策权**：本地 Scheduler + Liqo 只决定是否可以把工作负载提交到**已授权的远端资源域**；成员集群 Scheduler 才有权选择真实 NPU Node。Liqo virtual Node 的聚合容量，不自动等于成员集群中存在单台满足需求的物理机器。
 
 **一致性要求**：Offloading 授权与虚拟资源映射应使用同一有效策略版本；远端物理 Node 能否被实际分配必须由可信成员事实或参与的下游协议确认。远端集群失联、Offloading 撤销、映射冲突时将该域标记为不可验证并触发重评估，不从“虚拟节点仍存在”推断远端容量仍可用。若只拿到聚合可见性、无法证明满足完整 WorkflowShape，应返回 REMOTE_TOPOLOGY_UNKNOWN / DATA_UNAVAILABLE，并等待成员集群可信拓扑证据；**不得给出 ESTIMATED 准入，更不能给出 COORDINATED 保证**。ESTIMATED 也要求存在符合第 4.3 节的完整 CandidatePlan。
@@ -902,6 +928,10 @@ sequenceDiagram
   end
   Note over SCH,VOL: 无共同仲裁和交接时仅有ESTIMATED
 ~~~
+
+<p align="center"><strong>图 8　ARC、Runner 与 Workflow 跨组件协同时序</strong></p>
+
+**说明：** Runner 准入、逻辑预约、Runner 绑定和 Workflow 实际放置是不同阶段。只有下游参与同一预约与交接协议，才能声明 COORDINATED 保证。
 
 **保证范围**：PreFilter/Filter/Score 不产生资源排他；Runner Bind 不代表下游 Workflow 成功启动；只有预约权威和最终资源分配端共同遵守契约时才能声明 COORDINATED。成员集群对物理 NPU Node 的选择、真实设备分配与故障处理是其明确的责任，不能由 Liqo 虚拟节点或 Runner Scheduler 代行。
 
@@ -1188,6 +1218,10 @@ sequenceDiagram
   N->>API: 对账、保留不确定额度、更新状态
   N->>API: 原子提交新版本的合法预约
 ~~~
+
+<p align="center"><strong>图 9　Scheduler 故障转移与预约恢复时序</strong></p>
+
+**说明：** 新实例先取得有效写入代际，再核对持久预约与 Workflow 分配事实；旧代际写入被拒绝，未核实的资源继续保守保护。
 
 **恢复顺序**：先通过 Kubernetes API 权威记录完成代际接管（不能仅依赖进程本地自认领导权），再重建 AccountingDomain 与 FairnessPool 的权威版本；第三步核查活跃 Runner、Workflow、物理资源映射和 HELD/HANDOFF_PENDING/UNCERTAIN 状态；第四步隔离证据不完整的容量；最后按域重新开放新预约及队首评估。
 
