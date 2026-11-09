@@ -184,6 +184,8 @@ flowchart TB
 
 ### 4.1 准入的目标语义
 
+**需求前置条件。** ARC Kubernetes Container Mode 的 Runner 可能先于真实 NPU Workflow Pod 创建，因此无法从尚未出现的 Pod Requests 直接得知资源规格。系统要求一个**可信 CI 需求生产者**（平台作业模板/CI 接入契约，非普通用户 Pod annotation）在 Runner 开始调度之前，按明确的 CI JobAttempt 产出 TrustedDemandContract，并经受控关联层绑定到 Runner UID。仅拥有仓库级默认卡数、Runner 标签或 CPU Requests 不算完整需求证明。没有可用的事前数据通路时，该作业不能声称获得 BG-01 的 NPU 感知准入。
+
 **问题：** 调度对象的资源申请和最终执行负载的要求可能不同；单独检查调度对象能否绑定，不能证明目标 NPU 需求能够满足。
 
 **目标：** 对可信需求的完整执行规格进行可行性判定，并分别应用调度对象与实际执行负载的放置约束。准入需要同时检查授权、资源型号、可用量、拓扑、Queue 及数据有效性；任何一个必要条件不满足，都不能仅凭聚合容量放行。
@@ -195,7 +197,8 @@ flowchart TB
 - WorkflowShape：单节点或明确的多节点形态，每节点需求、拓扑亲和/反亲和及设备/网络条件。
 - executionScope：允许的本地或远端集群、资源池与授权限制。
 - tenant/queue：用于确定资源归属及配额语义。
-- identity：Runner UID、namespace、Job attempt 关联及策略版本，禁止仅凭名称推导身份。
+- identity：CI Provider JobAttempt、Runner UID、namespace、需求生产者身份、模板版本和策略版本，禁止仅凭名称推导身份。
+- readiness：可信需求必须先于 Runner 进入可调度阶段可被查询，且描述实际 NPU 消费者的单 Pod/PodGroup 规格；规格改变需重新准入。
 
 **输入非法（INVALID_DEMAND）**、**未授权（UNAUTHORIZED）**、**无可行拓扑（INFEASIBLE）**、**暂时无余量（INSUFFICIENT_CAPACITY）**、**资源事实不可信（DATA_UNAVAILABLE）**是不同结果。
 
@@ -219,6 +222,8 @@ Free(n, r, v) = max(0, Allocatable(n,r,v)
 其中 v 表示经过一致性校验的事实版本。公式**仅用于同一事实域内的资源账面估算**；当请求可能受其他独立 Scheduler 消耗且其分配不可见时，不能据此声明已获得强保证。
 
 **资源域判定原则：**
+
+**远端事实边界。** Liqo VirtualNode 的 Allocatable 是远端协商的聚合资源切片，不是物理 NPU Node 的可执行证明。对于远端候选，完整可行性可以由可信远端提供者返回可核验的物理放置证明或版本化 Feasible/NotFeasible 结果（含所核对的 WorkflowShape 摘要及约束）；无需将敏感的每台 Node 清单暴露给本地。这个结果只证明检查时刻可行，不代表已预约；非可信聚合数不能替代证明。
 
 - 本地资源域由可见物理节点构成；每个节点独立检查型号和放置约束。
 - Liqo 远端资源域必须先验证 NamespaceOffloading 授权，再确认远端映射与最终 Workflow 放置语义。一个聚合虚拟节点不应自动被视为一台具有同等卡数的真实物理节点。
@@ -246,6 +251,8 @@ Feasible(D,S,R) ⇔
 **SameCoherentExecutionScope** 并非总要求单个 Node：对于单节点 Workflow，P 必须落在一个满足全部条件的物理节点；对于明确的多节点 Workflow，P 可包含多个节点，但必须满足声明的组调度、网络拓扑和每节点需求，且不能从无协同关系的集群中拼接卡数。
 
 **CapacityFit** 比较该计划中每个节点实际可分配的对应型号卡数，而非只比较集群总和。**QueueQuotaFit** 与 **Authorized** 同时约束本地及远端候选；**FactsFreshAndConsistent** 要求计划中引用的数据具有可核验版本及有效性。
+
+对于远端，由受信任的远端可行性提供者在成员集群真实节点、型号、网络与 Queue 约束上执行同等检查，并返回可验证的完整计划证明，视为 CandidatePlan 的一种可行性证据。仅返回“总共有 16 卡”或不含需求摘要、授权、版本/有效期的裸布尔值，不满足该条件。完整远端证明仍不足以自行产生 COORDINATED：必须另有下游共同预约/撤销协议。
 
 得到有效 P 只是资源可行性结论，不等于公平仲裁已经准许该任务，也不等于另一个 Scheduler 必定在未来兑现分配。
 **组级需求可行性。** 对 WorkloadGroup，P 必须覆盖全部必需成员的每节点 Requests、拓扑/亲和性、Queue 配额和集群范围，并由 Workflow Scheduler 支持对应的 Gang 策略。仅有 `groupSize × 每 Pod NPU` 的集群聚合余量不能证明有合法的全组放置方案；若多个独立 AccountingDomain 无整体原子协议，不声明跨域 Gang 的 COORDINATED 保证。LWS 可按副本、整个 LWS 或角色形成不同组，groupSize 和成员版本必须由真实 LWS/PodGroup 契约确定，而不能从单个 Pod 的自由标签推断。
@@ -304,20 +311,25 @@ ScoreDomain       ⊆ FilterCandidate
 |---|---|
 | 本地和远端都满足完整 WorkflowShape | 按公平策略、授权、策略性偏好和资源效能选取；优先偏好不能改变可行性 |
 | 本地总余量大，但所有单节点都不足 | 对单节点需求不选本地；只有显式可执行的多节点形态可以组合 |
-| 远端虚拟节点空闲量为聚合视图 | 必须获得对应成员真实放置条件，或者按可明确表达的非保证级别处理；不能把汇总卡数当作一台机器 |
+| 远端虚拟节点空闲量为聚合视图 | 只有可信远端提供者确认完整 WorkflowShape 可行时才进入候选；裸聚合量仅触发进一步查询，不可直接形成 ESTIMATED |
 | 本地无授权，远端充足 | 不因容量充足绕过授权 |
 | 远端授权、映射或可达性异常 | 仅在本地独立满足所有要求时选本地；不得把未知远端视为可用 |
 | 任何候选配额不足 | 仅保留配额满足的候选，配额必须以相同租户/Queue 口径应用 |
+
+| 远端提供完整可行性证明但不参加共同预约 | 可输出 ESTIMATED，说明远端真实调度仍可能失败或等待；不宣称设备锁定 |
+| 远端证明过期、签发者不可信或只验证汇总容量 | REMOTE_TOPOLOGY_UNKNOWN / DATA_UNAVAILABLE，等待更新证据；不得按预计可用量默认放行 |
 
 ### 4.6 保证级别与跨 Scheduler 协作边界
 
 | 级别 | 必要条件 | 可对外说明 | 不能承诺 |
 |---|---|---|---|
-| **ESTIMATED** 预测性准入 | 存在基于可信快照的完整 CandidatePlan，且策略允许机会性准入 | 在快照时刻该 Workflow 具备可行资源计划 | NPU 已锁定、Workflow 必然立即运行、不会与其他 Scheduler 竞争 |
-| **COORDINATED** 受协调准入 | 除 ESTIMATED 条件外，下游 Scheduler/分配端确认同一资源域的预约、版本、交接和撤销语义 | 在协议明示的范围和有效期内保留协调承诺 | 跨协议边界或超出有效期后的绝对资源保证 |
+| **ESTIMATED** 预测性准入 | 已有可信前瞻需求与完整 CandidatePlan（含必要远端可行性证明），但下游未参与共同预约 | 在决策事实版本有效时判断该 Workflow 有可行执行路径；可降低明显错误的 Runner 提前启动 | NPU 已锁定、Workflow 将立即运行、不同 Scheduler 不会竞争、后续不会再次排队 |
+| **COORDINATED** 受协调准入 | 除 ESTIMATED 条件外，所有相关分配端共同验证同一资源域、Queue 额度、版本、预约/撤销与交接语义 | 在共同协议限定的资源、执行范围和期限内防止重复承诺并支持真实分配交接 | 全局无失败、外部未参与者的资源竞争、超有效期的无条件立即运行 |
 | **WAIT / REJECT** | 关键事实缺失、权限不通过、不可执行或无剩余量 | 解释等待/拒绝的原因与重评估条件 | 用“已通过 Runner Filter”替代资源保证 |
 
 逻辑预约不会自动升级 ESTIMATED 为 COORDINATED；若 Workflow Scheduler 不参与预约协议，只能保持预测性声明。**只有同一份资源占用与预约仲裁契约被所有相关分配参与者遵守时，才可要求防止跨调度器超卖。**
+
+**基础能力与强保证分界。** ESTIMATED 下 Runner 的逻辑预约只约束**参与本地仲裁的请求**，不限制独立 Workflow Scheduler，因而仍可能在 Workflow 创建后等待 NPU。只有 COORDINATED 路径可将避免“放行后因相同资源被并发分配而再次等待”作为受协议约束的目标；任一级别都不能把 Runner Bind 当作 Workflow 已成功调度。缺少前瞻需求契约则不进入上述两种准入等级，而返回 DEMAND_UNAVAILABLE。
 
 ### 4.7 边界情景与判定
 
