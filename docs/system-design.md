@@ -631,6 +631,9 @@ sequenceDiagram
 4. **拓扑竞争层**：当不同任务候选集交叉但不相等时，按对相同资源有效的仲裁顺序决定优先者；一个任务可以有多个 CandidatePlan，但只能在一次公平授权中选定一个执行计划和预留集合，不能在多个池里同时占据队首权益。
 
 **排序键**：arrivalSequence 由可信队列接收点持久化单调分配；同一序列冲突时使用 DemandID 稳定打破平局。Pod CreationTimestamp 只可用作辅助证据，不承担跨集群严格排序权威。失败重试或 Scheduler 切换不改变 arrivalSequence；重新提交的独立 Job attempt 使用新键。拒绝越权或永久不可能执行的需求不得阻塞后继。
+**跨 Namespace 共享 FIFO Queue。** 由平台策略显式授权多个 Namespace 使用同一个 FairnessQueue.queueID；例如 Namespace 上的 `ascend-ci.com/scheduler-queue` 仅作为受控配置入口，必须验证更新者权限、租户/Queue 归属和 policyVersion，不把任意字符串当作授权。未配置时，默认按 Namespace 创建独立的逻辑队列；**已经声明共享队列、但策略不可读或映射失效时必须等待，不得悄悄回退 Namespace 队列继续准入**。同一共享队列的任务只有候选资源确实冲突时才按该队列的 FIFO 规则互相约束；不同共享队列竞争相同物理域时仍受资源域仲裁、租户份额与全局保护约束，不因队列名称不同而规避公平。Namespace 迁移队列须版本化处理尚未承诺的需求，已持有保护/预约的任务按原有效协议完成或受控撤销。
+
+**组级 FIFO 身份。** 可信 WorkloadGroup 在同一 Queue 与竞争域内占据一个稳定的 arrivalSequence；Leader/Worker 异步创建不能将后到 PR 插入组内，同组成员也不能相互设置 FIFO 阻塞。两个组到达序列相同，以完整 groupID（含实例代际）一致打破平局，不能分别用成员 UID 排出相互循环的先后关系。组内实际 Pod 的放置顺序由执行端 Gang Scheduler 决定。
 
 #### 5.4.2 PR/Nightly 分时优先级与防饥饿
 
@@ -745,6 +748,9 @@ flowchart TD
 **INV-F05（公平与容量一致）：** 公平准许必须包含 DemandID、PolicyEpoch、protectionVersion，并与域级逻辑预约在同一个 AccountingDomain 版本化条件更新中验证；并发冲突后不复用失效的公平许可。
 
 **INV-F06（条件性活性）：** 授权资源持续可用并最终释放、任务具有可行拓扑且有效竞争受公平规则约束时，已获得保护资格的旧任务不会因新请求不断到达而无限次失去机会；不承诺在硬件永远不足时给出有限完成时间。
+**INV-F07（共享 Queue）：** 跨 Namespace 排序只使用经过授权及版本化的 FairnessQueue；同名字符串既不能跨租户提权，也不能替代物理竞争域。共享 Queue 身份不可读时不得 fail-open。
+
+**INV-F08（组级顺序）：** 同一 groupID+generation 的成员共享唯一 FIFO 位置并互不阻塞；不同组使用稳定的整组平局键，不能产生循环等待。
 
 | 故障模式 | 目标行为 | 不可接受行为 |
 |---|---|---|
@@ -773,8 +779,12 @@ flowchart TD
 | TC-F12 | 队首要求的型号/授权域永远不具备所需硬件 | 返回 INFEASIBLE 并退出有效队首，不形成永久阻塞 |
 | TC-F13 | Scheduler 重启导致本地 QueueSort 队列重建 | 从持久公平状态恢复 arrivalSequence、保护与 PolicyEpoch，不重排既有权利 |
 | TC-F14 | 受保护任务所需的在运行资源没有可信释放时刻 | 不承诺确定启动时刻，也不通过运行时间估计借用保护容量 |
+| TC-F15 | Namespace A/B 通过可信策略加入相同共享队列，争用同一资源域 | 两者按队列策略和完整竞争关系比较先后，重试不重排 |
+| TC-F16 | Leader 先创建，PR 随后到达，Worker 最后创建 | Worker 继承整组公平位置，PR 不可插入同一组中间；组成员彼此不阻塞 |
+| TC-F17 | 两个不同 WorkloadGroup 的成员具有相同时间戳 | 使用组级稳定平局键，所有成员对两组先后结论一致，不出现循环等待 |
+| TC-F18 | Namespace 已声明共享 Queue，但队列映射读取失败 | FAIRNESS_STATE_UNAVAILABLE/WAIT，不回退为独立 Namespace 队列放行 |
 
-以上 TC 是**目标架构的可验证场景**，不是工程执行记录。设计结论须与 INV-F01～F06 和 ADR-06 一致。
+以上 TC 是**目标架构的可验证场景**，不是工程执行记录。设计结论须与 INV-F01～F08 和 ADR-06/13/14 一致。
 
 ### 5.5 IR-05：事件、状态一致性与诊断
 
@@ -782,7 +792,7 @@ flowchart TD
 
 **目标：** 让关键状态变化可靠触发有界重评估，建立版本一致的诊断证据和故障恢复规则，同时保持授权与容量正确性。
 
-**SR-11 事件与重评估。** 资源释放、Node 变化、Liqo 授权、Queue 变化、PolicyEpoch 变动、预约释放和 Workflow 交接应经明确的重评估链影响 WAIT 需求。Pod/Node 可利用 Framework 事件提示；Liqo/Volcano CR 变化不能假定自动进入 QueueingHint，应定义显式桥接或有界周期核对，保留稳定队列身份和有界退避（见 5.6.6）。
+**SR-11 事件与重评估。** 资源释放、Node 变化、Liqo 授权、Namespace 到共享 Queue 的映射变化、Group/PodGroup 变化、PolicyEpoch 变动、预约释放和 Workflow 交接应经明确的重评估链影响 WAIT 需求。Pod/Node 可利用 Framework 事件提示；Liqo/Volcano CR 变化不能假定自动进入 QueueingHint，应定义显式桥接或有界周期核对，保留稳定队列身份和有界退避（见 5.6.6）。
 
 **SR-12 运行支撑。** 子系统应定义 Runner 调度与 Workflow 实际调度的分界、单一有效预约权威、各外部依赖的失败语义、最小权限、跨组件关联证据。关键授权/账本/远端物理事实未知时停止相应域的强承诺，而独立可信域可以继续；指标与诊断输出失败不改变准入正确性（见 5.6.1、5.6.6～5.6.8）。
 
@@ -790,7 +800,7 @@ flowchart TD
 
 ### 5.6 跨组件接口与 Scheduler Framework 契约
 
-本节将 IR-01～IR-05 的逻辑设计映射到真实的系统责任边界。所谓“接口”，是目标协议的输入、输出、状态权威及异常语义，不要求新增特定控制器或采用特定部署形态。**NPU Scheduler 只调度 Runner Pod；Workflow Pod 的绑定由其实际 schedulerName 指向的 Scheduler 执行**。外部系统不参与协议时，不能从本子系统的局部判断推导全链路资源保证。
+本节将 IR-01～IR-05 的逻辑设计映射到真实的系统责任边界。所谓“接口”，是目标协议的输入、输出、状态权威及异常语义，不要求新增特定控制器或采用特定部署形态。**目标架构下 NPU Scheduler 只负责 Runner Pod 的前置准入与公平保护；Workflow Pod 的真实绑定及组级调度由其实际 schedulerName 指向的 Scheduler 执行**。外部系统不参与协议时，不能从本子系统的局部判断推导全链路资源保证。
 
 #### 5.6.1 外部交互总览
 
@@ -832,7 +842,7 @@ flowchart TD
 | **Score/NormalizeScore** | 在 Runner 合法候选内优化 Runner 节点放置偏好；Workflow 执行域的策略评分由 CandidatePlanner 独立决定 | 不把未满足硬约束的 Node 通过高分重新引入可行集合 |
 | **Reserve** | 对已获公平许可及有效 Workflow CandidatePlan 执行 AccountingDomain 的域级 CAS，生成 HELD 逻辑预约；附域版本、策略与保护版本 | Framework 的本轮 Reserve 不是对另一个 Scheduler 的物理设备保留 |
 | **Unreserve** | 为当前调度轮的失败请求发出幂等撤销意图；由权威账本/对账确认最终释放 | 不以回调发生就推定 Workflow 已终止；不依赖回调必达或进程不崩溃 |
-| **Permit（按需）** | 对存在明确下游协议的 Runner 可声明有界等待/允许策略；仅在 Framework 支持的语义内使用 | 不通过 Permit 假装别的 Scheduler 已占有 NPU，也不无限阻塞绑定周期 |
+| **Permit（按需）** | 只在本 Scheduler 实际管理且具有明确生命周期的本地 Pod 组内执行有界许可；Runner 前置准入使用独立的组级需求计划及共享预约协议 | 不借 Runner 的 Permit 代替下游 LWS/Volcano 的 Gang 许可；不得因只见部分成员就报告整组已分配，亦不无限等待 |
 | **PreBind / Bind / PostBind** | 绑定前检查该 reservationID/generation 仍有效、所选 Runner Node 合法且受保护公平承诺未失效；由合法 Bind 路径绑定 Runner；绑定后关联通知与恢复对账 | 不要求成功 CAS 之后整个域版本永远不变；不把 PostBind 当作唯一可靠交接依据；成功 Bind Runner 不保证 Workflow Bind |
 | **EnqueueExtension / 重新入队** | 将本插件关注的 Pod/Node 变化映射为重试提示，并为外部状态变化定义有界、可靠的重评估触发链 | 不假设所有任意 CRD 更新都会自动触发 Framework 的队列提示；不得只依赖一次事件 |
 
@@ -885,6 +895,11 @@ sequenceDiagram
 | Scheduler 配置 | 明确 enqueue、allocate、reclaim、preempt 与 Queue 插件的策略边界 | 当前设计不允许通过外部抢占打破“不抢占运行任务”的目标 |
 | Workflow Pod/PodGroup | 由真正执行端判定 Gang、Node 选择和作业生命周期 | Runner 预约不等于 Volcano PodGroup 已满足组调度要求 |
 | 协调保证 | 下游必须接入同一 AccountingDomain 授权、提交、交接、撤销及版本协议 | 没有该协议只能 ESTIMATED；只读取 Queue CR 不能升级 COORDINATED |
+**LWS/Gang 执行端协议。** WorkloadGroup 来源为可信 LWS/PodGroup，至少核对工作负载 UID、Namespace、组实例及代际、所选组级策略（副本/整体/角色）、有效成员数量、各成员 Requests/拓扑、Queue/priorityClass、实际 schedulerName。标准 LWS 的组级对象可能是原生 PodGroup 或 Volcano PodGroup，必须以部署版本支持的真实 API 为准，不能把 `leaderworkerset.sigs.k8s.io/group-key` 和 `leaderworkerset.sigs.k8s.io/size` 两个 Pod 元数据字段单独当作完整的组调度协议。组身份与成员资格应由控制器/准入侧核验，避免使用者伪造 size 或借用别的组。
+
+**单一 Gang 执行权威。** 目标设计优先复用 LWS 配套的原生/Volcano Gang 功能：Runner 侧的组级 CandidatePlan 只是前置资源可行性与公平准入；执行端负责将成员形成 PodGroup、约束其整组绑定、处理 timeout/retry/rollback 并给出整体状态。成员集群负责真实 Node 和设备分配。若 Workflow Scheduler 不支持 Gang，则不能因 ARCSync 预测通过而声称整组可执行；若它支持 Gang，也不得再由 ARCSync 并行维护另一套互不协调的 Workflow Permit 计数器。原生/Volcano 接口按实际兼容版本选择，不能假定所有 LWS 部署同时支持两者。
+
+**全组确认与失败恢复。** 执行端至少反馈 groupID/generation、预期成员数、已确认成员 UID/Node/Requests、组级条件、不可调度原因及释放证据。只确认若干成员不代表整个组成功；超时、成员重建、PodGroup 变更和调度器故障需要有界重评估和幂等回滚。跨独立 AccountingDomain 没有共享原子协议时保持 ESTIMATED 或按未协调状态等待，不能以若干局部 Permit 成功升级 COORDINATED。
 
 **策略冲突规则**：该目标架构的受管理资源域**不得启用**会驱逐正在运行的 CI 任务的默认抢占、Volcano preempt 或 reclaim 路径；当下游无法按此约束关闭抢占/回收时，不能将其纳入非抢占调度承诺作用域。Volcano deserved 的共享资源可被 reclaim 的官方语义不能与“已运行任务绝不抢占”的目标同时无条件保证。不得通过修改 Volcano 本身的实际调度决定来代替本子系统的公平和容量仲裁。
 
@@ -961,6 +976,8 @@ sequenceDiagram
 
 **INV-I06**：跨 Scheduler 的 COORDINATED 等级以共同参与预约验证、交接、释放和补偿对账为必要条件；没有下游确认时永远不能自称强保证。
 
+**INV-I07**：Runner 的组级可行性许可不得替代真实 PodGroup/Gang 绑定；组级执行只能有一个权威协调者，组代际和成员集合必须一致。
+
 | TC | 架构场景 | 可判定的设计结论 |
 |---|---|---|
 | TC-I01 | ARC Runner Pod 不请求 NPU，但可信规格表明后续 Workflow 请求 8 卡 | PreFilter 基于 WorkflowShape 准入；Runner 的 CPU Node 与未来 NPU Node 分别过滤 |
@@ -977,8 +994,11 @@ sequenceDiagram
 | TC-I12 | Workflow Scheduler 拒绝或不支持接入协议 | 不升级为 COORDINATED；如路径允许预测性放行须明确残余风险 |
 | TC-I13 | Liqo/Volcano CR 更新，但没有关联的原生 Pod/Node 事件 | 必须有桥接或有界周期重评估，不可依赖不存在的自动唤醒 |
 | TC-I14 | 应用的 PostFilter 具备可抢占行为，而本子系统目标不抢占 | 相应调度路径不允许通过抢占来满足 Queue/Reserve Node 的资源承诺 |
+| TC-I15 | LWS 的组级策略为每副本 PodGroup，Runner 提前按整个 LWS 总容量判断 | 应按真实 PodGroup 粒度和成员要求形成需求，不能错误冻结整个 LWS 的容量 |
+| TC-I16 | ARCSync 的 Runner 准入成功，但实际 Workflow Scheduler 不支持 Gang | 不声明组级放置成功；返回不支持/等待，并由执行端报告最终状态 |
+| TC-I17 | Pod 元数据中的 group-key/size 与真实 LWS/PodGroup 代际或成员数冲突 | 拒绝采信未验证元数据，不按伪造的组规模执行许可 |
 
-这些场景只用于验证**设计规则可推演**，不包含测试执行、上线或代码现状。它们应追踪 INV-I01～I06、ADR-01/04/07/08/10 及 SR-06～SR-09、SR-11、SR-12。
+这些场景只用于验证**设计规则可推演**，不包含测试执行、上线或代码现状。它们应追踪 INV-I01～I07、ADR-01/04/07/08/10/13/14 及 SR-06～SR-09、SR-11、SR-12。
 
 ## 6 DFX 架构设计
 
@@ -1473,4 +1493,6 @@ PB-01～PB-07 的决策耗时和 RA-01～RA-06 的可靠性事件以**5 分钟�
 - [Kubernetes Running Multiple Schedulers](https://kubernetes.io/docs/concepts/scheduling-eviction/running-multiple-schedulers/)：多调度器间的节点和资源竞争边界。
 - [GitHub ARC Runner Scale Sets](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets)：ARC Kubernetes Container Mode 与 runner-container-hooks 创建作业 Pod 的责任边界。
 - [Liqo Offloading](https://docs.liqo.io/en/latest/features/offloading.html)：Namespace Offloading、远端虚拟节点及 Pod 选择策略。
+- [LeaderWorkerSet Gang Scheduling](https://lws.sigs.k8s.io/stable/docs/concepts/leaderworkerset/gang-scheduling/)：组级调度等级、Workload/PodGroup 关联及原生 Gang 权威。
+- [LeaderWorkerSet Volcano Scheduling](https://lws.sigs.k8s.io/main/docs/concepts/leaderworkerset/volcano-scheduling/)：Volcano provider 及 PodGroup/拓扑责任边界；具体能力以部署版本为准。
 - [Volcano Queue Resource Management](https://volcano.sh/docs/keyfeatures/queueresourcemanagement/)：capability、deserved、guarantee 的不同资源份额语义及 Queue 调度责任。
