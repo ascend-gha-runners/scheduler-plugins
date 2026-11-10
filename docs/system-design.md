@@ -81,7 +81,48 @@
 | AP-07 明确失效语义 | 依赖异常按授权、安全性和一致性影响选择等待、拒绝或有限降级 | QA-04/05/06 |
 | AP-08 可诊断的决策 | 决策具有关联 ID、策略版本、数据版本和原因码 | QA-07 |
 
-### 3.2 逻辑架构
+### 3.2 架构视图总览（4+1）
+
+一个架构图无法同时说明“模块是什么、代码如何组织、运行时怎样协作、部署在哪里、用户如何使用”。本设计按 **逻辑视图、开发视图、运行视图、部署视图和用例视图（+1）** 分别描述，视图中的同名元素代表同一职责，不将逻辑模块误当作必须独立部署的服务。
+
+~~~mermaid
+flowchart TB
+  subgraph TOP[" "]
+    direction LR
+    L["逻辑视图<br/>职责与领域对象"]
+    D["开发视图<br/>软件构件与依赖"]
+  end
+  U(["用例视图（+1）<br/>用户场景与验证"])
+  subgraph BOT[" "]
+    direction LR
+    R["运行视图<br/>调度、并发与恢复"]
+    P["部署视图<br/>集群、实例与资源位置"]
+  end
+  L -.-> U
+  D -.-> U
+  U -.-> R
+  U -.-> P
+  classDef view fill:#ffffff,stroke:#475569,color:#111827,stroke-width:1px
+  classDef scenario fill:#f8fafc,stroke:#475569,color:#111827,stroke-width:1.5px
+  class L,D,R,P view
+  class U scenario
+  style TOP fill:#ffffff,stroke:#ffffff
+  style BOT fill:#ffffff,stroke:#ffffff
+~~~
+
+<p align="center"><strong>图 1　NPU 调度子系统的 4+1 架构视图</strong></p>
+
+**说明：** 用例视图作为设计驱动，验证其余四个视图是否共同支持 BG-01 NPU 感知准入与 BG-02 公平等待。箭头表示追踪关系，不表示 Pod 流量或部署连接。
+
+| 视图 | 主要回答 | 本文位置和表达方式 |
+|---|---|---|
+| **逻辑视图** | 哪些职责共同完成 NPU 准入、公平仲裁及资源交接？ | 3.3～3.6：逻辑架构、责任、领域对象和 ADR；图 2 |
+| **开发视图** | 代码与接口应如何划分，避免职责耦合？ | 3.7：软件构件依赖；图 3 |
+| **运行视图** | 多实例调度如何并发，发生冲突和故障时如何恢复？ | 3.8：运行时同步边界；图 4；细化见第 4～6 章的状态/时序图 |
+| **部署视图** | Runner 调度、预约权威、远端候选与物理 NPU 分布在哪里？ | 3.9：集群和执行端拓扑；图 5 |
+| **用例视图（+1）** | 使用者希望解决哪些问题，如何验证方案？ | 3.10：关键用例、视图映射；图 6；反例与 DFX 场景见第 4～7 章 |
+
+### 3.3 逻辑视图：职责分解与协作
 
 ~~~mermaid
 flowchart TB
@@ -125,11 +166,11 @@ flowchart TB
   RES --> DIAG
 ~~~
 
-<p align="center"><strong>图 1　NPU 调度子系统逻辑架构</strong></p>
+<p align="center"><strong>图 2　NPU 调度子系统逻辑架构</strong></p>
 
 **说明：** 图中方框表示逻辑职责，不对应固定进程或 Pod。外部系统提供 Runner、资源与调度事实；本子系统负责需求校验、可行性判定、公平仲裁、逻辑预约和诊断。资源事实流与决策流分离，各模块不得绕过授权或预约仲裁。
 
-### 3.3 组件职责及数据权威
+### 3.4 逻辑元素职责及数据权威
 
 | 组件 | 决策职责 | 权威输入与输出 | 不承担的保证 |
 |---|---|---|---|
@@ -142,7 +183,7 @@ flowchart TB
 
 **外部执行权威：** CI 接入侧是 TrustedDemandContract 的生产者，ARC 维护 Runner/Job 生命周期；Workflow Scheduler（含 LWS/Volcano）负责实际 NPU PodGroup 的优先级、Gang、Node 绑定与释放，Device Plugin 负责设备资源事实。其状态仅经受信任的关联协议进入本子系统的证据视图，不能把外部组件写入内部责任链。
 
-### 3.4 规范化领域对象
+### 3.5 逻辑领域对象
 
 | 对象 | 必需字段与关系 | 语义 |
 |---|---|---|
@@ -164,7 +205,7 @@ flowchart TB
 | AllocationEvidence | Workflow UID、实际 Requests、Node/拓扑、分配确认版本、关联 DemandID | 用于预约交接的可信分配证据 |
 | DecisionEvidence | decisionID、reasonCode、policyVersion、snapshotVersion、guaranteeLevel | 解释准入、等待和拒绝原因 |
 
-### 3.5 关键架构决策
+### 3.6 关键架构决策与取舍
 
 | ADR | 目标决策与理由 | 取舍 |
 |---|---|---|
@@ -186,6 +227,173 @@ flowchart TB
 | ADR-15 前瞻需求契约 | CI 接入侧须在 Runner 调度前提供 JobAttempt 绑定的可信完整 NPU 需求；与真实 Workflow 不符时撤销旧承诺并重评估 | 单靠 ARC Runner Pod 的 CPU Requests 无法实现 BG-01；无可信契约的作业不进入受管理的 NPU 预测性准入 |
 | ADR-16 远端可行性证明 | Liqo 负责可见性与 Offloading 授权；远端可信调度/资源事实服务提供完整 WorkflowShape 可行性证明 | 虚拟 Node 聚合卡数不构成可行性；证据缺失时等待，证明可行但无共享预约时最多 ESTIMATED |
 | ADR-17 优先级与 Backfill 责任 | Runner 准入侧管 FIFO/公平保护；PR/Nightly 的实际 Workflow 执行优先级由可信 PriorityClass 和下游 Scheduler 负责，空间 Backfill 为默认安全路径 | 不维护第二套独立的执行优先级/抢占机制；时间 Backfill 仅在可强制执行全生命周期上限且不破坏保护时可选 |
+
+### 3.7 开发视图：软件构件与接口
+
+**关注点：** 开发人员需要知道哪些功能由调度扩展承担、哪些由外部适配器或共享状态协议承担，以及依赖如何单向收敛。本视图是**目标构件边界**，不是声称每个框已存在同名源码包或必须独立进程。
+
+~~~mermaid
+flowchart LR
+  ENTRY["Scheduler 入口<br/>cmd/scheduler"]
+  CORE["ARC NPU 调度扩展<br/>pkg/arcsync"]
+  DEM["需求与 Group 契约"]
+  PLAN["资源可行性规划"]
+  FAIR["公平/Reserve Node"]
+  RES["预约与交接"]
+  ADP["Liqo / Workflow 适配"]
+  EVID["事件与诊断"]
+  ENTRY --> CORE
+  CORE --> DEM
+  CORE --> PLAN
+  CORE --> FAIR
+  CORE --> RES
+  CORE --> ADP
+  DEM --> PLAN
+  PLAN --> FAIR
+  FAIR --> RES
+  ADP -.-> PLAN
+  RES -.-> EVID
+  classDef c fill:#ffffff,stroke:#475569,color:#111827
+  class ENTRY,CORE,DEM,PLAN,FAIR,RES,ADP,EVID c
+~~~
+
+<p align="center"><strong>图 3　调度子系统目标软件构件及依赖</strong></p>
+
+**说明：** `cmd/scheduler`、`pkg/arcsync` 是仓库中可识别的接入锚点；其他框表示目标职责边界，而非要求增加同名目录。需求生产者、LWS/Volcano 的真实绑定和 Device Plugin 不属于此子系统内部构件。
+
+| 构件边界 | 主要输入/输出 | 依赖约束 |
+|---|---|---|
+| **Scheduler 入口 / ARCSync 扩展** | Runner Pod、Scheduling Framework CycleState、调度决策 | 复用 Framework 的 PreFilter/Filter/Reserve/Bind 生命周期，不复制 Pod 绑定算法 |
+| **需求与可行性** | TrustedDemandContract、WorkflowShape、WorkloadGroup、RemoteFeasibilityEvidence → CandidatePlan | 只读可信需求和事实；不能依赖 Runner 已经绑定才能知道 NPU 规格 |
+| **公平与预约** | CandidatePlan、FairnessQueue、arrivalSequence、PolicyEpoch → FairnessPermit/LogicalReservation | 公平许可和资源承诺在同一有效版本边界仲裁，不使用孤立进程内 map 充当全局权威 |
+| **外部适配及诊断** | Liqo Offloading、Workflow/PodGroup 分配证据、原因码和关联 ID | 只能查询/校验外部权威；不能伪造远端物理拓扑或自行宣称 Workflow 已运行 |
+
+开发视图只规定**构件接口方向和可替换性**：远端可行性查询与本地 CandidatePlanner 可以通过不同传输方式实现，但应遵守相同的请求/证据契约；同理，逻辑预约的持久化和诊断实现不能反向改变公平或容量判定。
+
+### 3.8 运行视图：并发边界与状态权威
+
+**关注点：** 多个 Scheduler 实例可以同时处理不同 Runner，绑定周期与下游 Workflow 调度又是异步发生的。正确性不能依赖某个实例的 Pod List 顺序或本地缓存。下面只描述**运行时参与者与并发关系**；正常准入时序见 5.6.7，预约交接和故障恢复见 5.2.5、6.3.2。
+
+~~~mermaid
+flowchart LR
+  subgraph S["并发调度实例"]
+    direction TB
+    S1["Scheduler 实例 A"]
+    S2["Scheduler 实例 B"]
+  end
+  AUTH["共享预约/公平权威<br/>CAS + writerEpoch"]
+  EVID["资源事实视图<br/>Node / Pod / Liqo"]
+  EXEC["Workflow Scheduler<br/>实际分配与 Gang"]
+  REC["交接/恢复对账"]
+  S1 -->|"竞争提交"| AUTH
+  S2 -->|"竞争提交"| AUTH
+  EVID -->|"可信快照"| S1
+  EVID -->|"可信快照"| S2
+  AUTH -.->|"有效预约证明"| EXEC
+  EXEC -->|"绑定/释放事实"| REC
+  REC -->|"版本化对账"| AUTH
+  classDef x fill:#ffffff,stroke:#475569,color:#111827
+  class S1,S2,AUTH,EVID,EXEC,REC x
+  style S fill:#ffffff,stroke:#94a3b8
+~~~
+
+<p align="center"><strong>图 4　多实例调度与资源状态一致性</strong></p>
+
+**说明：** 并发调度实例依据同一权威版本竞争容量；Workflow Scheduler 独立做真实 Pod/设备分配，交接与恢复依赖权威证据。虚线仅表示下游明确参与共同预约协议时的协调关系。
+
+- **并发与同步：** Framework 的调度和绑定周期不等同于全局串行执行；共享域通过版本、CAS、PolicyEpoch 和 writerEpoch 解决竞争，见 5.2.4。
+- **生命周期：** `PLANNED → HELD → HANDOFF_PENDING → ALLOCATED → CLOSED` 是正常路径；异常状态与回滚以 5.2.3 状态机为准。
+- **失效边界：** Liqo/Queue/调度实例故障不能导致越权或重复承诺；不相关的独立域可以继续，见 6.3。
+- **保证级别：** `ESTIMATED` 是对快照可行性的判断；只有执行端参与同一预约、验证、撤销和交接协议，才能达到 `COORDINATED`，见 4.6。
+
+### 3.9 部署视图：本地控制面与远端执行域
+
+**关注点：** 显式区分 Runner 所在集群、Liqo 虚拟资源映射、成员集群物理 NPU 节点，以及共享状态权威的位置。**逻辑模块可以合并部署，不要求每项职责独占 Pod**；本图不定义现网实例数量和具体云账号/Region。
+
+~~~mermaid
+flowchart TB
+  CI["外部 CI 提供方<br/>JobAttempt 与需求契约"]
+  subgraph LOCAL["Runner 管理集群 / 本地 Kubernetes"]
+    direction LR
+    ARC["ARC / Runner"]
+    SCH["NPU Scheduler<br/>ARCSync"]
+    API["Kubernetes API<br/>预约/公平权威"]
+    VK["Liqo Offloading<br/>VirtualNode"]
+    LOCALWF["本地 Workflow Scheduler"]
+    LOCALN["本地 NPU Node<br/>Device Plugin"]
+  end
+  subgraph REMOTE["被授权成员集群 / 远端 Kubernetes"]
+    direction LR
+    FEAS["可信可行性提供者"]
+    WF["Workflow Scheduler<br/>LWS / PodGroup / PriorityClass"]
+    NPU["物理 NPU Nodes<br/>Device Plugin"]
+  end
+  CI --> ARC
+  CI --> API
+  ARC --> SCH
+  SCH <-->|"版本化授权/预约"| API
+  SCH -->|"查询远端可行性"| FEAS
+  API --> VK
+  API --> LOCALWF
+  LOCALWF --> LOCALN
+  VK -.->|"Offloading"| WF
+  WF --> NPU
+  NPU --> FEAS
+  classDef c fill:#ffffff,stroke:#475569,color:#111827
+  class CI,ARC,SCH,API,VK,LOCALWF,LOCALN,FEAS,WF,NPU c
+  style LOCAL fill:#ffffff,stroke:#94a3b8
+  style REMOTE fill:#ffffff,stroke:#94a3b8
+~~~
+
+<p align="center"><strong>图 5　Runner 管理集群与远端 NPU 执行域部署关系</strong></p>
+
+**说明：** Runner 可在不消耗 NPU 的节点上调度；本地或远端 Workflow Scheduler 才选择真实 NPU Node。Liqo 提供授权与 Offloading 入口，可信远端提供者核验物理可行性，虚拟 Node 不等同物理设备。
+
+| 部署边界 | 运行职责 | 故障隔离及约束 |
+|---|---|---|
+| **Runner 管理集群** | ARC Runner、NPU Scheduler、Kubernetes API、共享预约与公平状态 | Runner 可先于 Workflow 出现；状态权威必须可在实例切换后恢复；RBAC 限制跨租户写入 |
+| **成员执行集群** | Workflow Scheduler、LWS/PodGroup、NPU Device Plugin、真实 NPU Node | 最终节点放置、Gang 和 PriorityClass 归成员执行端；不得由管理集群直接指定物理卡 |
+| **Liqo/远端证据接口** | Offloading 授权、远端可行性查询与证据回传 | 虚拟聚合容量不证明真实物理可行；失联或证据过期时隔离受影响远端 |
+| **共享依赖** | Queue 额度、预约权威、策略版本和诊断链 | 两个资源域共享同一硬配额或同一物理资源时不能宣称故障完全独立 |
+
+### 3.10 用例视图（+1）：以用户场景验证架构
+
+**关注点：** 选择能体现 BG-01/BG-02 的主要场景，而不是把全部 120 个异常与 DFX 测试案例画进一张图。项目维护者关心“提交 CI 后什么时候能拿到 NPU”，平台管理者关心“多租户如何公平使用并诊断等待”。
+
+~~~mermaid
+flowchart LR
+  USER["项目维护者<br/>PR / Nightly"]
+  OPS["平台管理者"]
+  subgraph UC["NPU 调度子系统主要用例"]
+    direction TB
+    U1(["UC-01<br/>NPU 前瞻准入"])
+    U2(["UC-02<br/>大任务公平等待"])
+    U3(["UC-03<br/>跨集群 NPU 调度"])
+    U4(["UC-04<br/>多 Pod 任务交接"])
+  end
+  USER --> U1
+  USER --> U2
+  USER --> U3
+  USER --> U4
+  OPS --> U2
+  OPS --> U3
+  classDef c fill:#ffffff,stroke:#475569,color:#111827
+  class USER,OPS,U1,U2,U3,U4 c
+  style UC fill:#ffffff,stroke:#94a3b8
+~~~
+
+<p align="center"><strong>图 6　NPU 调度子系统关键用例</strong></p>
+
+**说明：** 从用户可观察的排队、放行和执行结果出发选择四个主场景。异常结果用表格和已有 TC/DFX 场景描述，避免用例图与系统流程图重复。
+
+| 主场景 | 用户触发与期望 | 关键设计路径 | 验证关注点 |
+|---|---|---|---|
+| **UC-01 前瞻准入** | 提交需要 NPU 的 CI，Runner 不应在根本无可执行卡型/拓扑时提前启动 | TrustedDemandContract → CandidatePlan → 预约级别 → Workflow 交接 | BG-01；4.1～4.8、5.1～5.2；TC-C/I/R |
+| **UC-02 大任务公平等待** | 大任务在竞争资源时不被无限插队，空闲非冲突资源仍可利用 | FairnessQueue → arrivalSequence → Reserve Node → 空间 Backfill | BG-02；5.4；TC-F、QA-02 |
+| **UC-03 跨集群调度** | 本集群不足而授权远端有可行资源时，可无感选择远端执行 | Liqo Offloading → CheckFeasibility → 远端 Workflow Scheduler | BG-01；5.3、5.6.4；TC-C/I |
+| **UC-04 多 Pod 交接** | LWS/Gang 任务按真实分组及每成员规格准入，整个任务结果可追踪 | WorkloadGroup → PodGroup → 成员分配证据 → 组级恢复对账 | BG-01/02；5.2、5.6.5；TC-R/I/A |
+
+**视图一致性要求：** 逻辑视图中的职责在开发视图中必须有明确接口承担；运行视图的每个共享状态必须能定位权威；部署视图必须能指出该权威位于哪个信任/故障域；每个主要用例至少能映射一条正常运行路径及一组失败/DFX 场景。只画框不写清关系不算完成视图设计。
 
 ## 4 NPU 需求与容量准入设计（IR-01、IR-03）
 
@@ -287,7 +495,7 @@ flowchart TD
   L -- 是 --> M["接受 Runner 准入，并声明保证级别"]
 ~~~
 
-<p align="center"><strong>图 2　NPU 准入决策流程</strong></p>
+<p align="center"><strong>图 7　NPU 准入决策流程</strong></p>
 
 **说明：** 依次核验需求授权、资源事实和完整 Workflow 执行计划，再进行公平裁决与逻辑预约。不同失败原因分别进入拒绝、等待或重新评估路径。
 
@@ -408,7 +616,7 @@ sequenceDiagram
   end
 ~~~
 
-<p align="center"><strong>图 3　NPU 需求校验与准入交互时序</strong></p>
+<p align="center"><strong>图 8　NPU 需求校验与准入交互时序</strong></p>
 
 **说明：** ARC 提供可信需求，校验和候选规划模块先检查授权与拓扑，获得公平许可后再由预约模块确定准入结果及保证级别。
 
@@ -482,7 +690,7 @@ stateDiagram-v2
   CLOSED --> [*]
 ~~~
 
-<p align="center"><strong>图 4　逻辑预约生命周期状态图</strong></p>
+<p align="center"><strong>图 9　逻辑预约生命周期状态图</strong></p>
 
 **说明：** 预约从计划、持有、交接到分配和关闭遵循受控状态转换；分配证据不完整时进入 UNCERTAIN，不因租约到期直接释放容量。
 
@@ -567,7 +775,7 @@ sequenceDiagram
   Note over W,L: 未参与共享协议时仅有ESTIMATED保证
 ~~~
 
-<p align="center"><strong>图 5　Runner 与 Workflow 资源交接时序</strong></p>
+<p align="center"><strong>图 10　Runner 与 Workflow 资源交接时序</strong></p>
 
 **说明：** 域级预约成功后，Runner 进行绑定；只有 Workflow 的真实资源分配被核实，逻辑预约才能完成交接。下游不参与共享协议时只具有预测性保证。
 
@@ -747,7 +955,7 @@ flowchart TD
   M -- 是 --> O["许可与逻辑预约"]
 ~~~
 
-<p align="center"><strong>图 6　Reserve Node 与安全 Backfill 决策流程</strong></p>
+<p align="center"><strong>图 11　Reserve Node 与安全 Backfill 决策流程</strong></p>
 
 **说明：** 先保护优先等待任务的必要容量；后继任务只有在空间不冲突，或具有可强制执行的结束时间上限且不推迟保护任务时，才可回填。
 
@@ -920,7 +1128,7 @@ sequenceDiagram
   end
 ~~~
 
-<p align="center"><strong>图 7　Liqo 远端可行性验证与实际执行时序</strong></p>
+<p align="center"><strong>图 12　Liqo 远端可行性验证与实际执行时序</strong></p>
 
 **说明：** Liqo 决定远端是否允许访问，远端可信提供者核验完整 NPU 规格是否有物理可行路径，成员集群 Scheduler 决定真实节点。只有有效检查证据可以进入前瞻准入；检查不产生物理锁定。
 
@@ -1015,7 +1223,7 @@ sequenceDiagram
   Note over SCH,VOL: 无共同仲裁和交接时仅有ESTIMATED
 ~~~
 
-<p align="center"><strong>图 8　ARC、Runner 与 Workflow 跨组件协同时序</strong></p>
+<p align="center"><strong>图 13　ARC、Runner 与 Workflow 跨组件协同时序</strong></p>
 
 **说明：** Runner 准入、逻辑预约、Runner 绑定和 Workflow 实际放置是不同阶段。只有下游参与同一预约与交接协议，才能声明 COORDINATED 保证。
 
@@ -1319,7 +1527,7 @@ sequenceDiagram
   N->>API: 原子提交新版本的合法预约
 ~~~
 
-<p align="center"><strong>图 9　Scheduler 故障转移与预约恢复时序</strong></p>
+<p align="center"><strong>图 14　Scheduler 故障转移与预约恢复时序</strong></p>
 
 **说明：** 新实例先取得有效写入代际，再核对持久预约与 Workflow 分配事实；旧代际写入被拒绝，未核实的资源继续保守保护。
 
@@ -1522,7 +1730,7 @@ PB-01～PB-07 的决策耗时和 RA-01～RA-06 的可靠性事件以**5 分钟�
 | SR-01 可信需求 | 4.1、5.1、5.6.2、6.1 | 02、10、13、15 | 01、06 | INV-S01～S04；TC-C10、TC-S01～S04 |
 | SR-02 容量计量 | 4.2、4.7、5.1、5.2 | 03、04、05 | 01、04 | INV-C01～C06、INV-R02/R03；TC-C01～C09、TC-R01 |
 | SR-03 可执行性 | 4.3～4.8、5.1、5.6.4～5.6.5、6.2.3 | 03、07、12、13、16 | 01、03 | TC-C01～C14、TC-I01/I03、TC-P09 |
-| SR-04 预约 | 3.4、5.2、6.2.4、6.3 | 05、09、12、13 | 01、04、05 | INV-R01～R06、INV-A01～A06；TC-R01～R14、TC-A01～A16 |
+| SR-04 预约 | 3.5、5.2、6.2.4、6.3 | 05、09、12、13 | 01、04、05 | INV-R01～R06、INV-A01～A06；TC-R01～R14、TC-A01～A16 |
 | SR-05 交接 | 5.2.3、5.2.5～5.2.8、6.4 | 05、07、11、13 | 01、04、07 | TC-R04～R12、TC-O03～O06 |
 | SR-06 Liqo | 4.2、4.5、5.3、5.6.4 | 02、04、16 | 01、06 | INV-I03；TC-C07/C08、TC-I06/I07 |
 | SR-07 资源域 | 4.3～4.7、5.3、5.6.4 | 03、04、07 | 01、03 | TC-C01～C04、TC-I04/I06 |
@@ -1532,7 +1740,7 @@ PB-01～PB-07 的决策耗时和 RA-01～RA-06 的可靠性事件以**5 分钟�
 | SR-11 事件 | 5.5、5.6.6、6.2.5、6.3、6.4 | 08、11、12、14～16 | 03～05、07 | INV-A06、INV-O06；TC-I13、TC-A07、TC-O04 |
 | SR-12 运行诊断 | 5.5、5.6、6.1～6.4 | 07～17 | 04～07 | PB-01～PB-07、RA-01～RA-06；TC-A01～A16、TC-S01～S14、TC-O01～O13 |
 
-表中两位数字是 ADR-XX、QA-XX 的简写，定义分别见 3.5 和 2.2。每个 SR 有设计章节、关键决策、质量属性及可判断场景。
+表中两位数字是 ADR-XX、QA-XX 的简写，定义分别见 3.6 和 2.2。每个 SR 有设计章节、关键决策、质量属性及可判断场景。
 
 ### 7.2 DFX 反向追踪
 
@@ -1561,6 +1769,24 @@ PB-01～PB-07 的决策耗时和 RA-01～RA-06 的可靠性事件以**5 分钟�
 
 **共 120 个目标架构场景**，并非声称代码测试通过。每个场景必须可追踪到输入条件、规则/状态、责任组件和预期结论；无法推导清楚的场景属于待整改的设计问题。
 
+### 7.4 4+1 视图与需求的双向核对
+
+视图不是五套相互独立的方案，而是同一组架构元素在不同关注点下的投影。本表通过典型场景将第 3 章的视图与第 4～6 章的关键协议、DFX 约束关联，避免一项关键能力只出现在某张图中。
+
+| 用户场景 | 逻辑视图 | 开发视图 | 运行视图 | 部署视图 | 验证入口 |
+|---|---|---|---|---|---|
+| **UC-01 Runner 前瞻 NPU 准入** | 可信需求、可行性判定、预约交接 | 需求/规划器接口，ARCSync Scheduling Framework 扩展 | Runner 调度、CAS 预约、Workflow 交接 | 管理集群 Scheduler 和真实 Workflow 执行端 | BG-01；TC-C/I/R；INV-C/R |
+| **UC-02 大任务 FIFO 与安全 Backfill** | FairnessQueue、WorkloadGroup、ReserveCommitment | 公平/预约统一版本接口 | 并发许可、保护与空间回填 | 共享公平状态与受保护 NPU 物理域 | BG-02；TC-F；QA-02/03 |
+| **UC-03 Liqo 跨集群可执行性** | ResourceDomain、RemoteFeasibilityEvidence、CandidatePlan | Liqo 与 CheckFeasibility 适配接口 | 查询、授权校验、证据超时与重新评估 | VirtualNode、远端可行性提供者、成员 NPU Nodes | TC-C/I；QA-01/05 |
+| **UC-04 LWS 多 Pod/Gang 交接** | WorkloadGroup、WorkflowShape、LogicalReservation | 组级需求与交接证据接口 | 组级确认、失败恢复、成员真实绑定 | 成员集群的 PodGroup/Workflow Scheduler | TC-R/I/A；QA-01/04/05 |
+
+**交叉检查规则：**
+
+1. 用例提出用户期望，逻辑视图能找到对应责任元素；开发视图能指出元素间输入/输出契约。
+2. 运行视图中的每项共享状态、写入、释放和重试都能找到权威与失败语义；部署视图能指出其集群/租户/资源域边界。
+3. DFX 的关键失效不能只在 FMEA 中描述：应能追溯到正常场景、运行恢复路径及部署故障隔离边界。
+4. 第 4～6 章细化不同视图中的算法、状态机、时序和质量属性；这些图**不增加新的独立架构视图**，避免重复描述或出现相互矛盾的职责划分。
+
 ## 8 技术规范参考
 
 ### 8.1 设计适用条件
@@ -1570,6 +1796,8 @@ PB-01～PB-07 的决策耗时和 RA-01～RA-06 的可靠性事件以**5 分钟�
 **非目标**：不设计 ARC Listener 接单机制、不代替成员集群的真实 NPU Node 调度、不定义运行时沙箱；不陈述代码完成度、部署计划、落地步骤或性能实测。章节中的性能与可靠性数值仅是目标设计预算，120 个 TC 为设计可判定场景，不代表执行测试已经通过。
 
 
+- [CodeArts Modeling 4+1 视图](https://support.huaweicloud.com/usermanual-codeartsmodeling/modeling_ug_0002_1.html)：逻辑、开发、运行、部署和用例五种架构视角及其关联。
+- [4+1 视图图示参考](https://juejin.cn/post/7269644482257453097)：本设计的多视图表达参考。
 - [Kubernetes Scheduling Framework](https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/)：Scheduler 扩展点、调度/绑定周期、QueueSort、Reserve/Unreserve。
 - [Kubernetes Running Multiple Schedulers](https://kubernetes.io/docs/concepts/scheduling-eviction/running-multiple-schedulers/)：多调度器间的节点和资源竞争边界。
 - [GitHub ARC Runner Scale Sets](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets)：ARC Kubernetes Container Mode 与 runner-container-hooks 创建作业 Pod 的责任边界。
