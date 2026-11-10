@@ -1730,7 +1730,7 @@ PB-01～PB-07 的决策耗时和 RA-01～RA-06 的可靠性事件以**5 分钟�
 | SR-01 可信需求 | 4.1、5.1、5.6.2、6.1 | 02、10、13、15 | 01、06 | INV-S01～S04；TC-C10、TC-S01～S04 |
 | SR-02 容量计量 | 4.2、4.7、5.1、5.2 | 03、04、05 | 01、04 | INV-C01～C06、INV-R02/R03；TC-C01～C09、TC-R01 |
 | SR-03 可执行性 | 4.3～4.8、5.1、5.6.4～5.6.5、6.2.3 | 03、07、12、13、16 | 01、03 | TC-C01～C14、TC-I01/I03、TC-P09 |
-| SR-04 预约 | 3.4、5.2、6.2.4、6.3 | 05、09、12、13 | 01、04、05 | INV-R01～R06、INV-A01～A06；TC-R01～R14、TC-A01～A16 |
+| SR-04 预约 | 3.5、5.2、6.2.4、6.3 | 05、09、12、13 | 01、04、05 | INV-R01～R06、INV-A01～A06；TC-R01～R14、TC-A01～A16 |
 | SR-05 交接 | 5.2.3、5.2.5～5.2.8、6.4 | 05、07、11、13 | 01、04、07 | TC-R04～R12、TC-O03～O06 |
 | SR-06 Liqo | 4.2、4.5、5.3、5.6.4 | 02、04、16 | 01、06 | INV-I03；TC-C07/C08、TC-I06/I07 |
 | SR-07 资源域 | 4.3～4.7、5.3、5.6.4 | 03、04、07 | 01、03 | TC-C01～C04、TC-I04/I06 |
@@ -1740,7 +1740,7 @@ PB-01～PB-07 的决策耗时和 RA-01～RA-06 的可靠性事件以**5 分钟�
 | SR-11 事件 | 5.5、5.6.6、6.2.5、6.3、6.4 | 08、11、12、14～16 | 03～05、07 | INV-A06、INV-O06；TC-I13、TC-A07、TC-O04 |
 | SR-12 运行诊断 | 5.5、5.6、6.1～6.4 | 07～17 | 04～07 | PB-01～PB-07、RA-01～RA-06；TC-A01～A16、TC-S01～S14、TC-O01～O13 |
 
-表中两位数字是 ADR-XX、QA-XX 的简写，定义分别见 3.5 和 2.2。每个 SR 有设计章节、关键决策、质量属性及可判断场景。
+表中两位数字是 ADR-XX、QA-XX 的简写，定义分别见 3.6 和 2.2。每个 SR 有设计章节、关键决策、质量属性及可判断场景。
 
 ### 7.2 DFX 反向追踪
 
@@ -1769,6 +1769,24 @@ PB-01～PB-07 的决策耗时和 RA-01～RA-06 的可靠性事件以**5 分钟�
 
 **共 120 个目标架构场景**，并非声称代码测试通过。每个场景必须可追踪到输入条件、规则/状态、责任组件和预期结论；无法推导清楚的场景属于待整改的设计问题。
 
+### 7.4 4+1 视图与需求的双向核对
+
+视图不是五套相互独立的方案，而是同一组架构元素在不同关注点下的投影。本表通过典型场景将第 3 章的视图与第 4～6 章的关键协议、DFX 约束关联，避免一项关键能力只出现在某张图中。
+
+| 用户场景 | 逻辑视图 | 开发视图 | 运行视图 | 部署视图 | 验证入口 |
+|---|---|---|---|---|---|
+| **UC-01 Runner 前瞻 NPU 准入** | 可信需求、可行性判定、预约交接 | 需求/规划器接口，ARCSync Scheduling Framework 扩展 | Runner 调度、CAS 预约、Workflow 交接 | 管理集群 Scheduler 和真实 Workflow 执行端 | BG-01；TC-C/I/R；INV-C/R |
+| **UC-02 大任务 FIFO 与安全 Backfill** | FairnessQueue、WorkloadGroup、ReserveCommitment | 公平/预约统一版本接口 | 并发许可、保护与空间回填 | 共享公平状态与受保护 NPU 物理域 | BG-02；TC-F；QA-02/03 |
+| **UC-03 Liqo 跨集群可执行性** | ResourceDomain、RemoteFeasibilityEvidence、CandidatePlan | Liqo 与 CheckFeasibility 适配接口 | 查询、授权校验、证据超时与重新评估 | VirtualNode、远端可行性提供者、成员 NPU Nodes | TC-C/I；QA-01/05 |
+| **UC-04 LWS 多 Pod/Gang 交接** | WorkloadGroup、WorkflowShape、LogicalReservation | 组级需求与交接证据接口 | 组级确认、失败恢复、成员真实绑定 | 成员集群的 PodGroup/Workflow Scheduler | TC-R/I/A；QA-01/04/05 |
+
+**交叉检查规则：**
+
+1. 用例提出用户期望，逻辑视图能找到对应责任元素；开发视图能指出元素间输入/输出契约。
+2. 运行视图中的每项共享状态、写入、释放和重试都能找到权威与失败语义；部署视图能指出其集群/租户/资源域边界。
+3. DFX 的关键失效不能只在 FMEA 中描述：应能追溯到正常场景、运行恢复路径及部署故障隔离边界。
+4. 第 4～6 章细化不同视图中的算法、状态机、时序和质量属性；这些图**不增加新的独立架构视图**，避免重复描述或出现相互矛盾的职责划分。
+
 ## 8 技术规范参考
 
 ### 8.1 设计适用条件
@@ -1778,6 +1796,8 @@ PB-01～PB-07 的决策耗时和 RA-01～RA-06 的可靠性事件以**5 分钟�
 **非目标**：不设计 ARC Listener 接单机制、不代替成员集群的真实 NPU Node 调度、不定义运行时沙箱；不陈述代码完成度、部署计划、落地步骤或性能实测。章节中的性能与可靠性数值仅是目标设计预算，120 个 TC 为设计可判定场景，不代表执行测试已经通过。
 
 
+- [CodeArts Modeling 4+1 视图](https://support.huaweicloud.com/usermanual-codeartsmodeling/modeling_ug_0002_1.html)：逻辑、开发、运行、部署和用例五种架构视角及其关联。
+- [4+1 视图图示参考](https://juejin.cn/post/7269644482257453097)：本设计的多视图表达参考。
 - [Kubernetes Scheduling Framework](https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/)：Scheduler 扩展点、调度/绑定周期、QueueSort、Reserve/Unreserve。
 - [Kubernetes Running Multiple Schedulers](https://kubernetes.io/docs/concepts/scheduling-eviction/running-multiple-schedulers/)：多调度器间的节点和资源竞争边界。
 - [GitHub ARC Runner Scale Sets](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets)：ARC Kubernetes Container Mode 与 runner-container-hooks 创建作业 Pod 的责任边界。
