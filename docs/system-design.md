@@ -2,6 +2,12 @@
 
 ## 1 设计目标与范围
 
+昇腾 CI 平台为 vLLM-Ascend、SGLang 等开源项目提供共享 NPU 测试资源。开发者通过 GitHub Actions 运行 PR、Nightly 和多机测试；不同任务对 NPU 型号、单节点卡数和拓扑有不同要求。随着并发任务增多，资源分散在不同节点、集群，任务既需要找到真正可执行的资源，也需要在资源紧张时得到公平的等待机会。
+
+在本设计涉及的技术链路中，Actions Runner Controller（ARC）管理 Runner；在 Kubernetes Container Mode 下，Runner Pod 与实际申请 NPU 的 Workflow Pod 分属两个阶段。Kubernetes Scheduler 和 Device Plugin 负责实际资源调度与设备分配，Liqo 提供跨集群资源访问，Volcano 提供 Queue 和工作负载调度能力。但 **Runner 能够启动，不等于后续 Workflow 已具备满足卡数、拓扑和授权约束的 NPU 资源**。
+
+由此产生两个问题：一是 Runner 提前启动、Workflow 却因 NPU 不足或拓扑不匹配而持续等待；二是多个任务共享资源时，小任务不断插队可能使大任务长期饥饿，而简单地执行严格 FIFO 又可能让空闲资源无法利用。本子系统因此聚焦 **NPU 感知准入** 与 **公平等待和资源效能**，负责判断未来 Workflow 的资源可执行性、安排竞争顺序，并明确与实际资源分配组件的协作边界。
+
 ### 1.1 业务目标
 
 **BG-01 NPU 感知准入。** 解决调度对象未体现最终 NPU 需求，导致资源不足时任务过早进入执行阶段的问题。目标是在准入时识别可信的完整资源需求，结合授权、拓扑和资源状态判断可执行性；不可满足时保留等待，而不是仅凭资源总量提前放行。
