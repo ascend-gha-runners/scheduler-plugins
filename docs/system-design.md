@@ -87,51 +87,35 @@
 | 明确失效语义 | 依赖异常按授权、安全性和一致性影响选择等待、拒绝或有限降级 | 质量属性 4、5、6 |
 | 可诊断的决策 | 决策具有关联 ID、策略版本、数据版本和原因码 | 质量属性 7 |
 
-### 3.2 逻辑架构
+### 3.2 架构视图总览（4+1）
+
+本章从五个角度描述同一个调度子系统：**逻辑视图**定义职责，**开发视图**定义构件组织，**运行视图**描述并发和交互，**部署视图**说明组件所在的集群与资源边界；**用例视图（+1）**用于驱动和验证上述设计。视图中的逻辑职责不要求逐一部署为独立进程或 Pod。
+
+![ARC NPU 调度子系统的 4+1 视图：中心用例视图关联逻辑、开发、运行、部署视图](images/4plus1/01-overview.svg)
+
+<p align="center"><strong>图 1　ARC NPU 调度子系统 4+1 视图总览</strong></p>
+
+**说明：** 通过关键场景将四个技术视图关联起来；各视图不是四套独立设计。图片采用 16:9 SVG 矢量格式。
+
+| 视图 | 主要回答 |
+|---|---|
+| 逻辑视图 | 哪些子系统职责共同完成 NPU 准入与公平调度？ |
+| 开发视图 | 在哪些构件中实现职责，模块如何依赖？ |
+| 运行视图 | 多实例调度、预约交接和故障恢复如何协作？ |
+| 部署视图 | Runner、Scheduler、Workflow 和物理 NPU 分别位于何处？ |
+| 用例视图（+1） | 开发者的哪些场景验证四个技术视图？ |
+
+### 3.3 逻辑视图：子系统职责与协作
 
 本视图说明如何在 Runner 放行前判断未来 Workflow 的 NPU 需求，以及本子系统与实际资源分配组件的职责边界。
 
-~~~mermaid
-flowchart TB
-  subgraph EXT["外部系统及资源事实"]
-    ARC["ARC Controller / Listener"]
-    API[("Kubernetes API")]
-    LIQO["Liqo：远端资源与授权"]
-    VQ["Volcano：Queue 与 Workflow 调度"]
-    DEVICE["Device Plugin：设备资源"]
-    WF["Workflow Scheduler：最终绑定"]
-  end
-  subgraph S["NPU 调度子系统"]
-    DEM["需求校验"]
-    SNAP["资源事实视图"]
-    FEAS["资源域可行性判定"]
-    FAIR["公平/优先级/Backfill 仲裁"]
-    RES["逻辑预约与交接"]
-    DIAG["诊断、事件与一致性监视"]
-  end
-  ARC -->|"Runner/需求"| API
-  DEVICE --> API
-  LIQO --> API
-  VQ --> API
-  API --> DEM
-  API --> SNAP
-  DEM --> FEAS
-  SNAP --> FEAS
-  FEAS --> FAIR --> RES
-  RES <-->|"版本化预约"| API
-  RES -.->|"仅在共享契约下协调"| WF
-  WF --> API
-  DEM --> DIAG
-  FEAS --> DIAG
-  FAIR --> DIAG
-  RES --> DIAG
-~~~
+![ARC NPU 调度子系统逻辑架构：外部系统、需求校验、容量事实、可行性、公平仲裁、预约交接与物理设备](images/4plus1/02-logical.svg)
 
-<p align="center"><strong>图 1　NPU 调度子系统逻辑架构</strong></p>
+<p align="center"><strong>图 2　NPU 调度子系统逻辑架构</strong></p>
 
 **说明：** 本子系统在 Runner 绑定前检查后续 Workflow 的 NPU 需求、可用资源与拓扑，再通过公平仲裁和逻辑预约确定是否放行，减少 Runner 已启动但 Workflow 因资源不足而等待的问题。真实节点调度和设备分配仍由 Workflow Scheduler 与 Device Plugin 负责。
 
-### 3.3 组件职责及数据权威
+### 3.4 逻辑元素职责及数据权威
 
 | 组件 | 决策职责 | 权威输入与输出 | 不承担的保证 |
 |---|---|---|---|
@@ -143,7 +127,7 @@ flowchart TB
 | Workflow Scheduler | 最终 Workflow Pod 放置及设备分配 | 真实 Workflow Pod、Node 和设备分配 | 不由 Runner 成功绑定所替代 |
 | 诊断与事件适配 | 描述等待、拒绝、重试和交接的原因及证据 | 各决策组件的状态变化 | 不另行形成一套容量权威数据 |
 
-### 3.4 规范化领域对象
+### 3.5 领域对象
 
 下表中的英文名称代表设计中的逻辑对象和字段，不要求分别创建同名 Kubernetes CRD。
 
@@ -163,7 +147,7 @@ flowchart TB
 | AllocationEvidence | Workflow UID、实际 Requests、Node/拓扑、分配确认版本、关联 DemandID | 用于预约交接的可信分配证据 |
 | DecisionEvidence | decisionID、reasonCode、policyVersion、snapshotVersion、guaranteeLevel | 解释准入、等待和拒绝原因 |
 
-### 3.5 关键架构决策
+### 3.6 关键架构决策
 
 | 设计决策 | 目标决策与理由 | 取舍 |
 |---|---|---|
@@ -181,6 +165,60 @@ flowchart TB
 | 决策 12 有界容量仲裁与增量索引 | 物理不重叠的有界 AccountingDomain、增量资源/队列索引、预算化拓扑搜索和有界比较并交换（CAS）重试 | 跨分区 Gang/全局 Queue 配额需要额外强协议；缺失时不能宣称强保证（6.2.4） |
 | 决策 13 组级执行责任归属 | Runner 侧只判断整个 WorkloadGroup 的需求与候选可行性；LWS/PodGroup 与 Workflow Scheduler 负责实际 Gang、成员放置及回滚 | 不在 本子系统 和下游同时维护独立的 Gang Permit；仅下游明确提供共同协议时才能宣称组级协调保证 |
 | 决策 14 可信共享 FIFO Queue | 用受控配置将 Namespace 映射到队列，和物理 FairnessPool 交叉确定竞争关系；队列及版本不可被任务自声明改变 | Queue 身份无法验证时不得回退为独立 Namespace 队列放行，牺牲局部可用性以保公平和隔离 |
+
+### 3.7 开发视图：代码构件与依赖
+
+开发视图回答**到哪里维护代码、不同职责通过什么接口协作**。下图中的 `cmd/scheduler`、`pkg/arcsync`、`liqo.go` 与 `volcano.go` 是当前仓库的代码位置；内部逻辑方框是目标职责划分，**不要求新增同名目录**。
+
+![开发视图：cmd/scheduler、pkg/arcsync 和需求校验、候选规划、公平、预约、Liqo/Volcano 适配的构件关系](images/4plus1/03-development.svg)
+
+<p align="center"><strong>图 3　NPU 调度子系统开发视图</strong></p>
+
+**说明：** 复用 Scheduling Framework；需求/可行性、公平与逻辑预约共享可信身份及版本语义。Liqo、Volcano 是外部接口适配，最终 Pod/Gang 绑定不由本模块重新实现。
+
+| 代码位置 / 目标构件 | 职责 |
+|---|---|
+| `cmd/scheduler`、`pkg/arcsync` | Scheduler 入口及 Framework 扩展 |
+| 需求校验、候选规划 | 规范化 WorkflowShape，依据资源/拓扑/授权生成 CandidatePlan |
+| 公平策略、预约交接 | 稳定 FIFO、Reserve Node、逻辑预约与真实分配对账 |
+| `pkg/arcsync/liqo.go`、`volcano.go` | 与外部资源、Queue/调度状态协作；不得代替外部状态权威 |
+
+### 3.8 运行视图：并发调度与状态交接
+
+运行视图关注并发提交、状态一致性与恢复。多个 Scheduler 实例可以处理不同 Runner；共享资源的公平许可与逻辑预约必须经过同一权威的原子仲裁。
+
+![运行视图：并发 Scheduler 实例通过 AccountingDomain CAS 仲裁，再由 Workflow Scheduler 执行并对账](images/4plus1/04-runtime.svg)
+
+<p align="center"><strong>图 4　多实例调度与预约交接运行视图</strong></p>
+
+**说明：** 各实例可并发读取资源事实，但共享域使用 CAS、PolicyEpoch、writerEpoch 防止重复承诺。Runner Bind 不等于 Workflow 获得 NPU；仅在下游参与共同协议时提供 `COORDINATED` 保证。详细状态机和恢复路径见 5.2、5.6、6.3。
+
+### 3.9 部署视图：控制面与物理 NPU 资源
+
+部署视图区分 Runner 管理集群、Liqo 远端虚拟资源和成员集群真实 NPU Node。本图说明**目标部署关系与责任边界**，不指定生产实例数、账号或 Region。
+
+![部署视图：本地 ARC、Runner、NPU Scheduler、Kubernetes API 和 Liqo VirtualNode；远端 Workflow Scheduler 与物理 NPU](images/4plus1/05-deployment.svg)
+
+<p align="center"><strong>图 5　Runner 管理集群与成员 NPU 集群部署视图</strong></p>
+
+**说明：** 本子系统负责 Runner 前置准入及逻辑预约，成员集群 Workflow Scheduler 负责真实 NPU Node/Gang 选择；Device Plugin 管理设备事实。Liqo VirtualNode 聚合视图不等于一台物理 NPU Node。远端失联时只能隔离受影响资源域，不能把其未知余量视为可用。
+
+### 3.10 用例视图（+1）：以主场景验证架构
+
+用例视图选择影响两个业务目标的四个主场景。图中 **UC（Use Case）表示用例编号**，用于连接用户期望与四个技术视图，不增加另一套功能需求编号。异常和 DFX 场景仍由第 4～7 章的验收表描述。
+
+![用例视图：开源项目维护者和平台管理者关注前瞻准入、大任务公平等待、跨集群资源选择、多 Pod Gang 交接](images/4plus1/06-use-cases.svg)
+
+<p align="center"><strong>图 6　NPU 调度子系统关键用例</strong></p>
+
+**说明：** 从项目维护者和平台管理者的可观察结果出发，将用户问题映射到结构、代码、运行和部署设计，不把正常及异常时序全部堆入用例图。
+
+| 用例 | 用户期望 | 设计与验证入口 |
+|---|---|---|
+| **UC-01 NPU 前瞻准入** | Runner 不在 NPU 型号/拓扑根本不可满足时提前启动 | 第 4 章、5.1～5.2；TC-C/R/I |
+| **UC-02 大任务公平等待** | 多机大任务不被无限插队，非冲突空闲资源可使用 | 5.4；TC-F、质量属性 2 |
+| **UC-03 跨集群资源选择** | 本地不足时使用授权且真实可执行的远端资源 | 5.3、5.6.4；TC-C/I |
+| **UC-04 多 Pod/Gang 交接** | 整组资源需求可准入，分配结果和异常可追踪 | 5.2、5.6.5；TC-R/I/A |
 
 ## 4 NPU 需求与容量准入设计
 
@@ -275,7 +313,7 @@ flowchart TD
   L -- 是 --> M["接受 Runner 准入，并声明保证级别"]
 ~~~
 
-<p align="center"><strong>图 2　NPU 准入决策流程</strong></p>
+<p align="center"><strong>图 7　NPU 准入决策流程</strong></p>
 
 **说明：** 准入不能只看空闲 NPU 总量，必须确认未来 Workflow 有完整可执行计划。无权限或规格不可执行时拒绝；资源暂不足或事实不可用时等待；公平仲裁与逻辑预约通过后，Runner 才可放行。
 
@@ -391,7 +429,7 @@ sequenceDiagram
   end
 ~~~
 
-<p align="center"><strong>图 3　NPU 需求校验与准入交互时序</strong></p>
+<p align="center"><strong>图 8　NPU 需求校验与准入交互时序</strong></p>
 
 **说明：** 此交互将 ARC 的 Runner 生命周期与 NPU 准入判定分开，避免仅凭 Runner 自身的 CPU 需求启动任务。子系统依据可信 Workflow 规格完成授权、可行性和公平判断，并向 ARC 返回可解释的准入结果。
 
@@ -465,7 +503,7 @@ stateDiagram-v2
   CLOSED --> [*]
 ~~~
 
-<p align="center"><strong>图 4　逻辑预约生命周期状态图</strong></p>
+<p align="center"><strong>图 9　逻辑预约生命周期状态图</strong></p>
 
 **说明：** 状态机防止取消、超时或失联时过早释放 NPU 容量。只有确认真实分配或释放后才完成交接或关闭预约；证据不完整时保留保护并标记 UNCERTAIN，避免重复承诺资源。
 
@@ -550,7 +588,7 @@ sequenceDiagram
   Note over W,L: 未参与共享协议时仅有ESTIMATED保证
 ~~~
 
-<p align="center"><strong>图 5　Runner 与 Workflow 资源交接时序</strong></p>
+<p align="center"><strong>图 10　Runner 与 Workflow 资源交接时序</strong></p>
 
 **说明：** 此时序解决 Runner 绑定成功与 Workflow 实际分配之间的计量空窗：分配未确认前持续保留逻辑预约；下游 Scheduler 未参与共享协议时，只能声明 ESTIMATED，不能保证 NPU 已锁定。
 
@@ -730,7 +768,7 @@ flowchart TD
   M -- 是 --> O["许可与逻辑预约"]
 ~~~
 
-<p align="center"><strong>图 6　Reserve Node 与安全 Backfill 决策流程</strong></p>
+<p align="center"><strong>图 11　Reserve Node 与安全 Backfill 决策流程</strong></p>
 
 **说明：** Reserve Node 保护大任务的等待权益，Backfill 允许其他任务使用不冲突的空闲资源，避免严格 FIFO 降低吞吐。若回填会占用受保护容量，必须证明其按时释放且不会推迟受保护任务。
 
@@ -887,7 +925,7 @@ sequenceDiagram
   MC-->>API: 真实分配证据供交接
 ~~~
 
-<p align="center"><strong>图 7　Liqo 远端资源选择与实际放置时序</strong></p>
+<p align="center"><strong>图 12　Liqo 远端资源选择与实际放置时序</strong></p>
 
 **说明：** 本地 Scheduler 负责选择已授权的远端资源域，成员集群负责选择实际 NPU 节点。Liqo 虚拟节点的汇总容量无法证明物理拓扑满足需求，因此不能据此提前放行需要特定卡数或拓扑的 Workflow。
 
@@ -968,7 +1006,7 @@ sequenceDiagram
   Note over SCH,VOL: 无共同仲裁和交接时仅有ESTIMATED
 ~~~
 
-<p align="center"><strong>图 8　ARC、Runner 与 Workflow 跨组件协同时序</strong></p>
+<p align="center"><strong>图 13　ARC、Runner 与 Workflow 跨组件协同时序</strong></p>
 
 **说明：** 此时序避免将 Runner 准入成功误认为 Workflow 已获得 NPU。本子系统负责准入与逻辑预约，实际 Workflow 放置由下游 Scheduler 负责；只有双方遵守共同的预约与交接协议，才能承诺 COORDINATED。
 
@@ -1266,7 +1304,7 @@ sequenceDiagram
   N->>API: 原子提交新版本的合法预约
 ~~~
 
-<p align="center"><strong>图 9　Scheduler 故障转移与预约恢复时序</strong></p>
+<p align="center"><strong>图 14　Scheduler 故障转移与预约恢复时序</strong></p>
 
 **说明：** 此恢复机制防止调度实例切换时重复预约或错误释放资源。新实例须取得有效写入代际并核对持久预约与实际分配；旧实例写入被阻断，无法核实的容量继续保护，直至对账完成。
 
@@ -1461,7 +1499,7 @@ D2 只适用于**下游尚不共享协议、但授权与可行性事实仍可独
 | 设计项 1 可信需求 | 4.1、5.1、5.6.2、6.1 | 决策 2、10、13 | 质量属性 1、6 | INV-S01～S04；TC-C10、TC-S01～S04 |
 | 设计项 2 容量计量 | 4.2、4.7、5.1、5.2 | 决策 3、4、5 | 质量属性 1、4 | INV-C01～C06、INV-R02/R03；TC-C01～C09、TC-R01 |
 | 设计项 3 可执行性 | 4.3～4.8、5.1、5.6.5、6.2.3 | 决策 3、7、12、13 | 质量属性 1、3 | TC-C01～C14、TC-I01/I03、TC-P09 |
-| 设计项 4 预约 | 3.4、5.2、6.2.4、6.3 | 决策 5、9、12、13 | 质量属性 1、4、5 | INV-R01～R06、INV-A01～A06；TC-R01～R14、TC-A01～A16 |
+| 设计项 4 预约 | 3.5、5.2、6.2.4、6.3 | 决策 5、9、12、13 | 质量属性 1、4、5 | INV-R01～R06、INV-A01～A06；TC-R01～R14、TC-A01～A16 |
 | 设计项 5 交接 | 5.2.3、5.2.5～5.2.8、6.4 | 决策 5、7、11、13 | 质量属性 1、4、7 | TC-R04～R12、TC-O03～O06 |
 | 设计项 6 Liqo | 4.2、4.5、5.3、5.6.4 | 决策 2、4 | 质量属性 1、6 | INV-I03；TC-C07/C08、TC-I06/I07 |
 | 设计项 7 资源域 | 4.3～4.7、5.3、5.6.4 | 决策 3、4、7 | 质量属性 1、3 | TC-C01～C04、TC-I04/I06 |
@@ -1500,6 +1538,17 @@ D2 只适用于**下游尚不共享协议、但授权与可行性事实仍可独
 
 **共 120 个目标架构场景**，并非声称代码测试通过。每个场景必须可追踪到输入条件、规则/状态、责任组件和预期结论；无法推导清楚的场景属于待整改的设计问题。
 
+### 7.4 4+1 视图一致性核对
+
+| 用例 | 逻辑视图 | 开发视图 | 运行/部署视图 | 设计验证 |
+|---|---|---|---|---|
+| UC-01 前瞻准入 | 需求、可行性、逻辑预约 | Demand → CandidatePlan → 预约接口 | Runner/Workflow 两阶段、管理/执行集群边界 | TC-C/I/R |
+| UC-02 公平等待 | FairnessQueue、Reserve Node | 公平与预约使用同一版本 | 并发 CAS、受保护资源域 | TC-F |
+| UC-03 远端资源 | ResourceDomain、真实拓扑事实 | Liqo 适配与候选规划 | Liqo VirtualNode → 成员集群物理 Node | TC-C/I |
+| UC-04 Gang 交接 | WorkloadGroup、AllocationEvidence | 组级需求与交接接口 | 下游 PodGroup/Gang 权威及恢复对账 | TC-R/I/A |
+
+**跨视图要求：** 逻辑元素应能找到代码职责；运行状态必须有权威来源；部署图须明确资源和故障域；每项关键用例能够追踪到正常路径及 DFX 场景。后文流程图是上述视图的详细设计，不构成另外的架构视图。
+
 ## 8 技术规范参考
 
 ### 8.1 设计适用条件
@@ -1509,6 +1558,8 @@ D2 只适用于**下游尚不共享协议、但授权与可行性事实仍可独
 **非目标**：不设计 ARC Listener 接单机制、不代替成员集群的真实 NPU Node 调度、不定义运行时沙箱；不陈述代码完成度、部署计划、落地步骤或性能实测。章节中的性能与可靠性数值仅是目标设计预算，120 个设计场景用于评审核对，不代表执行测试已经通过。
 
 
+- [4+1 视图参考文章](https://juejin.cn/post/7269644482257453097)：用户提供的视图表达参考。
+- [CodeArts Modeling 4+1 视图](https://support.huaweicloud.com/usermanual-codeartsmodeling/modeling_ug_0002_1.html)：逻辑、开发、运行、部署与用例视图的职责分工。
 - [Kubernetes Scheduling Framework](https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/)：Scheduler 扩展点、调度/绑定周期、QueueSort、Reserve/Unreserve。
 - [Kubernetes Running Multiple Schedulers](https://kubernetes.io/docs/concepts/scheduling-eviction/running-multiple-schedulers/)：多调度器间的节点和资源竞争边界。
 - [GitHub ARC Runner Scale Sets](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets)：ARC Kubernetes Container Mode 与 runner-container-hooks 创建作业 Pod 的责任边界。
